@@ -1,8 +1,30 @@
 import os
+import json
 from pydantic import BaseModel, Field
 from typing import Optional, Literal
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
+from app.core.database import SessionLocal
+from app.models.domain import AgentLog
+
+def log_agent_interaction(task_id: str, node_name: str, request_payload: list, response_payload: str, cost_tokens: int):
+    if not task_id:
+        return
+    try:
+        with SessionLocal() as db:
+            # 简单序列化 messages
+            req_str = json.dumps([{"role": m.type, "content": m.content} for m in request_payload], ensure_ascii=False)
+            log_entry = AgentLog(
+                task_id=task_id,
+                node_name=node_name,
+                request_payload=req_str,
+                response_payload=response_payload,
+                cost_tokens=cost_tokens
+            )
+            db.add(log_entry)
+            db.commit()
+    except Exception as e:
+        print(f"Failed to log agent interaction: {e}")
 
 # 初始化模型实例，强制要求配置 api_key, base_url, model_name
 def get_llm(model_config: Optional[dict] = None):
@@ -26,11 +48,16 @@ def get_llm(model_config: Optional[dict] = None):
         model=model_name,
         api_key=api_key,
         base_url=base_url,
-        temperature=0.1, # 降低温度以获得稳定的格式输出
-        max_tokens=config.get("max_tokens", 4096)
+        streaming=True, # 开启流式输出
+        temperature=0.5, # 稍微提高温度，避免模型在低温度下陷入死循环复读
+        max_tokens=config.get("max_tokens", 4096),
+        model_kwargs={
+            "max_completion_tokens": config.get("max_tokens", 4096), # 兼容某些服务商强制要求的 max_completion_tokens
+            "frequency_penalty": 0.5 # 增加重复惩罚，极大地降低“复读机”死循环的概率
+        }   
     )
 
-def solve_image(image_url: str, review_feedback: Optional[str] = None, model_config: Optional[dict] = None) -> dict:
+async def solve_image(image_url: str, review_feedback: Optional[str] = None, model_config: Optional[dict] = None, task_id: str = None) -> dict:
     """
     封装调用模型进行解题的逻辑
     """
@@ -96,15 +123,21 @@ def solve_image(image_url: str, review_feedback: Optional[str] = None, model_con
     ]
     
     # 调用模型
-    response = llm.invoke(messages)
+    response = await llm.ainvoke(messages)
     
+    tokens = response.response_metadata.get("token_usage", {}).get("total_tokens", 0)
+    if task_id:
+        # DB操作放进异步线程避免阻塞
+        import asyncio
+        asyncio.create_task(asyncio.to_thread(log_agent_interaction, task_id, "solver", messages, response.content, tokens))
+
     # 返回草稿和消耗的 token
     return {
         "draft": response.content,
-        "tokens": response.response_metadata.get("token_usage", {}).get("total_tokens", 0)
+        "tokens": tokens
     }
 
-def format_solution(draft_solution: str, model_config: Optional[dict] = None) -> dict:
+async def format_solution(draft_solution: str, model_config: Optional[dict] = None, task_id: str = None) -> dict:
     """
     封装调用模型进行最终排版润色的逻辑
     """
@@ -128,10 +161,15 @@ def format_solution(draft_solution: str, model_config: Optional[dict] = None) ->
     ]
     
     # 调用模型
-    response = llm.invoke(messages)
+    response = await llm.ainvoke(messages)
+    
+    tokens = response.response_metadata.get("token_usage", {}).get("total_tokens", 0)
+    if task_id:
+        import asyncio
+        asyncio.create_task(asyncio.to_thread(log_agent_interaction, task_id, "formatter", messages, response.content, tokens))
     
     # 返回最终结果和消耗的 token
     return {
         "formatted_result": response.content,
-        "tokens": response.response_metadata.get("token_usage", {}).get("total_tokens", 0)
+        "tokens": tokens
     }

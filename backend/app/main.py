@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from contextlib import asynccontextmanager
@@ -12,7 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from app.core.database import engine, Base, get_db
-from app.models.domain import Task
+from app.models.domain import Task, AgentLog
 from app.models.schemas import (
     TaskCreateRequest, TaskCreateResponse, TaskDetailResponse, 
     TaskStatus, ManualSubmitRequest
@@ -22,6 +23,30 @@ from app.agent.graph import build_graph
 # 全局并发信号量，控制同时进行的大模型推理任务数（根据 PRD 要求默认为 5）
 MAX_CONCURRENT_TASKS = 5
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+
+# 全局流式事件总线，用于将后台工作流的流式输出分发给所有 SSE 客户端
+from collections import defaultdict
+class TaskEventBus:
+    def __init__(self):
+        self.queues = defaultdict(list)
+        
+    def subscribe(self, task_id: str) -> asyncio.Queue:
+        q = asyncio.Queue()
+        self.queues[task_id].append(q)
+        return q
+        
+    def publish(self, task_id: str, event_data: str):
+        if task_id in self.queues:
+            for q in self.queues[task_id]:
+                q.put_nowait(event_data)
+                
+    def close(self, task_id: str):
+        if task_id in self.queues:
+            for q in self.queues[task_id]:
+                q.put_nowait(None)
+            del self.queues[task_id]
+
+task_events = TaskEventBus()
 
 # 提前编译好全局唯一的图引擎实例
 graph_app = build_graph()
@@ -65,10 +90,22 @@ async def run_agent_workflow_async(task_id: str, db: Session):
         
         # 3. 运行图引擎
         try:
-            # invoke 是同步阻塞的，在真实的纯异步场景下，如果里面有强阻塞的 I/O（如 httpx 没用 async）
-            # 应该用 asyncio.to_thread 包装。LangGraph 的 ainvoke 也是可选项。
-            # 为了兼容当前基于同步的 ChatOpenAI invoke，我们先用 to_thread 包装以释放事件循环。
-            final_state = await asyncio.to_thread(graph_app.invoke, initial_state)
+            config = {"configurable": {"thread_id": task_id}}
+            async for event in graph_app.astream_events(initial_state, config=config, version="v2"):
+                if event["event"] == "on_chat_model_stream":
+                    chunk = event["data"]["chunk"]
+                    node = event.get("metadata", {}).get("langgraph_node", "unknown")
+                    data = json.dumps({
+                        "event": "on_chat_model_stream",
+                        "chunk": chunk.content,
+                        "node": node
+                    }, ensure_ascii=False)
+                    task_events.publish(task_id, data)
+            
+            # 工作流执行完毕，获取最终状态
+            state_tuple = graph_app.get_state(config)
+            final_state = state_tuple.values
+            task_events.close(task_id)
             
             # 4. 工作流结束，将最终状态落库
             # 必须重新获取 session 里的 task_record，防止多线程下 session 过期或 detached
@@ -103,6 +140,7 @@ async def run_agent_workflow_async(task_id: str, db: Session):
         except Exception as e:
             # 异常时进行防断保护
             print(f"[{task_id}] Workflow crashed: {e}")
+            task_events.close(task_id)
             task_record = db.query(Task).filter(Task.task_id == task_id).first()
             if task_record:
                 task_record.state = TaskStatus.FAILED.value
@@ -213,7 +251,19 @@ async def create_task(req: TaskCreateRequest, background_tasks: BackgroundTasks,
             detail=f"Failed to create task: {str(e)}"
         )
 
-@app.get("/api/tasks/{task_id}", response_model=TaskDetailResponse)
+@app.get("/api/logs")
+async def get_logs(task_id: str = None, db: Session = Depends(get_db)):
+    """
+    Returns: List of AgentLog
+    Description: 供前端后台使用，通过此接口在管理界面展示模型的完整请求、响应明细及 Token 消耗等。
+    """
+    query = db.query(AgentLog)
+    if task_id:
+        query = query.filter(AgentLog.task_id == task_id)
+    logs = query.order_by(AgentLog.created_at.asc()).all()
+    return logs
+
+@app.get("/api/tasks/{task_id}")
 def get_task(task_id: str, db: Session = Depends(get_db)):
     """
     根据 task_id 获取任务的完整详情
@@ -225,6 +275,39 @@ def get_task(task_id: str, db: Session = Depends(get_db)):
             detail=f"Task with id {task_id} not found."
         )
     return task
+
+@app.get("/api/tasks/{task_id}/stream")
+async def stream_task(task_id: str, db: Session = Depends(get_db)):
+    """
+    Returns: Server-Sent Events (SSE)
+    Format: data: {"event": "on_chat_model_stream", "chunk": "...", "node": "solver"}
+    Description: 包含模型的流式输出（含思考过程）。只负责监听全局总线，不负责执行图。
+    """
+    task_record = db.query(Task).filter(Task.task_id == task_id).first()
+    if not task_record:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    async def event_generator():
+        # 如果任务已经处于终态，直接发送结束信号并退出，防止前端傻等
+        if task_record.state in [TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.MANUAL.value, TaskStatus.CANCELLED.value]:
+            yield f"data: {json.dumps({'event': 'end'})}\n\n"
+            return
+
+        q = task_events.subscribe(task_id)
+        try:
+            while True:
+                data = await q.get()
+                if data is None: # None 表示工作流结束
+                    yield f"data: {json.dumps({'event': 'end'})}\n\n"
+                    break
+                yield f"data: {data}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if task_id in task_events.queues and q in task_events.queues[task_id]:
+                task_events.queues[task_id].remove(q)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 @app.post("/api/tasks/{task_id}/manual")
 def submit_manual_review(task_id: str, req: ManualSubmitRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):

@@ -1,5 +1,6 @@
 from typing import Literal
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
 from app.agent.state import AgentState
 from app.agent.nodes.solver import solve_node
 from app.agent.nodes.reviewer import review_node
@@ -83,4 +84,5 @@ def build_graph() -> StateGraph:
     workflow.add_edge("formatter", END)
     
     # 编译图
-    return workflow.compile()
+    memory = MemorySaver()
+    return workflow.compile(checkpointer=memory)

@@ -28,3 +28,14 @@ class Task(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), doc="更新时间")
     manual_operator = Column(String, nullable=True, doc="人工处理人（如有）")
     manual_updated_at = Column(DateTime(timezone=True), nullable=True, doc="人工提交时间（如有）")
+
+class AgentLog(Base):
+    __tablename__ = "agent_logs"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String, index=True)
+    node_name = Column(String) # solver / reviewer / formatter
+    request_payload = Column(Text) # JSON string
+    response_payload = Column(Text) # JSON string
+    cost_tokens = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+

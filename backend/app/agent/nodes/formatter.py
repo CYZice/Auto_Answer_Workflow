@@ -3,25 +3,32 @@ from app.agent.nodes.llm_client import format_solution
 from app.core.database import SessionLocal
 from app.models.domain import Task
 
-def format_node(state: AgentState) -> AgentState:
+def format_node_sync(task_id: str):
+    # 检查是否被外部干预熔断，并更新当前状态
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.task_id == task_id).first()
+        if task:
+            if task.state == "cancelled":
+                return True
+            task.state = "formatting"
+            db.commit()
+    return False
+
+async def format_node(state: AgentState) -> AgentState:
     """
     Node C: Formatter (自动排版)
     """
     print(f"[Node] Formatter: Formatting task {state['task_id']}")
     
-    # 检查是否被外部干预熔断，并更新当前状态
-    with SessionLocal() as db:
-        task = db.query(Task).filter(Task.task_id == state['task_id']).first()
-        if task:
-            if task.state == "cancelled":
-                print(f"  [Formatter] Task {state['task_id']} was cancelled by external intervention.")
-                return {
-                    **state,
-                    "status": "cancelled",
-                    "error_msg": "Task was manually cancelled."
-                }
-            task.state = "formatting"
-            db.commit()
+    import asyncio
+    is_cancelled = await asyncio.to_thread(format_node_sync, state['task_id'])
+    if is_cancelled:
+        print(f"  [Formatter] Task {state['task_id']} was cancelled by external intervention.")
+        return {
+            **state,
+            "status": "cancelled",
+            "error_msg": "Task was manually cancelled."
+        }
 
     # 防御性编程
     draft_solution = state.get("draft_solution")
@@ -37,7 +44,7 @@ def format_node(state: AgentState) -> AgentState:
     try:
         # 调用大模型进行排版润色
         print(f"  -> Calling LLM (Formatter)...")
-        result = format_solution(draft_solution, formatter_config)
+        result = await format_solution(draft_solution, formatter_config, state['task_id'])
         
         return {
             **state,

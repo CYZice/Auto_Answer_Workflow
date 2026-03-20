@@ -3,25 +3,32 @@ from app.agent.nodes.llm_client import solve_image
 from app.core.database import SessionLocal
 from app.models.domain import Task
 
-def solve_node(state: AgentState) -> AgentState:
+def solve_node_sync(task_id: str):
+    # 检查是否被外部干预熔断，并更新当前状态
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.task_id == task_id).first()
+        if task:
+            if task.state == "cancelled":
+                return True
+            task.state = "solving"
+            db.commit()
+    return False
+
+async def solve_node(state: AgentState) -> AgentState:
     """
     Node A: Solver (识图解题)
     """
     print(f"[Node] Solver: Processing task {state['task_id']}")
     
-    # 检查是否被外部干预熔断，并更新当前状态
-    with SessionLocal() as db:
-        task = db.query(Task).filter(Task.task_id == state['task_id']).first()
-        if task:
-            if task.state == "cancelled":
-                print(f"  [Solver] Task {state['task_id']} was cancelled by external intervention.")
-                return {
-                    **state,
-                    "status": "cancelled",
-                    "error_msg": "Task was manually cancelled."
-                }
-            task.state = "solving"
-            db.commit()
+    import asyncio
+    is_cancelled = await asyncio.to_thread(solve_node_sync, state['task_id'])
+    if is_cancelled:
+        print(f"  [Solver] Task {state['task_id']} was cancelled by external intervention.")
+        return {
+            **state,
+            "status": "cancelled",
+            "error_msg": "Task was manually cancelled."
+        }
     
     # 获取输入参数
     image_url = state.get("image_url")
@@ -39,7 +46,7 @@ def solve_node(state: AgentState) -> AgentState:
     try:
         # 调用大模型解题
         print(f"  -> Calling LLM (Solver)...")
-        result = solve_image(image_url, review_feedback, solver_config)
+        result = await solve_image(image_url, review_feedback, solver_config, state['task_id'])
         
         return {
             **state,

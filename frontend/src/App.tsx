@@ -1,4 +1,4 @@
-import { useState, ClipboardEvent } from 'react'
+import { useState, ClipboardEvent, useEffect } from 'react'
 import { QueryClient, QueryClientProvider, useQuery, useMutation } from '@tanstack/react-query'
 import axios from 'axios'
 import ReactMarkdown from 'react-markdown'
@@ -324,6 +324,8 @@ function TaskDashboard() {
 
 function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: string) => void }) {
   const [draftInput, setDraftInput] = useState('')
+  const [streamedContent, setStreamedContent] = useState('')
+  const [currentNode, setCurrentNode] = useState('')
   
   const { data: task, isLoading } = useQuery({
     queryKey: ['task', taskId],
@@ -335,9 +337,57 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
     },
   })
 
+  // 当切换任务时，清空流式输出的旧数据
+  useEffect(() => {
+    setStreamedContent('');
+    setCurrentNode('');
+  }, [taskId]);
+
+  // Use React's useEffect to handle SSE connection
+  const isTaskEnded = task?.state === 'completed' || task?.state === 'failed' || task?.state === 'manual';
+  
+  useEffect(() => {
+    if (!task || isTaskEnded) return;
+
+    const sse = new EventSource(`http://localhost:8000/api/tasks/${taskId}/stream`);
+    
+    sse.onmessage = (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        if (data.event === 'on_chat_model_stream') {
+          setStreamedContent(prev => prev + (data.chunk || ''));
+          if (data.node) setCurrentNode(data.node);
+        } else if (data.event === 'end') {
+          sse.close(); // 后端主动通知结束，断开连接避免重试
+        } else if (data.error) {
+          console.error("SSE Error:", data.error);
+        }
+      } catch (err) {
+        console.error("Failed to parse SSE data", err);
+      }
+    };
+
+    sse.onerror = (e) => {
+      console.error("SSE connection error", e);
+      sse.close();
+    };
+
+    return () => {
+      sse.close();
+      // 不在此处清空内容，避免重渲染时发生闪烁
+    };
+  }, [taskId, isTaskEnded]);
+
   const manualMutation = useMutation({
     mutationFn: ({ action, draft }: { action: 'resume' | 'fail', draft?: string }) => 
       api.post(`/api/tasks/${taskId}/manual`, { action, draft_solution: draft }).then(res => res.data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['task', taskId] })
+    }
+  })
+
+  const cancelMutation = useMutation({
+    mutationFn: () => api.post(`/api/tasks/${taskId}/cancel`).then(res => res.data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['task', taskId] })
     }
@@ -429,12 +479,27 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
             </div>
           </div>
         ) : (
-          <div className="h-full flex flex-col justify-center items-center text-gray-500 space-y-4 min-h-[300px] bg-gray-50 rounded-lg border border-dashed">
-            <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-blue-600"></div>
-            <p className="font-medium">Agent is working on this task...</p>
-            <p className="text-sm px-4 py-1.5 bg-white border rounded-full shadow-sm">
-              Current Node: <span className="font-mono text-blue-600 font-bold ml-1">{task.state}</span>
-            </p>
+          <div className="h-full flex flex-col space-y-4 bg-gray-50 rounded-lg border border-dashed p-6 max-h-[500px]">
+            <div className="flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-3">
+                <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-600"></div>
+                <p className="font-medium text-gray-700">Agent is working...</p>
+                <span className="text-xs px-3 py-1 bg-white border rounded-full shadow-sm text-blue-600 font-mono">
+                  {currentNode || task.state}
+                </span>
+              </div>
+              <button 
+                onClick={() => cancelMutation.mutate()}
+                disabled={cancelMutation.isPending}
+                className="text-xs px-3 py-1.5 bg-red-50 text-red-600 border border-red-200 rounded-lg hover:bg-red-100 transition-colors flex items-center gap-1 disabled:opacity-50"
+              >
+                <X size={14} />
+                {cancelMutation.isPending ? 'Stopping...' : 'Stop Workflow'}
+              </button>
+            </div>
+            <div className="flex-grow overflow-y-auto bg-white p-4 rounded border text-sm font-mono whitespace-pre-wrap shadow-inner text-gray-800">
+              {streamedContent || "Waiting for stream..."}
+            </div>
           </div>
         )}
       </div>

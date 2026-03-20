@@ -6,25 +6,32 @@ import json
 from app.core.database import SessionLocal
 from app.models.domain import Task
 
-def review_node(state: AgentState) -> AgentState:
+def review_node_sync(task_id: str):
+    # 检查是否被外部干预熔断，并更新当前状态
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.task_id == task_id).first()
+        if task:
+            if task.state == "cancelled":
+                return True
+            task.state = "reviewing"
+            db.commit()
+    return False
+
+async def review_node(state: AgentState) -> AgentState:
     """
     Node B: Reviewer (自动审查)
     """
     print(f"[Node] Reviewer: Reviewing task {state['task_id']}")
     
-    # 检查是否被外部干预熔断，并更新当前状态
-    with SessionLocal() as db:
-        task = db.query(Task).filter(Task.task_id == state['task_id']).first()
-        if task:
-            if task.state == "cancelled":
-                print(f"  [Reviewer] Task {state['task_id']} was cancelled by external intervention.")
-                return {
-                    **state,
-                    "status": "cancelled",
-                    "error_msg": "Task was manually cancelled."
-                }
-            task.state = "reviewing"
-            db.commit()
+    import asyncio
+    is_cancelled = await asyncio.to_thread(review_node_sync, state['task_id'])
+    if is_cancelled:
+        print(f"  [Reviewer] Task {state['task_id']} was cancelled by external intervention.")
+        return {
+            **state,
+            "status": "cancelled",
+            "error_msg": "Task was manually cancelled."
+        }
 
     # 防御性编程
     draft = state.get("draft_solution")
@@ -56,14 +63,24 @@ def review_node(state: AgentState) -> AgentState:
         ]
         
         # 调用模型获取强类型结构化结果
-        # 注意：with_structured_output 目前可能不返回 token_usage (因为内部封装了工具调用)，
-        # 生产环境中可以通过 Callback 或拦截器获取，此处暂且 mock 一个预估值
-        decision_obj: ReviewDecision = structured_llm.invoke(messages)
+        decision_obj: ReviewDecision = await structured_llm.ainvoke(messages)
         
         decision = "PASS" if decision_obj.is_pass else "FAIL"
         feedback = decision_obj.feedback if not decision_obj.is_pass else None
             
         print(f"  [Reviewer Result] Decision: {decision}, Feedback: {feedback}")
+        
+        from app.agent.nodes.llm_client import log_agent_interaction
+        import json
+        import asyncio
+        asyncio.create_task(asyncio.to_thread(
+            log_agent_interaction,
+            state['task_id'], 
+            "reviewer", 
+            messages, 
+            json.dumps({"is_pass": decision_obj.is_pass, "feedback": decision_obj.feedback}, ensure_ascii=False),
+            200
+        ))
 
         return {
             **state,

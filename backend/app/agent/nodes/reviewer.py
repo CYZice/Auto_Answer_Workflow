@@ -12,16 +12,19 @@ def review_node(state: AgentState) -> AgentState:
     """
     print(f"[Node] Reviewer: Reviewing task {state['task_id']}")
     
-    # 检查是否被外部干预熔断
+    # 检查是否被外部干预熔断，并更新当前状态
     with SessionLocal() as db:
         task = db.query(Task).filter(Task.task_id == state['task_id']).first()
-        if task and task.state == "cancelled":
-            print(f"  [Reviewer] Task {state['task_id']} was cancelled by external intervention.")
-            return {
-                **state,
-                "status": "cancelled",
-                "error_msg": "Task was manually cancelled."
-            }
+        if task:
+            if task.state == "cancelled":
+                print(f"  [Reviewer] Task {state['task_id']} was cancelled by external intervention.")
+                return {
+                    **state,
+                    "status": "cancelled",
+                    "error_msg": "Task was manually cancelled."
+                }
+            task.state = "reviewing"
+            db.commit()
 
     # 防御性编程
     draft = state.get("draft_solution")
@@ -57,15 +60,10 @@ def review_node(state: AgentState) -> AgentState:
         # 生产环境中可以通过 Callback 或拦截器获取，此处暂且 mock 一个预估值
         decision_obj: ReviewDecision = structured_llm.invoke(messages)
         
-        decision = decision_obj.decision
-        feedback = decision_obj.reason if decision == "FAIL" else None
-        
-        # 如果有具体 issues，追加到 feedback 中
-        if decision == "FAIL" and decision_obj.issues:
-            issues_str = "\n".join([f"- [{i.get('type', '未知问题')}] {i.get('detail', '无详细描述')}" for i in decision_obj.issues])
-            feedback = f"{feedback}\n具体问题：\n{issues_str}"
+        decision = "PASS" if decision_obj.is_pass else "FAIL"
+        feedback = decision_obj.feedback if not decision_obj.is_pass else None
             
-        print(f"  [Reviewer Result] Decision: {decision}, Reason: {feedback}")
+        print(f"  [Reviewer Result] Decision: {decision}, Feedback: {feedback}")
 
         return {
             **state,

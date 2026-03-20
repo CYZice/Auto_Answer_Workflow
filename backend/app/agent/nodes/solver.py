@@ -9,16 +9,19 @@ def solve_node(state: AgentState) -> AgentState:
     """
     print(f"[Node] Solver: Processing task {state['task_id']}")
     
-    # 检查是否被外部干预熔断
+    # 检查是否被外部干预熔断，并更新当前状态
     with SessionLocal() as db:
         task = db.query(Task).filter(Task.task_id == state['task_id']).first()
-        if task and task.state == "cancelled":
-            print(f"  [Solver] Task {state['task_id']} was cancelled by external intervention.")
-            return {
-                **state,
-                "status": "cancelled",
-                "error_msg": "Task was manually cancelled."
-            }
+        if task:
+            if task.state == "cancelled":
+                print(f"  [Solver] Task {state['task_id']} was cancelled by external intervention.")
+                return {
+                    **state,
+                    "status": "cancelled",
+                    "error_msg": "Task was manually cancelled."
+                }
+            task.state = "solving"
+            db.commit()
     
     # 获取输入参数
     image_url = state.get("image_url")

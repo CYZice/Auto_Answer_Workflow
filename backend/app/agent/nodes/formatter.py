@@ -9,16 +9,19 @@ def format_node(state: AgentState) -> AgentState:
     """
     print(f"[Node] Formatter: Formatting task {state['task_id']}")
     
-    # 检查是否被外部干预熔断
+    # 检查是否被外部干预熔断，并更新当前状态
     with SessionLocal() as db:
         task = db.query(Task).filter(Task.task_id == state['task_id']).first()
-        if task and task.state == "cancelled":
-            print(f"  [Formatter] Task {state['task_id']} was cancelled by external intervention.")
-            return {
-                **state,
-                "status": "cancelled",
-                "error_msg": "Task was manually cancelled."
-            }
+        if task:
+            if task.state == "cancelled":
+                print(f"  [Formatter] Task {state['task_id']} was cancelled by external intervention.")
+                return {
+                    **state,
+                    "status": "cancelled",
+                    "error_msg": "Task was manually cancelled."
+                }
+            task.state = "formatting"
+            db.commit()
 
     # 防御性编程
     draft_solution = state.get("draft_solution")

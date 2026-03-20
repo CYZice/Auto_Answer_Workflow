@@ -5,9 +5,8 @@ from datetime import datetime
 
 # --- Agent Reviewer 结构化输出契约 ---
 class ReviewDecision(BaseModel):
-    decision: Literal["PASS", "FAIL"] = Field(description="审查结论")
-    reason: Optional[str] = Field(None, description="整体原因概括（FAIL 时必填）")
-    issues: Optional[List[dict]] = Field(default_factory=list, description="具体错误点列表，包含 type 和 detail 字段")
+    is_pass: bool = Field(description="审查是否通过。通过为true，发现错误为false")
+    feedback: str = Field(default="", description="如果不通过，请详细说明具体的错误点和原因；如果通过，可以留空或写'无'。")
 
 # --- API 请求与响应契约 ---
 class TaskStatus(str, Enum):
@@ -21,6 +20,8 @@ class TaskStatus(str, Enum):
     CANCELLED = "cancelled"
 
 class ModelConfig(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    
     model_name: Optional[str] = Field(default=None, description="模型名称")
     api_key: Optional[str] = Field(default=None, description="API Key (如未提供则使用系统环境变量)")
     base_url: Optional[str] = Field(default=None, description="API Base URL")

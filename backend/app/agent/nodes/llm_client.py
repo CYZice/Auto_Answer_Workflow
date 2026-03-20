@@ -48,12 +48,12 @@ def get_llm(model_config: Optional[dict] = None):
         model=model_name,
         api_key=api_key,
         base_url=base_url,
-        streaming=True, # 开启流式输出
-        temperature=0.5, # 稍微提高温度，避免模型在低温度下陷入死循环复读
+        streaming=config.get("streaming", True),
+        temperature=config.get("temperature", 0.5),
         max_tokens=config.get("max_tokens", 4096),
         model_kwargs={
             "max_completion_tokens": config.get("max_tokens", 4096), # 兼容某些服务商强制要求的 max_completion_tokens
-            "frequency_penalty": 0.5 # 增加重复惩罚，极大地降低“复读机”死循环的概率
+            "frequency_penalty": config.get("frequency_penalty", 0.5)
         }   
     )
 
@@ -125,7 +125,9 @@ async def solve_image(image_url: str, review_feedback: Optional[str] = None, mod
     # 调用模型
     response = await llm.ainvoke(messages)
     
-    tokens = response.response_metadata.get("token_usage", {}).get("total_tokens", 0)
+    response_metadata = getattr(response, "response_metadata", None) or {}
+    token_usage = response_metadata.get("token_usage") or {}
+    tokens = token_usage.get("total_tokens", 0)
     if task_id:
         # DB操作放进异步线程避免阻塞
         import asyncio
@@ -159,22 +161,22 @@ async def format_solution(draft_solution: str, model_config: Optional[dict] = No
 - 末尾要求：在解析结束后，空一行，添加 `【考点延伸】` 部分。
 
 # 《考点延伸参考知识库》
-- 专题 1 电路基本定理：题型 1 功率计算 $P=UI$（核心：吸收与发出功率判定）；题型 2 基尔霍夫定律（核心：独立 KCL/KVL 方程数判定）；题型 3 含受控源电路（核心：控制量关系）。
-- 专题 2 等效电路法：题型 1 戴维南及诺顿等效（核心：开路电压与短路电流）；题型 2 入端电阻 $Rin$（核心：外加电源法）。
-- 专题 3 电路方程法：题型 1 支路电流法；题型 2 回路电流法；题型 3 节点电压法（核心：弥尔曼定理与无压支路）。
-- 专题 4 电路定理法：题型 1 叠加定理（核心：受控源不能单独作用）；题型 2 等效电源定理；题型 3 特勒根与互易定理。
-- 专题 5 正弦稳态：题型 1 相量法（核心：时频域转换）；题型 2 正弦功率（核心：复功率与平均功率）。
-- 专题 6 谐振与互感：题型 1 谐振电路（核心：品质因数 Q）；题型 2 互感/变压器（核心：同名端与消互感）。
-- 专题 7 三相与非正弦：题型 1 三相电路（核心：线相关系）；题型 2 非正弦（核心：各次谐波功率独立性）。
-- 专题 8 暂态分析：题型 1 一阶电路（核心：三要素法）；题型 2 初始态突变（核心：换路定则）。
-- 专题 9 双口网络：题型 1 参数求解（核心：开路/短路测试条件）。
+- 专题 1 电路基本定理：题型 1 功率计算 $P=UI$；题型 2 基尔霍夫定律；题型 3 含受控源电路。
+- 专题 2 等效电路法：题型 1 戴维南及诺顿等效；题型 2 入端电阻 $Rin$。
+- 专题 3 电路方程法：题型 1 支路电流法；题型 2 回路电流法；题型 3 节点电压法。
+- 专题 4 电路定理法：题型 1 叠加定理；题型 2 等效电源定理；题型 3 特勒根与互易定理。
+- 专题 5 正弦稳态：题型 1 相量法；题型 2 正弦功率。
+- 专题 6 谐振与互感：题型 1 谐振电路；题型 2 互感/变压器。
+- 专题 7 三相与非正弦：题型 1 三相电路；题型 2 非正弦。
+- 专题 8 暂态分析：题型 1 一阶电路；题型 2 初始态突变。
+- 专题 9 双口网络：题型 1 参数求解。    
 
 # Output Format Example
 【解析】
 根据基尔霍夫电流定律可知，流入节点 $a$ 的电流 $I_1$ 等于...由此推导出...
 
 【考点延伸】
-专题 X 题型 Y 专题名称 核心技巧/注意事项"""
+专题 X 题型 Y 专题名称 """
     
     user_prompt = f"请对以下解题草稿进行最终排版：\n\n{draft_solution}"
         
@@ -186,7 +188,9 @@ async def format_solution(draft_solution: str, model_config: Optional[dict] = No
     # 调用模型
     response = await llm.ainvoke(messages)
     
-    tokens = response.response_metadata.get("token_usage", {}).get("total_tokens", 0)
+    response_metadata = getattr(response, "response_metadata", None) or {}
+    token_usage = response_metadata.get("token_usage") or {}
+    tokens = token_usage.get("total_tokens", 0)
     if task_id:
         import asyncio
         asyncio.create_task(asyncio.to_thread(log_agent_interaction, task_id, "formatter", messages, response.content, tokens))

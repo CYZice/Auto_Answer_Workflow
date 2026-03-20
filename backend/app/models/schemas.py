@@ -38,7 +38,7 @@ class TaskCreateResponse(BaseModel):
     status: TaskStatus
 
 class ManualSubmitRequest(BaseModel):
-    action: Literal["resume", "fail"] = Field(description="resume表示继续排版，fail表示放弃")
+    action: Literal["resume", "skip_review", "fail"] = Field(description="resume表示按失败节点恢复，skip_review表示跳过审查直接进入排版，fail表示放弃")
     draft_solution: Optional[str] = Field(None, description="人工修正后的解题内容")
     solver_config: Optional[ModelConfig] = Field(default=None, description="重试时使用的 Solver 模型配置")
     reviewer_config: Optional[ModelConfig] = Field(default=None, description="重试时使用的 Reviewer 模型配置")

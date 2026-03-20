@@ -33,7 +33,8 @@ async def solve_node(state: AgentState) -> AgentState:
     # 获取输入参数
     image_url = state.get("image_url")
     review_feedback = state.get("review_feedback")
-    solver_config = state.get("agent_configs", {}).get("solver", {})
+    agent_configs = state.get("agent_configs") or {}
+    solver_config = agent_configs.get("solver") or {}
     
     # 防御性编程：如果没有图片地址，直接失败
     if not image_url:

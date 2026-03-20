@@ -3,6 +3,7 @@ from app.models.schemas import ReviewDecision
 from app.agent.nodes.llm_client import get_llm
 from langchain_core.messages import SystemMessage, HumanMessage
 import json
+import re
 from app.core.database import SessionLocal
 from app.models.domain import Task
 
@@ -47,10 +48,104 @@ async def review_node(state: AgentState) -> AgentState:
     messages = []
     raw_response_text = None
     review_tokens = 200
+    def normalize_text(value):
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            text = value.strip()
+        else:
+            if isinstance(value, list):
+                parts = []
+                for item in value:
+                    if isinstance(item, str):
+                        parts.append(item)
+                    elif isinstance(item, dict):
+                        if item.get("type") == "text" and isinstance(item.get("text"), str):
+                            parts.append(item["text"])
+                        else:
+                            try:
+                                parts.append(json.dumps(item, ensure_ascii=False))
+                            except Exception:
+                                parts.append(str(item))
+                    else:
+                        parts.append(str(item))
+                text = "".join(parts).strip()
+            else:
+                text = json.dumps(value, ensure_ascii=False).strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", text)
+            text = re.sub(r"\n?```$", "", text)
+        return text.strip()
+
+    def extract_json_object(text: str):
+        if not text:
+            return None
+        start = text.find("{")
+        while start != -1:
+            in_string = False
+            escaped = False
+            depth = 0
+            for idx in range(start, len(text)):
+                ch = text[idx]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == "\"":
+                        in_string = False
+                    continue
+                if ch == "\"":
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return text[start:idx + 1]
+            start = text.find("{", start + 1)
+        return None
+
+    def recover_decision_from_text(value):
+        text = normalize_text(value)
+        if not text:
+            return None
+        candidates = [text]
+        extracted = extract_json_object(text)
+        if extracted and extracted != text:
+            candidates.insert(0, extracted)
+        for candidate in candidates:
+            try:
+                parsed_json = json.loads(candidate)
+                if isinstance(parsed_json, dict):
+                    return ReviewDecision.model_validate(parsed_json)
+            except Exception:
+                continue
+        match = re.search(r'"?is_pass"?\s*[:=]\s*(true|false|"true"|"false"|1|0)', text, flags=re.IGNORECASE)
+        if not match and "is_pass" not in text:
+            return None
+        if match:
+            token = match.group(1).strip('"').lower()
+            is_pass = token in {"true", "1"}
+        else:
+            lowered = text.lower()
+            if "is_pass" in lowered and "false" in lowered:
+                is_pass = False
+            else:
+                is_pass = True
+        feedback_match = re.search(r'"?feedback"?\s*[:=]\s*"((?:[^"\\]|\\.)*)"', text, flags=re.IGNORECASE)
+        if feedback_match:
+            feedback = bytes(feedback_match.group(1), "utf-8").decode("unicode_escape")
+        else:
+            feedback = ""
+        return ReviewDecision(is_pass=is_pass, feedback=feedback)
     try:
         print(f"  -> Calling LLM (Reviewer with Structured Output)...")
-        reviewer_config = state.get("agent_configs", {}).get("reviewer", {})
-        llm = get_llm(reviewer_config)
+        agent_configs = state.get("agent_configs") or {}
+        reviewer_config = agent_configs.get("reviewer") or {}
+        reviewer_runtime_config = dict(reviewer_config)
+        reviewer_runtime_config["streaming"] = False
+        llm = get_llm(reviewer_runtime_config)
         
         # 使用 LangChain 的 with_structured_output 绑定 Pydantic 模型
         # 这将强制模型输出完全符合 ReviewDecision 的 JSON 结构
@@ -101,19 +196,36 @@ async def review_node(state: AgentState) -> AgentState:
                     raw_response_text = raw_content
                 else:
                     raw_response_text = json.dumps(raw_content, ensure_ascii=False)
-                review_tokens = raw_message.response_metadata.get("token_usage", {}).get("total_tokens", review_tokens)
+                raw_metadata = getattr(raw_message, "response_metadata", None)
+                if not isinstance(raw_metadata, dict):
+                    raw_metadata = {}
+                token_usage = raw_metadata.get("token_usage")
+                if not isinstance(token_usage, dict):
+                    token_usage = {}
+                review_tokens = token_usage.get("total_tokens", review_tokens)
             if parsed_result is None:
-                if parsing_error:
+                recovered = recover_decision_from_text(raw_response_text)
+                if recovered is not None:
+                    decision_obj = recovered
+                elif parsing_error:
                     raise parsing_error
-                raise ValueError("Reviewer structured output parsing failed.")
+                else:
+                    raise ValueError("Reviewer structured output parsing failed.")
             if isinstance(parsed_result, ReviewDecision):
-                decision_obj = parsed_result
-            else:
+                if decision_obj is None:
+                    decision_obj = parsed_result
+            elif decision_obj is None:
                 decision_obj = ReviewDecision.model_validate(parsed_result)
         elif isinstance(structured_result, ReviewDecision):
             decision_obj = structured_result
         else:
-            decision_obj = ReviewDecision.model_validate(structured_result)
+            try:
+                decision_obj = ReviewDecision.model_validate(structured_result)
+            except Exception:
+                recovered = recover_decision_from_text(structured_result)
+                if recovered is None:
+                    raise
+                decision_obj = recovered
         
         decision = "PASS" if decision_obj.is_pass else "FAIL"
         feedback = decision_obj.feedback if not decision_obj.is_pass else None
@@ -121,7 +233,6 @@ async def review_node(state: AgentState) -> AgentState:
         print(f"  [Reviewer Result] Decision: {decision}, Feedback: {feedback}")
         
         from app.agent.nodes.llm_client import log_agent_interaction
-        import json
         import asyncio
         if raw_response_text is None:
             raw_response_text = json.dumps({"is_pass": decision_obj.is_pass, "feedback": decision_obj.feedback}, ensure_ascii=False)
@@ -156,7 +267,13 @@ async def review_node(state: AgentState) -> AgentState:
                     raw_response_text = fallback_content
                 else:
                     raw_response_text = json.dumps(fallback_content, ensure_ascii=False)
-                review_tokens = fallback_response.response_metadata.get("token_usage", {}).get("total_tokens", review_tokens)
+                fallback_metadata = getattr(fallback_response, "response_metadata", None)
+                if not isinstance(fallback_metadata, dict):
+                    fallback_metadata = {}
+                fallback_token_usage = fallback_metadata.get("token_usage")
+                if not isinstance(fallback_token_usage, dict):
+                    fallback_token_usage = {}
+                review_tokens = fallback_token_usage.get("total_tokens", review_tokens)
             except Exception as fallback_error:
                 raw_response_text = f"__RAW_RESPONSE_UNAVAILABLE__: {fallback_error}"
         if raw_response_text is None:

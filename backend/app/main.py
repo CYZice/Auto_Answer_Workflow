@@ -366,6 +366,7 @@ def submit_manual_review(task_id: str, req: ManualSubmitRequest, background_task
         
     # 如果 action 是 resume，按失败节点恢复执行
     task.state = TaskStatus.QUEUED.value
+    task.error_code = None
     
     # 将人工编辑的草稿注入到历史字段，供下一次执行时读取
     try:
@@ -380,11 +381,17 @@ def submit_manual_review(task_id: str, req: ManualSubmitRequest, background_task
         current_history["reviewer_config"] = req.reviewer_config.model_dump()
     if req.formatter_config is not None:
         current_history["formatter_config"] = req.formatter_config.model_dump()
-    resume_node = current_history.get("failed_node", "solver")
-    if resume_node not in VALID_RESUME_NODES:
-        resume_node = "solver"
-    if resume_node in {"reviewer", "formatter"} and not current_history.get("draft_solution"):
-        resume_node = "solver"
+    if req.action == "skip_review":
+        if not current_history.get("draft_solution"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Draft solution is required when skipping review.")
+        resume_node = "formatter"
+        current_history["failed_node"] = "reviewer"
+    else:
+        resume_node = current_history.get("failed_node", "solver")
+        if resume_node not in VALID_RESUME_NODES:
+            resume_node = "solver"
+        if resume_node in {"reviewer", "formatter"} and not current_history.get("draft_solution"):
+            resume_node = "solver"
     task.history = json.dumps(current_history, ensure_ascii=False)
     
     db.commit()

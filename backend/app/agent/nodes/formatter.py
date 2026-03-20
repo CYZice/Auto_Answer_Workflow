@@ -40,7 +40,8 @@ async def format_node(state: AgentState) -> AgentState:
             "error_msg": "Cannot format empty draft."
         }
         
-    formatter_config = state.get("agent_configs", {}).get("formatter", {})
+    agent_configs = state.get("agent_configs") or {}
+    formatter_config = agent_configs.get("formatter") or {}
     
     try:
         # 调用大模型进行排版润色

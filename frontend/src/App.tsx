@@ -202,7 +202,7 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   })
   const submittedTaskStatusQueries = useQueries({
     queries: submittedTasks.map((task) => ({
-      queryKey: ['task-status', task.taskId],
+      queryKey: ['task', task.taskId],
       queryFn: () => api.get<AdminTask>(`/api/tasks/${task.taskId}`).then((res) => res.data),
       refetchInterval: (query: { state: { data?: AdminTask } }) => {
         const state = query.state.data?.state;
@@ -222,6 +222,33 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       }),
     [submittedTasks, submittedTaskStatusQueries]
   )
+  useEffect(() => {
+    if (submittedTasks.length === 0) return
+
+    const taskIdsToRemove = submittedTasks.reduce<string[]>((acc, task, index) => {
+      const queryState = submittedTaskStatusQueries[index]
+      const queryError = queryState?.error
+      if (axios.isAxiosError(queryError) && queryError.response?.status === 404) {
+        acc.push(task.taskId)
+        return acc
+      }
+      const taskState = (queryState?.data as AdminTask | undefined)?.state
+      if (taskState === 'completed') {
+        acc.push(task.taskId)
+      }
+      return acc
+    }, [])
+
+    if (taskIdsToRemove.length === 0) return
+
+    const taskIdsToRemoveSet = new Set(taskIdsToRemove)
+    setSubmittedTasks((prev) => prev.filter((task) => !taskIdsToRemoveSet.has(task.taskId)))
+    setActiveTaskId((prev) => {
+      if (!prev) return prev
+      if (taskIdsToRemoveSet.has(prev)) return null
+      return prev
+    })
+  }, [submittedTasks, submittedTaskStatusQueries])
   const isRunningState = (state: string) => RUNNING_TASK_STATES.includes(state)
   const runningCount = submittedTaskItems.filter((task) => isRunningState(task.state)).length
   const completedCount = submittedTaskItems.filter((task) => task.state === 'completed').length
@@ -672,9 +699,9 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
   }, [taskId, isTaskEnded]);
 
   const manualMutation = useMutation({
-    mutationFn: ({ action, draft }: { action: 'resume' | 'fail', draft?: string }) => {
+    mutationFn: ({ action, draft }: { action: 'resume' | 'skip_review' | 'fail', draft?: string }) => {
       const payload: Record<string, unknown> = { action, draft_solution: draft }
-      if (action === 'resume') {
+      if (action === 'resume' || action === 'skip_review') {
         Object.assign(payload, getLatestRetryConfigs())
       }
       return api.post(`/api/tasks/${taskId}/manual`, payload).then(res => res.data)
@@ -696,6 +723,7 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
 
   const history = task.history ? JSON.parse(task.history) : {}
   const tokens = task.token_usage ? JSON.parse(task.token_usage) : {}
+  const shouldShowTaskError = Boolean(task.error_code) && ['failed', 'manual', 'cancelled'].includes(task.state)
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 bg-white p-6 rounded-xl shadow-sm border">
@@ -726,7 +754,7 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
           </div>
         </div>
 
-        {task.error_code && (
+        {shouldShowTaskError && (
           <div className="bg-red-50 text-red-700 p-4 rounded text-sm font-mono border border-red-100">
             <strong>Error:</strong> {task.error_code}
           </div>
@@ -756,6 +784,12 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
                 className="bg-green-600 text-white px-6 py-2.5 rounded font-medium hover:bg-green-700 transition-colors shadow-sm"
               >
                 Approve & Resume
+              </button>
+              <button 
+                onClick={() => manualMutation.mutate({ action: 'skip_review', draft: draftInput || history.draft_solution })}
+                className="bg-blue-600 text-white px-6 py-2.5 rounded font-medium hover:bg-blue-700 transition-colors shadow-sm"
+              >
+                Skip Review & Format
               </button>
               <button 
                 onClick={() => manualMutation.mutate({ action: 'fail' })}
@@ -798,7 +832,7 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
                 <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-600"></div>
                 <p className="font-medium text-gray-700">Agent is working...</p>
                 <span className="text-xs px-3 py-1 bg-white border rounded-full shadow-sm text-blue-600 font-mono">
-                  {currentNode || task.state}
+                  {currentNode ? `${task.state} · ${currentNode}` : task.state}
                 </span>
               </div>
               <button 

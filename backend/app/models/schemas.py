@@ -22,9 +22,19 @@ class TaskStatus(str, Enum):
     MANUAL = "manual"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
+
+class ModelConfig(BaseModel):
+    model_name: str = Field(default="gpt-4o-mini", description="模型名称")
+    api_key: Optional[str] = Field(default=None, description="API Key (如未提供则使用系统环境变量)")
+    base_url: Optional[str] = Field(default="https://api.openai.com/v1", description="API Base URL")
+    max_tokens: Optional[int] = Field(default=4096, description="最大生成 Token 数")
 
 class TaskCreateRequest(BaseModel):
     image_url: str = Field(..., description="题目图片本地存储路径或云端链接")
+    solver_config: Optional[ModelConfig] = Field(default=None, description="Solver(解题)节点的大模型配置")
+    reviewer_config: Optional[ModelConfig] = Field(default=None, description="Reviewer(审查)节点的大模型配置")
+    formatter_config: Optional[ModelConfig] = Field(default=None, description="Formatter(排版)节点的大模型配置")
 
 class TaskCreateResponse(BaseModel):
     task_id: str

@@ -5,6 +5,11 @@ from contextlib import asynccontextmanager
 import uuid
 import asyncio
 import json
+import os
+from dotenv import load_dotenv
+
+# 加载 .env 环境变量
+load_dotenv()
 
 from app.core.database import engine, Base, get_db
 from app.models.domain import Task
@@ -36,12 +41,26 @@ async def run_agent_workflow_async(task_id: str, db: Session):
             return
 
         # 2. 构造图引擎的初始状态
+        # 尝试从 history 中提取动态模型配置
+        agent_configs = {}
+        try:
+            if task_record.history:
+                history_data = json.loads(task_record.history)
+                agent_configs = {
+                    "solver": history_data.get("solver_config", {}),
+                    "reviewer": history_data.get("reviewer_config", {}),
+                    "formatter": history_data.get("formatter_config", {})
+                }
+        except Exception:
+            pass
+
         initial_state = {
             "task_id": task_record.task_id,
             "image_url": task_record.image_url,
             "status": task_record.state,
             "retry_count": task_record.retry_count,
-            "total_tokens": 0
+            "total_tokens": 0,
+            "agent_configs": agent_configs
         }
         
         # 3. 运行图引擎
@@ -52,15 +71,26 @@ async def run_agent_workflow_async(task_id: str, db: Session):
             final_state = await asyncio.to_thread(graph_app.invoke, initial_state)
             
             # 4. 工作流结束，将最终状态落库
-            task_record.state = final_state.get("status", "failed")
+            # 必须重新获取 session 里的 task_record，防止多线程下 session 过期或 detached
+            task_record = db.query(Task).filter(Task.task_id == task_id).first()
+            if not task_record: return
+
+            # 如果在执行期间被标记为 cancelled，保持 cancelled 状态
+            if task_record.state != TaskStatus.CANCELLED.value:
+                task_record.state = final_state.get("status", "failed")
+            
             task_record.retry_count = final_state.get("retry_count", 0)
             
-            # 提取可能存在的历史记录或草稿
-            history_data = {
+            # 提取可能存在的历史记录或草稿并合并
+            try:
+                history_data = json.loads(task_record.history) if task_record.history else {}
+            except Exception:
+                history_data = {}
+            history_data.update({
                 "draft_solution": final_state.get("draft_solution"),
                 "review_decision": final_state.get("review_decision"),
                 "review_feedback": final_state.get("review_feedback"),
-            }
+            })
             task_record.history = json.dumps(history_data, ensure_ascii=False)
             
             task_record.final_result = final_state.get("final_result")
@@ -73,10 +103,11 @@ async def run_agent_workflow_async(task_id: str, db: Session):
         except Exception as e:
             # 异常时进行防断保护
             print(f"[{task_id}] Workflow crashed: {e}")
-            task_record.state = TaskStatus.FAILED.value
-            task_record.error_code = f"System Error: {str(e)}"
-            db.commit()
-
+            task_record = db.query(Task).filter(Task.task_id == task_id).first()
+            if task_record:
+                task_record.state = TaskStatus.FAILED.value
+                task_record.error_code = f"System Error: {str(e)}"
+                db.commit()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -89,19 +120,33 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# 配置 CORS，允许前端跨域请求
+# 配置 CORS，增加对大请求体（Base64图片）的支持
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # 在生产环境中应该指定具体的前端地址
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# 增大 FastAPI 接收 JSON 的默认限制（如果不加这个，太大的 Base64 会报 413 Payload Too Large）
+from fastapi import Request
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+
+class LimitUploadSize(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.method == 'POST':
+            if int(request.headers.get('content-length', 0)) > 50 * 1024 * 1024: # 50MB 限制
+                return JSONResponse(status_code=413, content={"detail": "Payload too large"})
+        return await call_next(request)
+
+app.add_middleware(LimitUploadSize)
+
 @app.post("/api/tasks", response_model=TaskCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_task(req: TaskCreateRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """
-    接收前端上传的题目图片地址，初始化一个解析任务并丢入后台队列执行。
+    接收前端上传的题目图片地址（或 Base64），初始化一个解析任务并丢入后台队列执行。
     """
     try:
         new_task_id = f"task_{uuid.uuid4().hex[:8]}"
@@ -111,7 +156,12 @@ async def create_task(req: TaskCreateRequest, background_tasks: BackgroundTasks,
             task_id=new_task_id,
             thread_id=new_thread_id,
             image_url=req.image_url,
-            state=TaskStatus.QUEUED.value
+            state=TaskStatus.QUEUED.value,
+            history=json.dumps({
+                "solver_config": req.solver_config.model_dump() if req.solver_config else {},
+                "reviewer_config": req.reviewer_config.model_dump() if req.reviewer_config else {},
+                "formatter_config": req.formatter_config.model_dump() if req.formatter_config else {}
+            }, ensure_ascii=False)
         )
         
         db.add(new_task)
@@ -165,17 +215,34 @@ def submit_manual_review(task_id: str, req: ManualSubmitRequest, background_task
         
     # 如果 action 是 resume，根据 PRD，相当于直接赋予草稿并让它去 formatting
     # 这里我们简化逻辑：更新数据库里的草稿，并把状态强行置为 queued（或其他入口），重新排队
-    # 更严谨的做法是在 initial_state 中带入修改过的 draft 并直接跳转到 formatting 节点
     task.state = TaskStatus.QUEUED.value
     
-    # 将人工编辑的草稿注入到历史字段，供下一次执行时读取（简单实现）
+    # 将人工编辑的草稿注入到历史字段，供下一次执行时读取
     current_history = json.loads(task.history) if task.history else {}
     current_history["draft_solution"] = req.draft_solution
     task.history = json.dumps(current_history, ensure_ascii=False)
     
     db.commit()
     
-    # 重新触发后台工作流（可以在 run_agent_workflow_async 内部解析历史来做断点恢复）
+    # 重新触发后台工作流
     background_tasks.add_task(run_agent_workflow_async, task.task_id, db)
     
     return {"status": "success", "message": "Task resumed and queued for formatting."}
+
+@app.post("/api/tasks/{task_id}/cancel")
+def cancel_task(task_id: str, db: Session = Depends(get_db)):
+    """
+    外部干预接口：熔断/终止一个正在执行的任务
+    """
+    task = db.query(Task).filter(Task.task_id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+        
+    if task.state in [TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value]:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Task is already in {task.state} state.")
+        
+    task.state = TaskStatus.CANCELLED.value
+    task.error_code = "Manually cancelled."
+    db.commit()
+    
+    return {"status": "success", "message": "Task marked as cancelled."}

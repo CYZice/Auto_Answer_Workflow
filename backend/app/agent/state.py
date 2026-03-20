@@ -9,7 +9,7 @@ class AgentState(TypedDict):
     image_url: str
     
     # 当前流程的内部状态
-    status: Literal["queued", "solving", "reviewing", "formatting", "manual", "completed", "failed"]
+    status: Literal["queued", "solving", "reviewing", "formatting", "manual", "completed", "failed", "cancelled"]
     
     # 节点流转数据
     draft_solution: Optional[str]      # Solver 输出的草稿 / 人工编辑后的草稿
@@ -21,3 +21,6 @@ class AgentState(TypedDict):
     retry_count: int                   # 当前重试次数（第 2 次审查仍失败即 failed）
     error_msg: Optional[str]           # 系统错误信息
     total_tokens: int                  # 累计消耗的 Token
+    
+    # 动态模型配置
+    agent_configs: Optional[dict]       # 包含各个节点的模型配置，如 {"solver": {...}, "reviewer": {...}}

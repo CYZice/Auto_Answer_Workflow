@@ -10,6 +10,11 @@ def route_after_review(state: AgentState) -> Literal["formatter", "solver", "fai
     条件路由：根据 Reviewer 的裁决决定下一步。
     对应 PRD：允许 1 次重做（即最多 2 次审查）；第二次审查仍 FAIL -> failed
     """
+    # 优先检查是否因为异常或外部熔断已经标记为 failed 或 cancelled
+    if state.get("status") in ["failed", "cancelled"]:
+        print(f"  [Router] State is {state.get('status')} -> failed")
+        return "failed"
+
     decision = state.get("review_decision")
     current_retry = state.get("retry_count", 0)
     

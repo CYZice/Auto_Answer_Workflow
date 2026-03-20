@@ -12,7 +12,8 @@ class Task(Base):
 
     task_id = Column(String, primary_key=True, index=True, doc="唯一主键")
     thread_id = Column(String, index=True, nullable=False, doc="任务线程标识（用于串联多轮尝试）")
-    image_url = Column(String, nullable=False, doc="图片存储位置（本地路径或对象存储 URL）")
+    # 把 image_url 的类型改为 Text 以支持极长的 Base64 字符串
+    image_url = Column(Text, nullable=False, doc="图片存储位置（本地路径或对象存储 URL 或 Base64）")
     state = Column(String, nullable=False, default="queued", doc="queued/solving/reviewing/formatting/manual/completed/failed")
     retry_count = Column(Integer, nullable=False, default=0, doc="当前已重试次数")
     

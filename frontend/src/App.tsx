@@ -4,7 +4,7 @@ import axios from 'axios'
 import ReactMarkdown from 'react-markdown'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
-import { X, Image as ImageIcon, Play, Plus, Maximize2, Settings, Database, Save, Trash2 } from 'lucide-react'
+import { X, Image as ImageIcon, Play, Plus, Maximize2, Settings, Database, Save, Trash2, Download } from 'lucide-react'
 import 'katex/dist/katex.min.css'
 
 const queryClient = new QueryClient()
@@ -580,6 +580,8 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
   const [searchTaskId, setSearchTaskId] = useState('')
   const [stateFilter, setStateFilter] = useState('')
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
+  const [selectedExportIds, setSelectedExportIds] = useState<string[]>([])
+  const [isExporting, setIsExporting] = useState(false)
   const [editState, setEditState] = useState('')
   const [editHistory, setEditHistory] = useState('')
   const [editFinalResult, setEditFinalResult] = useState('')
@@ -629,6 +631,12 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
     }
   }, [selectedTaskId, listData])
 
+  useEffect(() => {
+    if (!listData) return
+    const idsInList = new Set(listData.items.map((item) => item.task_id))
+    setSelectedExportIds((prev) => prev.filter((id) => idsInList.has(id)))
+  }, [listData])
+
   const updateMutation = useMutation({
     mutationFn: () =>
       api.patch(`/api/admin/tasks/${selectedTaskId}`, {
@@ -668,6 +676,57 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
     const confirmed = window.confirm(`确认删除任务 ${taskId} 吗？`)
     if (!confirmed) return
     deleteMutation.mutate(taskId)
+  }
+
+  const toggleExportSelection = (taskId: string) => {
+    setSelectedExportIds((prev) => (
+      prev.includes(taskId) ? prev.filter((id) => id !== taskId) : [...prev, taskId]
+    ))
+  }
+
+  const toggleSelectAllInList = () => {
+    const ids = (listData?.items || []).map((item) => item.task_id)
+    if (ids.length === 0) return
+    const allSelected = ids.every((id) => selectedExportIds.includes(id))
+    setSelectedExportIds(allSelected ? [] : ids)
+  }
+
+  const exportFinalResults = async () => {
+    if (selectedExportIds.length === 0) {
+      setOperationMessage('请先勾选任务')
+      return
+    }
+    setIsExporting(true)
+    try {
+      const details = await Promise.all(
+        selectedExportIds.map((taskId) =>
+          api.get<AdminTask>(`/api/admin/tasks/${taskId}`).then((res) => res.data)
+        )
+      )
+      const itemsWithFinalResult = details.filter((task) => (task.final_result || '').trim().length > 0)
+      if (itemsWithFinalResult.length === 0) {
+        setOperationMessage('所选任务没有可导出的最终排版结果')
+        return
+      }
+      const fileContent = itemsWithFinalResult
+        .map((task) => `# ${task.task_id}\n\n${(task.final_result || '').trim()}`)
+        .join('\n\n---\n\n')
+      const blob = new Blob([fileContent], { type: 'text/markdown;charset=utf-8' })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+      link.href = url
+      link.download = `final_results_${timestamp}.md`
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      URL.revokeObjectURL(url)
+      setOperationMessage(`导出成功，共 ${itemsWithFinalResult.length} 条最终排版结果`)
+    } catch (error: unknown) {
+      setOperationMessage(getErrorMessage(error, '导出失败'))
+    } finally {
+      setIsExporting(false)
+    }
   }
 
   return (
@@ -719,20 +778,47 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
           </div>
 
           <div className="pt-2 border-t">
-            <h3 className="font-semibold text-gray-800 mb-2">任务列表 ({listData?.total || 0})</h3>
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="font-semibold text-gray-800">任务列表 ({listData?.total || 0})</h3>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={toggleSelectAllInList}
+                  className="text-xs px-2.5 py-1 border rounded hover:bg-gray-50"
+                >
+                  全选当前列表
+                </button>
+                <button
+                  onClick={exportFinalResults}
+                  disabled={isExporting || selectedExportIds.length === 0}
+                  className="inline-flex items-center gap-1.5 text-xs px-2.5 py-1 bg-indigo-600 text-white rounded disabled:opacity-50 hover:bg-indigo-700"
+                >
+                  <Download size={12} />
+                  {isExporting ? '导出中...' : `导出最终结果(${selectedExportIds.length})`}
+                </button>
+              </div>
+            </div>
             <div className="space-y-2 max-h-[600px] overflow-y-auto">
               {listLoading && <div className="text-sm text-gray-500">加载中...</div>}
               {!listLoading && (listData?.items || []).map((task) => (
-                <button
+                <div
                   key={task.task_id}
-                  onClick={() => setSelectedTaskId(task.task_id)}
                   className={`w-full text-left p-3 rounded-lg border transition-colors ${
                     selectedTaskId === task.task_id ? 'border-indigo-400 bg-indigo-50' : 'border-gray-200 hover:bg-gray-50'
                   }`}
                 >
-                  <div className="text-xs font-mono text-gray-700 truncate">{task.task_id}</div>
-                  <div className="text-xs text-gray-500 mt-1">{task.state} · retry {task.retry_count}</div>
-                </button>
+                  <div className="flex items-start gap-2">
+                    <input
+                      type="checkbox"
+                      checked={selectedExportIds.includes(task.task_id)}
+                      onChange={() => toggleExportSelection(task.task_id)}
+                      className="mt-0.5"
+                    />
+                    <button onClick={() => setSelectedTaskId(task.task_id)} className="flex-1 text-left">
+                      <div className="text-xs font-mono text-gray-700 truncate">{task.task_id}</div>
+                      <div className="text-xs text-gray-500 mt-1">{task.state} · retry {task.retry_count}</div>
+                    </button>
+                  </div>
+                </div>
               ))}
             </div>
           </div>

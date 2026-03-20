@@ -4,7 +4,7 @@ import axios from 'axios'
 import ReactMarkdown from 'react-markdown'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
-import { X, Image as ImageIcon, Play, Plus, Maximize2, Settings } from 'lucide-react'
+import { X, Image as ImageIcon, Play, Plus, Maximize2, Settings, Database, Save, Trash2 } from 'lucide-react'
 import 'katex/dist/katex.min.css'
 
 const queryClient = new QueryClient()
@@ -12,6 +12,14 @@ const queryClient = new QueryClient()
 const api = axios.create({
   baseURL: 'http://localhost:8000',
 })
+
+const getErrorMessage = (error: unknown, fallback: string) => {
+  if (axios.isAxiosError(error)) {
+    return (error.response?.data as { detail?: string } | undefined)?.detail || error.message || fallback
+  }
+  if (error instanceof Error) return error.message
+  return fallback
+}
 
 // --- Types ---
 interface PendingTask {
@@ -26,9 +34,46 @@ interface ModelConfig {
   max_tokens: number;
 }
 
+interface AdminTask {
+  task_id: string;
+  thread_id: string;
+  image_url: string;
+  state: string;
+  retry_count: number;
+  history?: string | null;
+  final_result?: string | null;
+  token_usage?: string | null;
+  error_code?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  manual_operator?: string | null;
+}
+
+interface AdminTaskListResponse {
+  total: number;
+  page: number;
+  page_size: number;
+  items: AdminTask[];
+}
+
+interface AdminLogItem {
+  id: number;
+  task_id: string;
+  node_name: string;
+  request_payload?: string | null;
+  response_payload?: string | null;
+  cost_tokens: number;
+  created_at?: string | null;
+}
+
+interface AdminLogListResponse {
+  total: number;
+  items: AdminLogItem[];
+}
+
 // --- Components ---
 
-function TaskDashboard() {
+function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   // 待处理队列（本地维护）
   const [pendingQueue, setPendingQueue] = useState<PendingTask[]>([])
   // 当前正在预览的图片
@@ -114,9 +159,9 @@ function TaskDashboard() {
         console.log(`✅ 任务提交成功，后端返回 Task ID: ${result.task_id}`);
         // 将最后一个任务设为当前活跃视图
         setActiveTaskId(result.task_id);
-      } catch (error: any) {
+      } catch (error: unknown) {
         console.error("❌ 提交任务失败:", error);
-        const errorMsg = error.response?.data?.detail || error.message || "未知错误";
+        const errorMsg = getErrorMessage(error, "未知错误");
         setErrorMessage(`提交失败: ${errorMsg}`);
         // 如果提交失败，把没提交的放回队列（可选策略）
         // 这里为了体验，只提示错误
@@ -152,13 +197,22 @@ function TaskDashboard() {
           <h1 className="text-3xl font-bold text-gray-900">Zyb-Agent 生产流水线</h1>
           <p className="text-sm text-gray-500 mt-2">提示: 直接在这个页面 <kbd className="bg-gray-100 px-1 rounded border">Ctrl+V</kbd> 粘贴图片即可添加到队列。</p>
         </div>
-        <button 
-          onClick={() => setShowSettings(true)}
-          className="p-2 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-full transition-colors"
-          title="模型配置"
-        >
-          <Settings size={24} />
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={onOpenAdmin}
+            className="p-2 text-gray-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-full transition-colors"
+            title="后台管理"
+          >
+            <Database size={24} />
+          </button>
+          <button 
+            onClick={() => setShowSettings(true)}
+            className="p-2 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-full transition-colors"
+            title="模型配置"
+          >
+            <Settings size={24} />
+          </button>
+        </div>
       </header>
 
       {/* 待处理队列区域 */}
@@ -332,7 +386,7 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
     queryFn: () => api.get(`/api/tasks/${taskId}`).then(res => res.data),
     refetchInterval: (query) => {
       const state = query.state.data?.state;
-      if (state === 'completed' || state === 'failed' || state === 'manual') return false;
+      if (state === 'completed' || state === 'failed' || state === 'manual' || state === 'cancelled') return false;
       return 2000;
     },
   })
@@ -344,10 +398,10 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
   }, [taskId]);
 
   // Use React's useEffect to handle SSE connection
-  const isTaskEnded = task?.state === 'completed' || task?.state === 'failed' || task?.state === 'manual';
+  const isTaskEnded = task?.state === 'completed' || task?.state === 'failed' || task?.state === 'manual' || task?.state === 'cancelled';
   
   useEffect(() => {
-    if (!task || isTaskEnded) return;
+    if (isTaskEnded) return;
 
     const sse = new EventSource(`http://localhost:8000/api/tasks/${taskId}/stream`);
     
@@ -409,6 +463,7 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
             task.state === 'completed' ? 'bg-green-100 text-green-700' :
             task.state === 'failed' ? 'bg-red-100 text-red-700' :
             task.state === 'manual' ? 'bg-yellow-100 text-yellow-700' :
+            task.state === 'cancelled' ? 'bg-gray-200 text-gray-700' :
             'bg-blue-100 text-blue-700'
           }`}>
             {task.state}
@@ -478,6 +533,20 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
               </ReactMarkdown>
             </div>
           </div>
+        ) : task.state === 'cancelled' ? (
+          <div className="space-y-4 h-full flex flex-col">
+            <h3 className="font-semibold text-gray-700 flex items-center gap-2 shrink-0">
+              <span className="w-2 h-2 rounded-full bg-gray-500 inline-block"></span>
+              Workflow Cancelled
+            </h3>
+            <div className="text-sm text-gray-700 bg-gray-50 p-4 rounded border border-gray-200">
+              <p className="font-medium">该任务已停止并以取消状态结束。</p>
+              <p className="mt-2 font-mono text-xs">{task.error_code || 'Manually cancelled.'}</p>
+            </div>
+            <div className="flex-grow overflow-y-auto bg-white p-4 rounded border text-sm font-mono whitespace-pre-wrap shadow-inner text-gray-800 max-h-[400px]">
+              {streamedContent || "No stream content was produced before cancellation."}
+            </div>
+          </div>
         ) : (
           <div className="h-full flex flex-col space-y-4 bg-gray-50 rounded-lg border border-dashed p-6 max-h-[500px]">
             <div className="flex items-center justify-between shrink-0">
@@ -507,15 +576,280 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
   )
 }
 
+function AdminPanel({ onBack }: { onBack: () => void }) {
+  const [searchTaskId, setSearchTaskId] = useState('')
+  const [stateFilter, setStateFilter] = useState('')
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
+  const [editState, setEditState] = useState('')
+  const [editHistory, setEditHistory] = useState('')
+  const [editFinalResult, setEditFinalResult] = useState('')
+  const [editErrorCode, setEditErrorCode] = useState('')
+  const [editManualOperator, setEditManualOperator] = useState('')
+  const [operationMessage, setOperationMessage] = useState<string | null>(null)
+
+  const { data: listData, isLoading: listLoading } = useQuery({
+    queryKey: ['admin-tasks', searchTaskId, stateFilter],
+    queryFn: () =>
+      api
+        .get<AdminTaskListResponse>('/api/admin/tasks', {
+          params: {
+            task_id: searchTaskId || undefined,
+            state: stateFilter || undefined,
+            page: 1,
+            page_size: 100
+          }
+        })
+        .then((res) => res.data)
+  })
+
+  const { data: selectedTask, isLoading: detailLoading } = useQuery({
+    queryKey: ['admin-task-detail', selectedTaskId],
+    queryFn: () => api.get<AdminTask>(`/api/admin/tasks/${selectedTaskId}`).then((res) => res.data),
+    enabled: !!selectedTaskId
+  })
+
+  const { data: logData } = useQuery({
+    queryKey: ['admin-logs', selectedTaskId],
+    queryFn: () => api.get<AdminLogListResponse>('/api/admin/logs', { params: { task_id: selectedTaskId } }).then((res) => res.data),
+    enabled: !!selectedTaskId
+  })
+
+  useEffect(() => {
+    if (!selectedTask) return
+    setEditState(selectedTask.state || '')
+    setEditHistory(selectedTask.history || '')
+    setEditFinalResult(selectedTask.final_result || '')
+    setEditErrorCode(selectedTask.error_code || '')
+    setEditManualOperator(selectedTask.manual_operator || '')
+  }, [selectedTask])
+
+  useEffect(() => {
+    if (!selectedTaskId && listData && listData.items.length > 0) {
+      setSelectedTaskId(listData.items[0].task_id)
+    }
+  }, [selectedTaskId, listData])
+
+  const updateMutation = useMutation({
+    mutationFn: () =>
+      api.patch(`/api/admin/tasks/${selectedTaskId}`, {
+        state: editState || undefined,
+        history: editHistory,
+        final_result: editFinalResult,
+        error_code: editErrorCode || null,
+        manual_operator: editManualOperator || null
+      }),
+    onSuccess: () => {
+      setOperationMessage('保存成功')
+      queryClient.invalidateQueries({ queryKey: ['admin-task-detail', selectedTaskId] })
+      queryClient.invalidateQueries({ queryKey: ['admin-tasks'] })
+    },
+    onError: (error: unknown) => {
+      const msg = getErrorMessage(error, '保存失败')
+      setOperationMessage(msg)
+    }
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: (taskId: string) => api.delete(`/api/admin/tasks/${taskId}`),
+    onSuccess: (_, taskId) => {
+      setOperationMessage(`已删除 ${taskId}`)
+      queryClient.invalidateQueries({ queryKey: ['admin-tasks'] })
+      queryClient.invalidateQueries({ queryKey: ['admin-task-detail'] })
+      queryClient.invalidateQueries({ queryKey: ['admin-logs'] })
+      setSelectedTaskId(null)
+    },
+    onError: (error: unknown) => {
+      const msg = getErrorMessage(error, '删除失败')
+      setOperationMessage(msg)
+    }
+  })
+
+  const handleDelete = (taskId: string) => {
+    const confirmed = window.confirm(`确认删除任务 ${taskId} 吗？`)
+    if (!confirmed) return
+    deleteMutation.mutate(taskId)
+  }
+
+  return (
+    <div className="max-w-7xl mx-auto p-8 space-y-6">
+      <header className="border-b pb-4 flex justify-between items-center">
+        <div>
+          <h1 className="text-3xl font-bold text-gray-900">后台管理</h1>
+          <p className="text-sm text-gray-500 mt-2">按 task_id 管理任务记录</p>
+        </div>
+        <button onClick={onBack} className="px-4 py-2 bg-white border rounded-lg hover:bg-gray-50 transition-colors">
+          返回处理台
+        </button>
+      </header>
+
+      {operationMessage && (
+        <div className="bg-blue-50 border border-blue-200 text-blue-700 px-4 py-2 rounded">
+          {operationMessage}
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="bg-white border rounded-xl p-4 space-y-4">
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-gray-700">Task ID 搜索</label>
+            <input
+              value={searchTaskId}
+              onChange={(e) => setSearchTaskId(e.target.value)}
+              className="w-full border rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+              placeholder="输入 task_id 关键字"
+            />
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-gray-700">状态筛选</label>
+            <select
+              value={stateFilter}
+              onChange={(e) => setStateFilter(e.target.value)}
+              className="w-full border rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+            >
+              <option value="">全部</option>
+              <option value="queued">queued</option>
+              <option value="solving">solving</option>
+              <option value="reviewing">reviewing</option>
+              <option value="formatting">formatting</option>
+              <option value="manual">manual</option>
+              <option value="completed">completed</option>
+              <option value="failed">failed</option>
+              <option value="cancelled">cancelled</option>
+            </select>
+          </div>
+
+          <div className="pt-2 border-t">
+            <h3 className="font-semibold text-gray-800 mb-2">任务列表 ({listData?.total || 0})</h3>
+            <div className="space-y-2 max-h-[600px] overflow-y-auto">
+              {listLoading && <div className="text-sm text-gray-500">加载中...</div>}
+              {!listLoading && (listData?.items || []).map((task) => (
+                <button
+                  key={task.task_id}
+                  onClick={() => setSelectedTaskId(task.task_id)}
+                  className={`w-full text-left p-3 rounded-lg border transition-colors ${
+                    selectedTaskId === task.task_id ? 'border-indigo-400 bg-indigo-50' : 'border-gray-200 hover:bg-gray-50'
+                  }`}
+                >
+                  <div className="text-xs font-mono text-gray-700 truncate">{task.task_id}</div>
+                  <div className="text-xs text-gray-500 mt-1">{task.state} · retry {task.retry_count}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div className="lg:col-span-2 bg-white border rounded-xl p-6 space-y-4">
+          {!selectedTaskId && <div className="text-sm text-gray-500">请从左侧选择任务</div>}
+          {detailLoading && <div className="text-sm text-gray-500">正在加载详情...</div>}
+          {selectedTask && (
+            <>
+              <div className="flex justify-between items-center">
+                <h2 className="text-lg font-semibold text-gray-800 font-mono">{selectedTask.task_id}</h2>
+                <button
+                  onClick={() => handleDelete(selectedTask.task_id)}
+                  className="inline-flex items-center gap-2 px-3 py-1.5 text-sm text-red-600 border border-red-200 rounded hover:bg-red-50"
+                >
+                  <Trash2 size={14} />
+                  删除任务
+                </button>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4 text-sm bg-gray-50 border rounded p-4">
+                <div><strong>thread_id:</strong> {selectedTask.thread_id}</div>
+                <div><strong>retry:</strong> {selectedTask.retry_count}</div>
+                <div><strong>created_at:</strong> {selectedTask.created_at || '-'}</div>
+                <div><strong>updated_at:</strong> {selectedTask.updated_at || '-'}</div>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-gray-700">状态</label>
+                <select value={editState} onChange={(e) => setEditState(e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm">
+                  <option value="queued">queued</option>
+                  <option value="solving">solving</option>
+                  <option value="reviewing">reviewing</option>
+                  <option value="formatting">formatting</option>
+                  <option value="manual">manual</option>
+                  <option value="completed">completed</option>
+                  <option value="failed">failed</option>
+                  <option value="cancelled">cancelled</option>
+                </select>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-gray-700">manual_operator</label>
+                <input value={editManualOperator} onChange={(e) => setEditManualOperator(e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" />
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-gray-700">error_code</label>
+                <input value={editErrorCode} onChange={(e) => setEditErrorCode(e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" />
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-gray-700">history</label>
+                <textarea value={editHistory} onChange={(e) => setEditHistory(e.target.value)} className="w-full min-h-36 border rounded-lg px-3 py-2 text-xs font-mono" />
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-gray-700">final_result</label>
+                <textarea value={editFinalResult} onChange={(e) => setEditFinalResult(e.target.value)} className="w-full min-h-36 border rounded-lg px-3 py-2 text-xs font-mono" />
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-gray-700">token_usage（只读）</label>
+                <pre className="w-full min-h-20 border rounded-lg px-3 py-2 text-xs font-mono bg-gray-50 overflow-auto whitespace-pre-wrap">{selectedTask.token_usage || ''}</pre>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-gray-700">image_url</label>
+                <img src={selectedTask.image_url} alt="task" className="max-h-60 border rounded bg-gray-50 object-contain" />
+              </div>
+
+              <div className="flex justify-end">
+                <button
+                  onClick={() => updateMutation.mutate()}
+                  disabled={updateMutation.isPending}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+                >
+                  <Save size={16} />
+                  {updateMutation.isPending ? '保存中...' : '保存修改'}
+                </button>
+              </div>
+
+              <div className="pt-2 border-t">
+                <h3 className="font-semibold text-gray-800 mb-2">Agent Logs ({logData?.total || 0})</h3>
+                <div className="space-y-3 max-h-80 overflow-y-auto">
+                  {(logData?.items || []).map((log) => (
+                    <div key={log.id} className="border rounded-lg p-3 bg-gray-50 text-xs space-y-2">
+                      <div className="font-semibold text-gray-700">{log.node_name} · tokens {log.cost_tokens} · {log.created_at || '-'}</div>
+                      <pre className="bg-white border rounded p-2 overflow-auto whitespace-pre-wrap">{log.request_payload || ''}</pre>
+                      <pre className="bg-white border rounded p-2 overflow-auto whitespace-pre-wrap">{log.response_payload || ''}</pre>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function App() {
+  const [currentView, setCurrentView] = useState<'dashboard' | 'admin'>('dashboard')
+
   return (
     <QueryClientProvider client={queryClient}>
       <div className="min-h-screen bg-gray-100/50 py-8 font-sans text-gray-800">
-        <TaskDashboard />
+        {currentView === 'dashboard' ? (
+          <TaskDashboard onOpenAdmin={() => setCurrentView('admin')} />
+        ) : (
+          <AdminPanel onBack={() => setCurrentView('dashboard')} />
+        )}
       </div>
     </QueryClientProvider>
   )
 }
 
 export default App
-

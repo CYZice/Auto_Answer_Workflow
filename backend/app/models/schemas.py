@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Dict, Any
 from enum import Enum
 from datetime import datetime
 
@@ -56,3 +56,36 @@ class TaskDetailResponse(BaseModel):
 
     class Config:
         from_attributes = True  # 允许直接从 SQLAlchemy 模型读取数据
+
+class AdminTaskListResponse(BaseModel):
+    total: int
+    page: int
+    page_size: int
+    items: List[TaskDetailResponse]
+
+class AdminTaskUpdateRequest(BaseModel):
+    state: Optional[TaskStatus] = None
+    history: Optional[str] = None
+    final_result: Optional[str] = None
+    error_code: Optional[str] = None
+    manual_operator: Optional[str] = None
+
+class AdminTaskUpdateResponse(BaseModel):
+    message: str
+    task: TaskDetailResponse
+
+class AdminLogItemResponse(BaseModel):
+    id: int
+    task_id: str
+    node_name: str
+    request_payload: Optional[str] = None
+    response_payload: Optional[str] = None
+    cost_tokens: int
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+class AdminLogListResponse(BaseModel):
+    total: int
+    items: List[AdminLogItemResponse]

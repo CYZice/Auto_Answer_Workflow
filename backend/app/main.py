@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -16,7 +16,9 @@ from app.core.database import engine, Base, get_db
 from app.models.domain import Task, AgentLog
 from app.models.schemas import (
     TaskCreateRequest, TaskCreateResponse, TaskDetailResponse, 
-    TaskStatus, ManualSubmitRequest
+    TaskStatus, ManualSubmitRequest, AdminTaskListResponse,
+    AdminTaskUpdateRequest, AdminTaskUpdateResponse,
+    AdminLogListResponse, AdminLogItemResponse
 )
 from app.agent.graph import build_graph
 
@@ -360,3 +362,66 @@ def cancel_task(task_id: str, db: Session = Depends(get_db)):
     db.commit()
     
     return {"status": "success", "message": "Task marked as cancelled."}
+
+@app.get("/api/admin/tasks", response_model=AdminTaskListResponse)
+def admin_list_tasks(
+    task_id: str | None = Query(default=None),
+    state: TaskStatus | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=200),
+    db: Session = Depends(get_db)
+):
+    query = db.query(Task)
+    if task_id:
+        query = query.filter(Task.task_id.like(f"%{task_id}%"))
+    if state:
+        query = query.filter(Task.state == state.value)
+
+    total = query.count()
+    items = (
+        query.order_by(Task.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return AdminTaskListResponse(total=total, page=page, page_size=page_size, items=items)
+
+@app.get("/api/admin/tasks/{task_id}", response_model=TaskDetailResponse)
+def admin_get_task(task_id: str, db: Session = Depends(get_db)):
+    task = db.query(Task).filter(Task.task_id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+    return task
+
+@app.patch("/api/admin/tasks/{task_id}", response_model=AdminTaskUpdateResponse)
+def admin_update_task(task_id: str, req: AdminTaskUpdateRequest, db: Session = Depends(get_db)):
+    task = db.query(Task).filter(Task.task_id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+
+    updates = req.model_dump(exclude_unset=True)
+    for field_name, value in updates.items():
+        if field_name == "state" and value is not None:
+            setattr(task, field_name, value.value)
+        else:
+            setattr(task, field_name, value)
+
+    db.commit()
+    db.refresh(task)
+    return AdminTaskUpdateResponse(message="Task updated successfully.", task=task)
+
+@app.delete("/api/admin/tasks/{task_id}")
+def admin_delete_task(task_id: str, db: Session = Depends(get_db)):
+    task = db.query(Task).filter(Task.task_id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+
+    db.query(AgentLog).filter(AgentLog.task_id == task_id).delete()
+    db.delete(task)
+    db.commit()
+    return {"status": "success", "message": f"Task {task_id} deleted."}
+
+@app.get("/api/admin/logs", response_model=AdminLogListResponse)
+def admin_list_logs(task_id: str, db: Session = Depends(get_db)):
+    logs = db.query(AgentLog).filter(AgentLog.task_id == task_id).order_by(AgentLog.created_at.asc()).all()
+    return AdminLogListResponse(total=len(logs), items=[AdminLogItemResponse.model_validate(log) for log in logs])

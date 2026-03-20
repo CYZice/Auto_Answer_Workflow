@@ -40,6 +40,9 @@ class TaskCreateResponse(BaseModel):
 class ManualSubmitRequest(BaseModel):
     action: Literal["resume", "fail"] = Field(description="resume表示继续排版，fail表示放弃")
     draft_solution: Optional[str] = Field(None, description="人工修正后的解题内容")
+    solver_config: Optional[ModelConfig] = Field(default=None, description="重试时使用的 Solver 模型配置")
+    reviewer_config: Optional[ModelConfig] = Field(default=None, description="重试时使用的 Reviewer 模型配置")
+    formatter_config: Optional[ModelConfig] = Field(default=None, description="重试时使用的 Formatter 模型配置")
 
 class TaskDetailResponse(BaseModel):
     task_id: str

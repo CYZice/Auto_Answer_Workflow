@@ -17,6 +17,9 @@ const RUNNING_TASK_STATES = ['queued', 'solving', 'reviewing', 'formatting']
 const EXCEPTION_TASK_STATES = ['failed', 'manual', 'cancelled']
 const SUBMITTED_TASKS_STORAGE_KEY = 'submitted_tasks'
 const ACTIVE_TASK_ID_STORAGE_KEY = 'active_task_id'
+const SOLVER_CONFIG_STORAGE_KEY = 'solver_config'
+const REVIEWER_CONFIG_STORAGE_KEY = 'reviewer_config'
+const FORMATTER_CONFIG_STORAGE_KEY = 'formatter_config'
 
 const getErrorMessage = (error: unknown, fallback: string) => {
   if (axios.isAxiosError(error)) {
@@ -80,6 +83,12 @@ interface AdminLogListResponse {
   items: AdminLogItem[];
 }
 
+interface RetryModelConfigs {
+  solver_config: ModelConfig;
+  reviewer_config: ModelConfig;
+  formatter_config: ModelConfig;
+}
+
 const readStoredJson = <T,>(key: string, fallback: T): T => {
   const raw = localStorage.getItem(key)
   if (!raw) return fallback
@@ -88,6 +97,29 @@ const readStoredJson = <T,>(key: string, fallback: T): T => {
   } catch {
     return fallback
   }
+}
+
+const getLatestRetryConfigs = (): RetryModelConfigs => ({
+  solver_config: readStoredJson<ModelConfig>(SOLVER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 4096 }),
+  reviewer_config: readStoredJson<ModelConfig>(REVIEWER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 2048 }),
+  formatter_config: readStoredJson<ModelConfig>(FORMATTER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 1024 })
+})
+
+const persistTaskForDashboard = (taskId: string) => {
+  const submittedTasks = readStoredJson<SubmittedTask[]>(SUBMITTED_TASKS_STORAGE_KEY, [])
+  const normalized = Array.isArray(submittedTasks)
+    ? submittedTasks.filter((item): item is SubmittedTask => (
+      typeof item === 'object'
+      && item !== null
+      && typeof item.taskId === 'string'
+      && item.taskId.trim().length > 0
+    ))
+    : []
+  if (!normalized.some((item) => item.taskId === taskId)) {
+    normalized.push({ taskId })
+  }
+  localStorage.setItem(SUBMITTED_TASKS_STORAGE_KEY, JSON.stringify(normalized))
+  localStorage.setItem(ACTIVE_TASK_ID_STORAGE_KEY, taskId)
 }
 
 // --- Components ---
@@ -115,23 +147,23 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [taskFilter, setTaskFilter] = useState<'all' | 'running' | 'completed' | 'exception'>('all')
   const [solverConfig, setSolverConfig] = useState<ModelConfig>(() => {
-    const saved = localStorage.getItem('solver_config')
+    const saved = localStorage.getItem(SOLVER_CONFIG_STORAGE_KEY)
     return saved ? JSON.parse(saved) : { model_name: '', api_key: '', base_url: '', max_tokens: 4096 }
   })
   const [reviewerConfig, setReviewerConfig] = useState<ModelConfig>(() => {
-    const saved = localStorage.getItem('reviewer_config')
+    const saved = localStorage.getItem(REVIEWER_CONFIG_STORAGE_KEY)
     return saved ? JSON.parse(saved) : { model_name: '', api_key: '', base_url: '', max_tokens: 2048 }
   })
   const [formatterConfig, setFormatterConfig] = useState<ModelConfig>(() => {
-    const saved = localStorage.getItem('formatter_config')
+    const saved = localStorage.getItem(FORMATTER_CONFIG_STORAGE_KEY)
     return saved ? JSON.parse(saved) : { model_name: '', api_key: '', base_url: '', max_tokens: 1024 }
   })
 
   // 保存设置到 localStorage
   const saveSettings = () => {
-    localStorage.setItem('solver_config', JSON.stringify(solverConfig))
-    localStorage.setItem('reviewer_config', JSON.stringify(reviewerConfig))
-    localStorage.setItem('formatter_config', JSON.stringify(formatterConfig))
+    localStorage.setItem(SOLVER_CONFIG_STORAGE_KEY, JSON.stringify(solverConfig))
+    localStorage.setItem(REVIEWER_CONFIG_STORAGE_KEY, JSON.stringify(reviewerConfig))
+    localStorage.setItem(FORMATTER_CONFIG_STORAGE_KEY, JSON.stringify(formatterConfig))
     setShowSettings(false)
   }
 
@@ -640,8 +672,13 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
   }, [taskId, isTaskEnded]);
 
   const manualMutation = useMutation({
-    mutationFn: ({ action, draft }: { action: 'resume' | 'fail', draft?: string }) => 
-      api.post(`/api/tasks/${taskId}/manual`, { action, draft_solution: draft }).then(res => res.data),
+    mutationFn: ({ action, draft }: { action: 'resume' | 'fail', draft?: string }) => {
+      const payload: Record<string, unknown> = { action, draft_solution: draft }
+      if (action === 'resume') {
+        Object.assign(payload, getLatestRetryConfigs())
+      }
+      return api.post(`/api/tasks/${taskId}/manual`, payload).then(res => res.data)
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['task', taskId] })
     }
@@ -879,11 +916,52 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
     }
   })
 
+  const retryMutation = useMutation({
+    mutationFn: async () => {
+      if (!selectedTaskId || !selectedTask) throw new Error('请先选择任务')
+      if (!['manual', 'failed'].includes(selectedTask.state)) throw new Error('仅 manual/failed 任务可重试')
+      let draftSolution: string | undefined
+      const historyText = (editHistory || '').trim()
+      if (historyText) {
+        let parsedHistory: unknown
+        try {
+          parsedHistory = JSON.parse(historyText)
+        } catch {
+          throw new Error('history 不是合法 JSON，请先修正后再重试')
+        }
+        if (parsedHistory && typeof parsedHistory === 'object' && 'draft_solution' in parsedHistory) {
+          const rawDraft = (parsedHistory as { draft_solution?: unknown }).draft_solution
+          if (typeof rawDraft === 'string' && rawDraft.trim().length > 0) {
+            draftSolution = rawDraft
+          }
+        }
+      }
+      await api.post(`/api/tasks/${selectedTaskId}/manual`, {
+        action: 'resume',
+        draft_solution: draftSolution,
+        ...getLatestRetryConfigs()
+      })
+    },
+    onSuccess: () => {
+      if (selectedTaskId) {
+        persistTaskForDashboard(selectedTaskId)
+      }
+      setOperationMessage(`已触发重试：${selectedTaskId}`)
+      queryClient.invalidateQueries({ queryKey: ['admin-task-detail', selectedTaskId] })
+      queryClient.invalidateQueries({ queryKey: ['admin-tasks'] })
+      queryClient.invalidateQueries({ queryKey: ['task', selectedTaskId] })
+    },
+    onError: (error: unknown) => {
+      setOperationMessage(getErrorMessage(error, '重试失败'))
+    }
+  })
+
   const handleDelete = (taskId: string) => {
     const confirmed = window.confirm(`确认删除任务 ${taskId} 吗？`)
     if (!confirmed) return
     deleteMutation.mutate(taskId)
   }
+  const canRetrySelectedTask = !!selectedTask && ['manual', 'failed'].includes(selectedTask.state)
 
   const toggleExportSelection = (taskId: string) => {
     setSelectedExportIds((prev) => (
@@ -1038,13 +1116,22 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
             <>
               <div className="flex justify-between items-center">
                 <h2 className="text-lg font-semibold text-gray-800 font-mono">{selectedTask.task_id}</h2>
-                <button
-                  onClick={() => handleDelete(selectedTask.task_id)}
-                  className="inline-flex items-center gap-2 px-3 py-1.5 text-sm text-red-600 border border-red-200 rounded hover:bg-red-50"
-                >
-                  <Trash2 size={14} />
-                  删除任务
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => retryMutation.mutate()}
+                    disabled={!canRetrySelectedTask || retryMutation.isPending}
+                    className="inline-flex items-center gap-2 px-3 py-1.5 text-sm text-green-700 border border-green-200 rounded hover:bg-green-50 disabled:opacity-50"
+                  >
+                    {retryMutation.isPending ? '重试中...' : '断点重试'}
+                  </button>
+                  <button
+                    onClick={() => handleDelete(selectedTask.task_id)}
+                    className="inline-flex items-center gap-2 px-3 py-1.5 text-sm text-red-600 border border-red-200 rounded hover:bg-red-50"
+                  >
+                    <Trash2 size={14} />
+                    删除任务
+                  </button>
+                </div>
               </div>
 
               <div className="grid grid-cols-2 gap-4 text-sm bg-gray-50 border rounded p-4">

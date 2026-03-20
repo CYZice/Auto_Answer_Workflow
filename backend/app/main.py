@@ -374,6 +374,12 @@ def submit_manual_review(task_id: str, req: ManualSubmitRequest, background_task
         current_history = {}
     if req.draft_solution is not None:
         current_history["draft_solution"] = req.draft_solution
+    if req.solver_config is not None:
+        current_history["solver_config"] = req.solver_config.model_dump()
+    if req.reviewer_config is not None:
+        current_history["reviewer_config"] = req.reviewer_config.model_dump()
+    if req.formatter_config is not None:
+        current_history["formatter_config"] = req.formatter_config.model_dump()
     resume_node = current_history.get("failed_node", "solver")
     if resume_node not in VALID_RESUME_NODES:
         resume_node = "solver"

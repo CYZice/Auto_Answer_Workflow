@@ -145,14 +145,15 @@ async def review_node(state: AgentState) -> AgentState:
         reviewer_config = agent_configs.get("reviewer") or {}
         reviewer_runtime_config = dict(reviewer_config)
         reviewer_runtime_config["streaming"] = False
-        llm = get_llm(reviewer_runtime_config)
         
-        # 使用 LangChain 的 with_structured_output 绑定 Pydantic 模型
-        # 这将强制模型输出完全符合 ReviewDecision 的 JSON 结构
-        try:
-            structured_llm = llm.with_structured_output(ReviewDecision, include_raw=True)
-        except TypeError:
-            structured_llm = llm.with_structured_output(ReviewDecision)
+        from app.agent.nodes.llm_client import get_llm, call_with_retry_and_fallback
+        
+        def create_structured_llm(config):
+            llm = get_llm(config)
+            try:
+                return llm.with_structured_output(ReviewDecision, include_raw=True)
+            except TypeError:
+                return llm.with_structured_output(ReviewDecision)
         
         sys_prompt = """# Role
 你是一位极度精准的【电路分析专家】，专门负责电路题目的逻辑审查。你拥有深厚的电类专业功底，做事严谨，杜绝废话。
@@ -184,7 +185,16 @@ async def review_node(state: AgentState) -> AgentState:
             ])
         ]
         
-        structured_result = await structured_llm.ainvoke(messages)
+        fallback_models = reviewer_runtime_config.get("fallback_models", ["gpt-4o", "claude-3-5-sonnet", "gpt-4o-mini"])
+        structured_result = await call_with_retry_and_fallback(
+            create_llm_func=create_structured_llm,
+            messages=messages,
+            model_config=reviewer_runtime_config,
+            fallback_models=fallback_models,
+            timeout=300.0,
+            max_retries=2
+        )
+        
         decision_obj = None
         if isinstance(structured_result, dict):
             parsed_result = structured_result.get("parsed")

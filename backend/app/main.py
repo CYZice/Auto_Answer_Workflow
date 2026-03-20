@@ -130,18 +130,46 @@ app.add_middleware(
 )
 
 # 增大 FastAPI 接收 JSON 的默认限制（如果不加这个，太大的 Base64 会报 413 Payload Too Large）
-from fastapi import Request
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
+# 改用纯 ASGI 中间件实现，避免 BaseHTTPMiddleware 阻塞 BackgroundTasks
+class LimitUploadSizeASGI:
+    def __init__(self, app, max_upload_size: int = 50 * 1024 * 1024): # 默认 50MB
+        self.app = app
+        self.max_upload_size = max_upload_size
 
-class LimitUploadSize(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        if request.method == 'POST':
-            if int(request.headers.get('content-length', 0)) > 50 * 1024 * 1024: # 50MB 限制
-                return JSONResponse(status_code=413, content={"detail": "Payload too large"})
-        return await call_next(request)
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+            
+        if scope["method"] == "POST":
+            # 尝试从 headers 获取 content-length
+            content_length = 0
+            for name, value in scope.get("headers", []):
+                if name.lower() == b"content-length":
+                    try:
+                        content_length = int(value)
+                    except ValueError:
+                        pass
+                    break
+            
+            if content_length > self.max_upload_size:
+                # 返回 413 Payload Too Large
+                response = {
+                    "type": "http.response.start",
+                    "status": 413,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                    ],
+                }
+                await send(response)
+                await send({
+                    "type": "http.response.body",
+                    "body": b'{"detail": "Payload too large"}',
+                })
+                return
+                
+        await self.app(scope, receive, send)
 
-app.add_middleware(LimitUploadSize)
+app.add_middleware(LimitUploadSizeASGI)
 
 @app.post("/api/tasks", response_model=TaskCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_task(req: TaskCreateRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
@@ -177,6 +205,9 @@ async def create_task(req: TaskCreateRequest, background_tasks: BackgroundTasks,
         )
     except Exception as e:
         db.rollback()
+        import traceback
+        traceback.print_exc()
+        print(f"❌ Failed to create task: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create task: {str(e)}"

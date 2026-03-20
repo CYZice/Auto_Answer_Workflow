@@ -37,6 +37,8 @@ function TaskDashboard() {
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null)
   // 控制设置弹窗
   const [showSettings, setShowSettings] = useState(false)
+  // 错误提示
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
   // 模型配置状态，初始尝试从 localStorage 读取
   const [solverConfig, setSolverConfig] = useState<ModelConfig>(() => {
     const saved = localStorage.getItem('solver_config')
@@ -96,19 +98,28 @@ function TaskDashboard() {
   // 处理“开始处理”逻辑
   const handleStartProcessing = async () => {
     if (pendingQueue.length === 0) return;
+    setErrorMessage(null);
     
     // 复制一份当前队列，然后清空 UI 队列
     const tasksToProcess = [...pendingQueue];
     setPendingQueue([]);
     
+    console.log("🚀 开始提交任务队列，共", tasksToProcess.length, "个任务");
+
     // 逐个提交给后端
     for (const task of tasksToProcess) {
       try {
+        console.log(`正在提交任务 (ID: ${task.id})...`);
         const result = await createMutation.mutateAsync(task.imageUrl);
+        console.log(`✅ 任务提交成功，后端返回 Task ID: ${result.task_id}`);
         // 将最后一个任务设为当前活跃视图
         setActiveTaskId(result.task_id);
-      } catch (error) {
-        console.error("Failed to start task:", error);
+      } catch (error: any) {
+        console.error("❌ 提交任务失败:", error);
+        const errorMsg = error.response?.data?.detail || error.message || "未知错误";
+        setErrorMessage(`提交失败: ${errorMsg}`);
+        // 如果提交失败，把没提交的放回队列（可选策略）
+        // 这里为了体验，只提示错误
       }
     }
   };
@@ -117,8 +128,24 @@ function TaskDashboard() {
     setPendingQueue(prev => prev.filter(t => t.id !== id));
   };
 
+  const parseMaxTokens = (val: string) => {
+    const parsed = parseInt(val, 10);
+    return isNaN(parsed) ? 0 : parsed;
+  };
+
   return (
     <div className="max-w-7xl mx-auto p-8 space-y-8" onPaste={handlePaste}>
+      {/* 错误提示框 */}
+      {errorMessage && (
+        <div className="bg-red-50 border-l-4 border-red-500 p-4 rounded shadow-sm flex justify-between items-start">
+          <div className="text-red-700">
+            <p className="font-bold">发生错误</p>
+            <p className="text-sm">{errorMessage}</p>
+          </div>
+          <button onClick={() => setErrorMessage(null)} className="text-red-500 hover:text-red-700"><X size={18}/></button>
+        </div>
+      )}
+
       {/* 顶部标题与说明 */}
       <header className="border-b pb-4 flex justify-between items-start">
         <div>
@@ -224,7 +251,7 @@ function TaskDashboard() {
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">Max Tokens</label>
-                    <input type="number" value={solverConfig.max_tokens} onChange={e => setSolverConfig({...solverConfig, max_tokens: parseInt(e.target.value)})} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
+                    <input type="number" value={solverConfig.max_tokens || ''} onChange={e => setSolverConfig({...solverConfig, max_tokens: parseMaxTokens(e.target.value)})} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
                   </div>
                   <div className="col-span-2">
                     <label className="block text-sm font-medium text-gray-700 mb-1">Base URL</label>
@@ -247,7 +274,7 @@ function TaskDashboard() {
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">Max Tokens</label>
-                    <input type="number" value={reviewerConfig.max_tokens} onChange={e => setReviewerConfig({...reviewerConfig, max_tokens: parseInt(e.target.value)})} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-purple-500 outline-none" />
+                    <input type="number" value={reviewerConfig.max_tokens || ''} onChange={e => setReviewerConfig({...reviewerConfig, max_tokens: parseMaxTokens(e.target.value)})} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-purple-500 outline-none" />
                   </div>
                   <div className="col-span-2">
                     <label className="block text-sm font-medium text-gray-700 mb-1">Base URL</label>
@@ -270,7 +297,7 @@ function TaskDashboard() {
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">Max Tokens</label>
-                    <input type="number" value={formatterConfig.max_tokens} onChange={e => setFormatterConfig({...formatterConfig, max_tokens: parseInt(e.target.value)})} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 outline-none" />
+                    <input type="number" value={formatterConfig.max_tokens || ''} onChange={e => setFormatterConfig({...formatterConfig, max_tokens: parseMaxTokens(e.target.value)})} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 outline-none" />
                   </div>
                   <div className="col-span-2">
                     <label className="block text-sm font-medium text-gray-700 mb-1">Base URL</label>

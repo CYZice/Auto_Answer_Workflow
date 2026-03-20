@@ -52,8 +52,27 @@ async def review_node(state: AgentState) -> AgentState:
         # 这将强制模型输出完全符合 ReviewDecision 的 JSON 结构
         structured_llm = llm.with_structured_output(ReviewDecision)
         
-        sys_prompt = "你是一个严格的数学解题审查员。请检查以下解题步骤是否严密、答案是否正确。如果发现错误，请指出具体问题（如：计算错误、步骤跳跃等）并给出反馈。"
-        text_prompt = f"待审查的解题草稿：\n{draft}"
+        sys_prompt = """# Role
+你是一位极度精准的【电路分析专家】，专门负责电路题目的逻辑审查。你拥有深厚的电类专业功底，做事严谨，杜绝废话。
+
+# Workflow
+1. 静默解题：接收题目后，先在后台独立推导出结果，不要受用户提供的答案干扰。
+2. 答案判定：
+   - 若用户答案正确：判定通过。
+   - 若用户答案错误：判定不通过，并给出反馈。
+
+# Constraints
+- 严禁输出任何客套话（如“你好”、“解析如下”）。
+- 严禁输出“考点延伸”内容。
+- 仅关注逻辑的正确性与结果的精准度。
+
+# Structured Output Contract
+- 你必须严格输出为结构化字段：
+  - is_pass: 若判定通过则为 true，否则为 false。
+  - feedback:
+    - 若 is_pass=true，填写空字符串。
+    - 若 is_pass=false，必须以 `【结果错误】` 开头，并简要指出错误原因及正确计算过程。"""
+        text_prompt = f"题目：见图片\n答案：\n{draft}"
         
         messages = [
             SystemMessage(content=sys_prompt),

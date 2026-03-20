@@ -1,5 +1,5 @@
-import { useState, ClipboardEvent, useEffect } from 'react'
-import { QueryClient, QueryClientProvider, useQuery, useMutation } from '@tanstack/react-query'
+import { useState, ClipboardEvent, useEffect, useMemo } from 'react'
+import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueries } from '@tanstack/react-query'
 import axios from 'axios'
 import ReactMarkdown from 'react-markdown'
 import remarkMath from 'remark-math'
@@ -13,6 +13,11 @@ const api = axios.create({
   baseURL: 'http://localhost:8000',
 })
 
+const RUNNING_TASK_STATES = ['queued', 'solving', 'reviewing', 'formatting']
+const EXCEPTION_TASK_STATES = ['failed', 'manual', 'cancelled']
+const SUBMITTED_TASKS_STORAGE_KEY = 'submitted_tasks'
+const ACTIVE_TASK_ID_STORAGE_KEY = 'active_task_id'
+
 const getErrorMessage = (error: unknown, fallback: string) => {
   if (axios.isAxiosError(error)) {
     return (error.response?.data as { detail?: string } | undefined)?.detail || error.message || fallback
@@ -25,6 +30,10 @@ const getErrorMessage = (error: unknown, fallback: string) => {
 interface PendingTask {
   id: string;
   imageUrl: string;
+}
+
+interface SubmittedTask {
+  taskId: string;
 }
 
 interface ModelConfig {
@@ -71,20 +80,40 @@ interface AdminLogListResponse {
   items: AdminLogItem[];
 }
 
+const readStoredJson = <T,>(key: string, fallback: T): T => {
+  const raw = localStorage.getItem(key)
+  if (!raw) return fallback
+  try {
+    return JSON.parse(raw) as T
+  } catch {
+    return fallback
+  }
+}
+
 // --- Components ---
 
 function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
-  // 待处理队列（本地维护）
   const [pendingQueue, setPendingQueue] = useState<PendingTask[]>([])
-  // 当前正在预览的图片
+  const [submittedTasks, setSubmittedTasks] = useState<SubmittedTask[]>(() => {
+    const saved = readStoredJson<SubmittedTask[]>(SUBMITTED_TASKS_STORAGE_KEY, [])
+    if (!Array.isArray(saved)) return []
+    return saved.filter((item): item is SubmittedTask => (
+      typeof item === 'object'
+      && item !== null
+      && typeof item.taskId === 'string'
+      && item.taskId.trim().length > 0
+    ))
+  })
   const [previewImage, setPreviewImage] = useState<string | null>(null)
-  // 当前活跃（正在查看）的后端任务ID
-  const [activeTaskId, setActiveTaskId] = useState<string | null>(null)
-  // 控制设置弹窗
+  const [activeTaskId, setActiveTaskId] = useState<string | null>(() => {
+    const saved = localStorage.getItem(ACTIVE_TASK_ID_STORAGE_KEY)
+    if (!saved) return null
+    const taskId = saved.trim()
+    return taskId.length > 0 ? taskId : null
+  })
   const [showSettings, setShowSettings] = useState(false)
-  // 错误提示
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
-  // 模型配置状态，初始尝试从 localStorage 读取
+  const [taskFilter, setTaskFilter] = useState<'all' | 'running' | 'completed' | 'exception'>('all')
   const [solverConfig, setSolverConfig] = useState<ModelConfig>(() => {
     const saved = localStorage.getItem('solver_config')
     return saved ? JSON.parse(saved) : { model_name: '', api_key: '', base_url: '', max_tokens: 4096 }
@@ -139,6 +168,65 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       formatter_config: formatterConfig
     }).then(res => res.data),
   })
+  const submittedTaskStatusQueries = useQueries({
+    queries: submittedTasks.map((task) => ({
+      queryKey: ['task-status', task.taskId],
+      queryFn: () => api.get<AdminTask>(`/api/tasks/${task.taskId}`).then((res) => res.data),
+      refetchInterval: (query: { state: { data?: AdminTask } }) => {
+        const state = query.state.data?.state;
+        if (state === 'completed' || state === 'failed' || state === 'manual' || state === 'cancelled') return false;
+        return 2000;
+      },
+    })),
+  })
+  const submittedTaskItems = useMemo(
+    () =>
+      submittedTasks.map((task, index) => {
+        const taskData = submittedTaskStatusQueries[index]?.data as AdminTask | undefined
+        return {
+          taskId: task.taskId,
+          state: taskData?.state || 'queued'
+        }
+      }),
+    [submittedTasks, submittedTaskStatusQueries]
+  )
+  const isRunningState = (state: string) => RUNNING_TASK_STATES.includes(state)
+  const runningCount = submittedTaskItems.filter((task) => isRunningState(task.state)).length
+  const completedCount = submittedTaskItems.filter((task) => task.state === 'completed').length
+  const exceptionCount = submittedTaskItems.filter((task) => EXCEPTION_TASK_STATES.includes(task.state)).length
+  const filteredTaskItems = submittedTaskItems.filter((task) => {
+    if (taskFilter === 'running') return isRunningState(task.state)
+    if (taskFilter === 'completed') return task.state === 'completed'
+    if (taskFilter === 'exception') return EXCEPTION_TASK_STATES.includes(task.state)
+    return true
+  })
+  const runningItems = filteredTaskItems.filter((task) => isRunningState(task.state))
+  const otherItems = filteredTaskItems.filter((task) => !isRunningState(task.state))
+
+  useEffect(() => {
+    localStorage.setItem(SUBMITTED_TASKS_STORAGE_KEY, JSON.stringify(submittedTasks))
+  }, [submittedTasks])
+
+  useEffect(() => {
+    if (activeTaskId) {
+      localStorage.setItem(ACTIVE_TASK_ID_STORAGE_KEY, activeTaskId)
+      return
+    }
+    localStorage.removeItem(ACTIVE_TASK_ID_STORAGE_KEY)
+  }, [activeTaskId])
+
+  useEffect(() => {
+    if (submittedTasks.length === 0) {
+      if (activeTaskId !== null) {
+        setActiveTaskId(null)
+      }
+      return
+    }
+    if (activeTaskId && submittedTasks.some((task) => task.taskId === activeTaskId)) {
+      return
+    }
+    setActiveTaskId(submittedTasks[submittedTasks.length - 1].taskId)
+  }, [submittedTasks, activeTaskId])
 
   // 处理“开始处理”逻辑
   const handleStartProcessing = async () => {
@@ -157,6 +245,11 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         console.log(`正在提交任务 (ID: ${task.id})...`);
         const result = await createMutation.mutateAsync(task.imageUrl);
         console.log(`✅ 任务提交成功，后端返回 Task ID: ${result.task_id}`);
+        setSubmittedTasks((prev) => (
+          prev.some((item) => item.taskId === result.task_id)
+            ? prev
+            : [...prev, { taskId: result.task_id }]
+        ));
         // 将最后一个任务设为当前活跃视图
         setActiveTaskId(result.task_id);
       } catch (error: unknown) {
@@ -262,10 +355,79 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         )}
       </div>
 
-      {/* 任务详情区域（如果是实际项目，这里应该有个列表供切换） */}
+      {submittedTaskItems.length > 0 && (
+        <div className="bg-white p-4 rounded-xl shadow-sm border space-y-3">
+          <div className="flex flex-wrap gap-2">
+            <button
+              onClick={() => setTaskFilter('all')}
+              className={`px-3 py-1.5 rounded-lg border text-sm transition-colors ${
+                taskFilter === 'all'
+                  ? 'border-blue-500 bg-blue-50 text-blue-700'
+                  : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
+              }`}
+            >
+              全部 ({submittedTaskItems.length})
+            </button>
+            <button
+              onClick={() => setTaskFilter('running')}
+              className={`px-3 py-1.5 rounded-lg border text-sm transition-colors ${
+                taskFilter === 'running'
+                  ? 'border-blue-500 bg-blue-50 text-blue-700'
+                  : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
+              }`}
+            >
+              运行中 ({runningCount})
+            </button>
+            <button
+              onClick={() => setTaskFilter('completed')}
+              className={`px-3 py-1.5 rounded-lg border text-sm transition-colors ${
+                taskFilter === 'completed'
+                  ? 'border-blue-500 bg-blue-50 text-blue-700'
+                  : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
+              }`}
+            >
+              已完成 ({completedCount})
+            </button>
+            <button
+              onClick={() => setTaskFilter('exception')}
+              className={`px-3 py-1.5 rounded-lg border text-sm transition-colors ${
+                taskFilter === 'exception'
+                  ? 'border-blue-500 bg-blue-50 text-blue-700'
+                  : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
+              }`}
+            >
+              异常/人工 ({exceptionCount})
+            </button>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {runningItems.map((task) => (
+              <TaskSwitcherButton
+                key={task.taskId}
+                taskId={task.taskId}
+                state={task.state}
+                isActive={activeTaskId === task.taskId}
+                onSelect={() => setActiveTaskId(task.taskId)}
+              />
+            ))}
+            {otherItems.map((task) => (
+              <TaskSwitcherButton
+                key={task.taskId}
+                taskId={task.taskId}
+                state={task.state}
+                isActive={activeTaskId === task.taskId}
+                onSelect={() => setActiveTaskId(task.taskId)}
+              />
+            ))}
+            {filteredTaskItems.length === 0 && (
+              <div className="text-sm text-gray-500 px-2 py-1">当前筛选下没有任务</div>
+            )}
+          </div>
+        </div>
+      )}
+
       {activeTaskId && (
         <div>
-          <h2 className="text-lg font-semibold mb-4 text-gray-700">最近提交的任务详情</h2>
+          <h2 className="text-lg font-semibold mb-4 text-gray-700">任务详情</h2>
           <TaskDetail taskId={activeTaskId} onPreview={setPreviewImage} />
         </div>
       )}
@@ -373,6 +535,51 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         </div>
       )}
     </div>
+  )
+}
+
+function TaskSwitcherButton({
+  taskId,
+  state,
+  isActive,
+  onSelect
+}: {
+  taskId: string
+  state: string
+  isActive: boolean
+  onSelect: () => void
+}) {
+  return (
+    <button
+      onClick={onSelect}
+      className={`px-3 py-1.5 rounded-lg border text-sm font-mono transition-colors ${
+        isActive
+          ? 'border-blue-500 bg-blue-50 text-blue-700'
+          : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
+      }`}
+    >
+      <span>{taskId}</span>
+      <TaskStatusBadge state={state} />
+    </button>
+  )
+}
+
+function TaskStatusBadge({ state }: { state: string }) {
+  const styleMap: Record<string, string> = {
+    completed: 'bg-green-100 text-green-700',
+    failed: 'bg-red-100 text-red-700',
+    manual: 'bg-yellow-100 text-yellow-700',
+    cancelled: 'bg-gray-200 text-gray-700',
+    solving: 'bg-blue-100 text-blue-700',
+    reviewing: 'bg-blue-100 text-blue-700',
+    formatting: 'bg-blue-100 text-blue-700',
+    queued: 'bg-gray-100 text-gray-600'
+  }
+
+  return (
+    <span className={`ml-2 px-2 py-0.5 rounded text-[10px] uppercase ${styleMap[state] || 'bg-gray-100 text-gray-600'}`}>
+      {state}
+    </span>
   )
 }
 

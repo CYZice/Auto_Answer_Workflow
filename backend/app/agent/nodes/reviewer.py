@@ -43,6 +43,10 @@ async def review_node(state: AgentState) -> AgentState:
             "error_msg": "Missing draft_solution in state."
         }
 
+    llm = None
+    messages = []
+    raw_response_text = None
+    review_tokens = 200
     try:
         print(f"  -> Calling LLM (Reviewer with Structured Output)...")
         reviewer_config = state.get("agent_configs", {}).get("reviewer", {})
@@ -50,7 +54,10 @@ async def review_node(state: AgentState) -> AgentState:
         
         # 使用 LangChain 的 with_structured_output 绑定 Pydantic 模型
         # 这将强制模型输出完全符合 ReviewDecision 的 JSON 结构
-        structured_llm = llm.with_structured_output(ReviewDecision)
+        try:
+            structured_llm = llm.with_structured_output(ReviewDecision, include_raw=True)
+        except TypeError:
+            structured_llm = llm.with_structured_output(ReviewDecision)
         
         sys_prompt = """# Role
 你是一位极度精准的【电路分析专家】，专门负责电路题目的逻辑审查。你拥有深厚的电类专业功底，做事严谨，杜绝废话。
@@ -82,8 +89,31 @@ async def review_node(state: AgentState) -> AgentState:
             ])
         ]
         
-        # 调用模型获取强类型结构化结果
-        decision_obj: ReviewDecision = await structured_llm.ainvoke(messages)
+        structured_result = await structured_llm.ainvoke(messages)
+        decision_obj = None
+        if isinstance(structured_result, dict):
+            parsed_result = structured_result.get("parsed")
+            raw_message = structured_result.get("raw")
+            parsing_error = structured_result.get("parsing_error")
+            if raw_message is not None:
+                raw_content = raw_message.content
+                if isinstance(raw_content, str):
+                    raw_response_text = raw_content
+                else:
+                    raw_response_text = json.dumps(raw_content, ensure_ascii=False)
+                review_tokens = raw_message.response_metadata.get("token_usage", {}).get("total_tokens", review_tokens)
+            if parsed_result is None:
+                if parsing_error:
+                    raise parsing_error
+                raise ValueError("Reviewer structured output parsing failed.")
+            if isinstance(parsed_result, ReviewDecision):
+                decision_obj = parsed_result
+            else:
+                decision_obj = ReviewDecision.model_validate(parsed_result)
+        elif isinstance(structured_result, ReviewDecision):
+            decision_obj = structured_result
+        else:
+            decision_obj = ReviewDecision.model_validate(structured_result)
         
         decision = "PASS" if decision_obj.is_pass else "FAIL"
         feedback = decision_obj.feedback if not decision_obj.is_pass else None
@@ -93,23 +123,55 @@ async def review_node(state: AgentState) -> AgentState:
         from app.agent.nodes.llm_client import log_agent_interaction
         import json
         import asyncio
+        if raw_response_text is None:
+            raw_response_text = json.dumps({"is_pass": decision_obj.is_pass, "feedback": decision_obj.feedback}, ensure_ascii=False)
         asyncio.create_task(asyncio.to_thread(
             log_agent_interaction,
             state['task_id'], 
             "reviewer", 
             messages, 
-            json.dumps({"is_pass": decision_obj.is_pass, "feedback": decision_obj.feedback}, ensure_ascii=False),
-            200
+            json.dumps({
+                "is_pass": decision_obj.is_pass,
+                "feedback": decision_obj.feedback,
+                "raw_response": raw_response_text
+            }, ensure_ascii=False),
+            review_tokens
         ))
 
         return {
             **state,
             "review_decision": decision,
             "review_feedback": feedback,
-            "total_tokens": state.get("total_tokens", 0) + 200 # 假设一次审查消耗200token
+            "total_tokens": state.get("total_tokens", 0) + review_tokens
         }
         
     except Exception as e:
+        from app.agent.nodes.llm_client import log_agent_interaction
+        import asyncio
+        if raw_response_text is None and llm is not None:
+            try:
+                fallback_response = await llm.ainvoke(messages)
+                fallback_content = fallback_response.content
+                if isinstance(fallback_content, str):
+                    raw_response_text = fallback_content
+                else:
+                    raw_response_text = json.dumps(fallback_content, ensure_ascii=False)
+                review_tokens = fallback_response.response_metadata.get("token_usage", {}).get("total_tokens", review_tokens)
+            except Exception as fallback_error:
+                raw_response_text = f"__RAW_RESPONSE_UNAVAILABLE__: {fallback_error}"
+        if raw_response_text is None:
+            raw_response_text = "__RAW_RESPONSE_UNAVAILABLE__"
+        asyncio.create_task(asyncio.to_thread(
+            log_agent_interaction,
+            state['task_id'],
+            "reviewer",
+            messages,
+            json.dumps({
+                "error": str(e),
+                "raw_response": raw_response_text
+            }, ensure_ascii=False),
+            review_tokens
+        ))
         print(f"  [Reviewer] API Error: {e}")
         return {
             **state,

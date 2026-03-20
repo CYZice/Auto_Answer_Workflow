@@ -1166,13 +1166,13 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
               </div>
 
               <div className="space-y-2">
-                <label className="text-sm font-medium text-gray-700">history</label>
-                <textarea value={editHistory} onChange={(e) => setEditHistory(e.target.value)} className="w-full min-h-36 border rounded-lg px-3 py-2 text-xs font-mono" />
+                <label className="text-sm font-medium text-gray-700">image_url</label>
+                <img src={selectedTask.image_url} alt="task" className="max-h-60 border rounded bg-gray-50 object-contain" />
               </div>
 
               <div className="space-y-2">
                 <label className="text-sm font-medium text-gray-700">final_result</label>
-                <textarea value={editFinalResult} onChange={(e) => setEditFinalResult(e.target.value)} className="w-full min-h-36 border rounded-lg px-3 py-2 text-xs font-mono" />
+                <textarea value={editFinalResult} onChange={(e) => setEditFinalResult(e.target.value)} className="w-full min-h-60 border rounded-lg px-3 py-2 text-xs font-mono" />
               </div>
 
               <div className="space-y-2">
@@ -1181,8 +1181,8 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
               </div>
 
               <div className="space-y-2">
-                <label className="text-sm font-medium text-gray-700">image_url</label>
-                <img src={selectedTask.image_url} alt="task" className="max-h-60 border rounded bg-gray-50 object-contain" />
+                <label className="text-sm font-medium text-gray-700">history</label>
+                <textarea value={editHistory} onChange={(e) => setEditHistory(e.target.value)} className="w-full min-h-36 border rounded-lg px-3 py-2 text-xs font-mono" />
               </div>
 
               <div className="flex justify-end">

@@ -45,7 +45,7 @@ def increment_retry(state: AgentState) -> AgentState:
         "status": "solving"
     }
 
-def build_graph() -> StateGraph:
+def build_graph(entry_point: Literal["solver", "reviewer", "formatter"] = "solver") -> StateGraph:
     """
     构建并返回 LangGraph 核心拓扑图
     """
@@ -60,8 +60,8 @@ def build_graph() -> StateGraph:
     workflow.add_node("increment_retry", increment_retry)
     
     # 2. 定义边 (Edges)
-    # 起点始终是 solver
-    workflow.set_entry_point("solver")
+    # 起点可按需指定，支持从失败节点恢复
+    workflow.set_entry_point(entry_point)
     
     # solver 必然流向 reviewer
     workflow.add_edge("solver", "reviewer")

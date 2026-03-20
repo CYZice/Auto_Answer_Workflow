@@ -50,10 +50,10 @@ class TaskEventBus:
 
 task_events = TaskEventBus()
 
-# 提前编译好全局唯一的图引擎实例
-graph_app = build_graph()
+VALID_RESUME_NODES = {"solver", "reviewer", "formatter"}
+graph_apps = {node: build_graph(node) for node in VALID_RESUME_NODES}
 
-async def run_agent_workflow_async(task_id: str, db: Session):
+async def run_agent_workflow_async(task_id: str, db: Session, start_node: str = "solver"):
     """
     异步执行图引擎工作流，并持久化每一步的状态。
     加入信号量以控制并发，防止触发模型 API 的 Rate Limit。
@@ -68,8 +68,9 @@ async def run_agent_workflow_async(task_id: str, db: Session):
             return
 
         # 2. 构造图引擎的初始状态
-        # 尝试从 history 中提取动态模型配置
+        # 尝试从 history 中提取动态模型配置和可恢复数据
         agent_configs = {}
+        history_data = {}
         try:
             if task_record.history:
                 history_data = json.loads(task_record.history)
@@ -79,16 +80,31 @@ async def run_agent_workflow_async(task_id: str, db: Session):
                     "formatter": history_data.get("formatter_config", {})
                 }
         except Exception:
-            pass
+            history_data = {}
+
+        token_usage = {}
+        try:
+            token_usage = json.loads(task_record.token_usage) if task_record.token_usage else {}
+        except Exception:
+            token_usage = {}
+
+        if start_node not in VALID_RESUME_NODES:
+            start_node = "solver"
+        if start_node in {"reviewer", "formatter"} and not history_data.get("draft_solution"):
+            start_node = "solver"
 
         initial_state = {
             "task_id": task_record.task_id,
             "image_url": task_record.image_url,
             "status": task_record.state,
             "retry_count": task_record.retry_count,
-            "total_tokens": 0,
+            "draft_solution": history_data.get("draft_solution"),
+            "review_decision": history_data.get("review_decision"),
+            "review_feedback": history_data.get("review_feedback"),
+            "total_tokens": token_usage.get("total_tokens", 0),
             "agent_configs": agent_configs
         }
+        graph_app = graph_apps[start_node]
         
         # 3. 运行图引擎
         try:
@@ -113,10 +129,12 @@ async def run_agent_workflow_async(task_id: str, db: Session):
             # 必须重新获取 session 里的 task_record，防止多线程下 session 过期或 detached
             task_record = db.query(Task).filter(Task.task_id == task_id).first()
             if not task_record: return
+            previous_state = task_record.state
+            final_status = final_state.get("status", "failed")
 
             # 如果在执行期间被标记为 cancelled，保持 cancelled 状态
             if task_record.state != TaskStatus.CANCELLED.value:
-                task_record.state = final_state.get("status", "failed")
+                task_record.state = final_status
             
             task_record.retry_count = final_state.get("retry_count", 0)
             
@@ -125,11 +143,21 @@ async def run_agent_workflow_async(task_id: str, db: Session):
                 history_data = json.loads(task_record.history) if task_record.history else {}
             except Exception:
                 history_data = {}
-            history_data.update({
-                "draft_solution": final_state.get("draft_solution"),
-                "review_decision": final_state.get("review_decision"),
-                "review_feedback": final_state.get("review_feedback"),
-            })
+
+            if final_state.get("draft_solution") is not None:
+                history_data["draft_solution"] = final_state.get("draft_solution")
+            if final_state.get("review_decision") is not None:
+                history_data["review_decision"] = final_state.get("review_decision")
+            if final_state.get("review_feedback") is not None:
+                history_data["review_feedback"] = final_state.get("review_feedback")
+
+            failed_node = final_state.get("failed_node")
+            if not failed_node and final_status == TaskStatus.FAILED.value and previous_state in VALID_RESUME_NODES:
+                failed_node = previous_state
+            if final_status == TaskStatus.FAILED.value and failed_node in VALID_RESUME_NODES:
+                history_data["failed_node"] = failed_node
+            else:
+                history_data.pop("failed_node", None)
             task_record.history = json.dumps(history_data, ensure_ascii=False)
             
             task_record.final_result = final_state.get("final_result")
@@ -145,6 +173,13 @@ async def run_agent_workflow_async(task_id: str, db: Session):
             task_events.close(task_id)
             task_record = db.query(Task).filter(Task.task_id == task_id).first()
             if task_record:
+                failed_node = task_record.state if task_record.state in VALID_RESUME_NODES else "solver"
+                try:
+                    history_data = json.loads(task_record.history) if task_record.history else {}
+                except Exception:
+                    history_data = {}
+                history_data["failed_node"] = failed_node
+                task_record.history = json.dumps(history_data, ensure_ascii=False)
                 task_record.state = TaskStatus.FAILED.value
                 task_record.error_code = f"System Error: {str(e)}"
                 db.commit()
@@ -329,21 +364,29 @@ def submit_manual_review(task_id: str, req: ManualSubmitRequest, background_task
         db.commit()
         return {"status": "success", "message": "Task marked as failed."}
         
-    # 如果 action 是 resume，根据 PRD，相当于直接赋予草稿并让它去 formatting
-    # 这里我们简化逻辑：更新数据库里的草稿，并把状态强行置为 queued（或其他入口），重新排队
+    # 如果 action 是 resume，按失败节点恢复执行
     task.state = TaskStatus.QUEUED.value
     
     # 将人工编辑的草稿注入到历史字段，供下一次执行时读取
-    current_history = json.loads(task.history) if task.history else {}
-    current_history["draft_solution"] = req.draft_solution
+    try:
+        current_history = json.loads(task.history) if task.history else {}
+    except Exception:
+        current_history = {}
+    if req.draft_solution is not None:
+        current_history["draft_solution"] = req.draft_solution
+    resume_node = current_history.get("failed_node", "solver")
+    if resume_node not in VALID_RESUME_NODES:
+        resume_node = "solver"
+    if resume_node in {"reviewer", "formatter"} and not current_history.get("draft_solution"):
+        resume_node = "solver"
     task.history = json.dumps(current_history, ensure_ascii=False)
     
     db.commit()
     
     # 重新触发后台工作流
-    background_tasks.add_task(run_agent_workflow_async, task.task_id, db)
+    background_tasks.add_task(run_agent_workflow_async, task.task_id, db, resume_node)
     
-    return {"status": "success", "message": "Task resumed and queued for formatting."}
+    return {"status": "success", "message": f"Task resumed from node: {resume_node}."}
 
 @app.post("/api/tasks/{task_id}/cancel")
 def cancel_task(task_id: str, db: Session = Depends(get_db)):

@@ -36,6 +36,7 @@ async def format_node(state: AgentState) -> AgentState:
         return {
             **state,
             "status": "failed",
+            "failed_node": "formatter",
             "error_msg": "Cannot format empty draft."
         }
         
@@ -57,5 +58,6 @@ async def format_node(state: AgentState) -> AgentState:
         return {
             **state,
             "status": "failed",
+            "failed_node": "formatter",
             "error_msg": f"LLM API Error in Formatter: {str(e)}"
         }

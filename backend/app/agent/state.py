@@ -20,6 +20,7 @@ class AgentState(TypedDict):
     # 策略控制数据
     retry_count: int                   # 当前重试次数（第 2 次审查仍失败即 failed）
     error_msg: Optional[str]           # 系统错误信息
+    failed_node: Optional[Literal["solver", "reviewer", "formatter"]]  # 失败节点，用于 resume 定位恢复入口
     total_tokens: int                  # 累计消耗的 Token
     
     # 动态模型配置

@@ -40,6 +40,7 @@ async def solve_node(state: AgentState) -> AgentState:
         return {
             **state,
             "status": "failed",
+            "failed_node": "solver",
             "error_msg": "Missing image_url in state."
         }
         
@@ -60,5 +61,6 @@ async def solve_node(state: AgentState) -> AgentState:
         return {
             **state,
             "status": "failed",
+            "failed_node": "solver",
             "error_msg": f"LLM API Error: {str(e)}"
         }

@@ -39,6 +39,7 @@ async def review_node(state: AgentState) -> AgentState:
         return {
             **state,
             "status": "failed",
+            "failed_node": "reviewer",
             "error_msg": "Missing draft_solution in state."
         }
 
@@ -94,5 +95,6 @@ async def review_node(state: AgentState) -> AgentState:
         return {
             **state,
             "status": "failed",
+            "failed_node": "reviewer",
             "error_msg": f"LLM API Error in Reviewer: {str(e)}"
         }

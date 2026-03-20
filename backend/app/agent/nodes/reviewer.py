@@ -62,7 +62,7 @@ def review_node(state: AgentState) -> AgentState:
         
         # 如果有具体 issues，追加到 feedback 中
         if decision == "FAIL" and decision_obj.issues:
-            issues_str = "\n".join([f"- [{i.type}] {i.detail}" for i in decision_obj.issues])
+            issues_str = "\n".join([f"- [{i.get('type', '未知问题')}] {i.get('detail', '无详细描述')}" for i in decision_obj.issues])
             feedback = f"{feedback}\n具体问题：\n{issues_str}"
             
         print(f"  [Reviewer Result] Decision: {decision}, Reason: {feedback}")

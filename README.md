@@ -38,36 +38,35 @@ LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL_NAME=gpt-4o-mini
 ```
 
-### 3. 启动后端服务
-打开一个终端终端窗口，启动 FastAPI 后端：
+### 3. 一键启动服务 (推荐)
+为了避免在多个终端中来回切换，你可以使用项目根目录下的 `start.sh` 脚本一键启动前端和后端：
 
 ```bash
-# 1. 进入后端目录
-cd backend
+# 赋予执行权限（仅需一次）
+chmod +x start.sh
 
-# 2. 创建并激活虚拟环境 (推荐)
+# 一键启动
+./start.sh
+```
+
+*(按 `Ctrl+C` 即可同时关闭前端和后端服务)*
+
+### 4. 手动分别启动（可选）
+如果你想分别查看前后端的日志，也可以手动启动：
+
+**启动后端：**
+```bash
+cd backend
 python3 -m venv .venv
 source .venv/bin/activate
-
-# 3. 安装依赖
 pip install -r requirements.txt
-
-# 4. 启动服务 (默认运行在 8000 端口)
 uvicorn app.main:app --reload
 ```
-*启动成功后，数据库表结构会自动初始化生成 `agent_tasks.db` 文件。*
 
-### 4. 启动前端服务
-打开一个新的终端窗口，启动 Vite 前端：
-
+**启动前端：**
 ```bash
-# 1. 进入前端目录
 cd frontend
-
-# 2. 安装依赖
 npm install
-
-# 3. 启动开发服务器 (默认运行在 5173 端口)
 npm run dev
 ```
 

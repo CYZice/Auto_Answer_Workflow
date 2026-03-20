@@ -4,14 +4,28 @@ from typing import Optional, Literal
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
-# 初始化模型实例 (按你的要求配置了 base_url 和 api_key)
-# 这里使用 gpt-4o-mini 进行测试，生产环境可换为 gpt-4o 或 claude
+# 初始化模型实例，强制要求配置 api_key, base_url, model_name
 def get_llm(model_config: Optional[dict] = None):
     config = model_config or {}
+    
+    # 依次从配置字典或环境变量获取
+    model_name = config.get("model_name") or os.getenv("LLM_MODEL_NAME")
+    api_key = config.get("api_key") or os.getenv("LLM_API_KEY")
+    base_url = config.get("base_url") or os.getenv("LLM_BASE_URL")
+    
+    # 严格校验，缺失则抛出异常
+    missing_configs = []
+    if not api_key: missing_configs.append("API Key")
+    if not base_url: missing_configs.append("Base URL")
+    if not model_name: missing_configs.append("Model Name")
+    
+    if missing_configs:
+        raise ValueError(f"缺少大模型配置: {', '.join(missing_configs)}。请在前端页面设置中填写，或在后端 .env 文件中配置。")
+        
     return ChatOpenAI(
-        model=config.get("model_name", "gpt-4o-mini"),
-        api_key=config.get("api_key") or os.getenv("OPENAI_API_KEY", "sk-y9ELdtTFNbNWry1jLlU3v34D4R4DpAMWiMNtIVDNizdlyM2h"),
-        base_url=config.get("base_url") or "https://yunwu.ai/v1",
+        model=model_name,
+        api_key=api_key,
+        base_url=base_url,
         temperature=0.1, # 降低温度以获得稳定的格式输出
         max_tokens=config.get("max_tokens", 4096)
     )

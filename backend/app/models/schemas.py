@@ -4,14 +4,10 @@ from enum import Enum
 from datetime import datetime
 
 # --- Agent Reviewer 结构化输出契约 ---
-class Issue(BaseModel):
-    type: str = Field(description="问题类型，如：计算错误、逻辑跳跃、格式问题")
-    detail: str = Field(description="具体问题描述")
-
 class ReviewDecision(BaseModel):
     decision: Literal["PASS", "FAIL"] = Field(description="审查结论")
     reason: Optional[str] = Field(None, description="整体原因概括（FAIL 时必填）")
-    issues: Optional[List[Issue]] = Field(default_factory=list, description="具体错误点列表")
+    issues: Optional[List[dict]] = Field(default_factory=list, description="具体错误点列表，包含 type 和 detail 字段")
 
 # --- API 请求与响应契约 ---
 class TaskStatus(str, Enum):
@@ -25,9 +21,9 @@ class TaskStatus(str, Enum):
     CANCELLED = "cancelled"
 
 class ModelConfig(BaseModel):
-    model_name: str = Field(default="gpt-4o-mini", description="模型名称")
+    model_name: Optional[str] = Field(default=None, description="模型名称")
     api_key: Optional[str] = Field(default=None, description="API Key (如未提供则使用系统环境变量)")
-    base_url: Optional[str] = Field(default="https://api.openai.com/v1", description="API Base URL")
+    base_url: Optional[str] = Field(default=None, description="API Base URL")
     max_tokens: Optional[int] = Field(default=4096, description="最大生成 Token 数")
 
 class TaskCreateRequest(BaseModel):

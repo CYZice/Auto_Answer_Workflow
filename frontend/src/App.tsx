@@ -42,15 +42,15 @@ function TaskDashboard() {
   // 模型配置状态，初始尝试从 localStorage 读取
   const [solverConfig, setSolverConfig] = useState<ModelConfig>(() => {
     const saved = localStorage.getItem('solver_config')
-    return saved ? JSON.parse(saved) : { model_name: 'gpt-4o', api_key: '', base_url: 'https://api.openai.com/v1', max_tokens: 4096 }
+    return saved ? JSON.parse(saved) : { model_name: '', api_key: '', base_url: '', max_tokens: 4096 }
   })
   const [reviewerConfig, setReviewerConfig] = useState<ModelConfig>(() => {
     const saved = localStorage.getItem('reviewer_config')
-    return saved ? JSON.parse(saved) : { model_name: 'gpt-4o-mini', api_key: '', base_url: 'https://api.openai.com/v1', max_tokens: 2048 }
+    return saved ? JSON.parse(saved) : { model_name: '', api_key: '', base_url: '', max_tokens: 2048 }
   })
   const [formatterConfig, setFormatterConfig] = useState<ModelConfig>(() => {
     const saved = localStorage.getItem('formatter_config')
-    return saved ? JSON.parse(saved) : { model_name: 'gpt-4o-mini', api_key: '', base_url: 'https://api.openai.com/v1', max_tokens: 1024 }
+    return saved ? JSON.parse(saved) : { model_name: '', api_key: '', base_url: '', max_tokens: 1024 }
   })
 
   // 保存设置到 localStorage
@@ -89,9 +89,9 @@ function TaskDashboard() {
   const createMutation = useMutation({
     mutationFn: (url: string) => api.post('/api/tasks', { 
       image_url: url,
-      solver_config: solverConfig.api_key ? solverConfig : undefined,
-      reviewer_config: reviewerConfig.api_key ? reviewerConfig : undefined,
-      formatter_config: formatterConfig.api_key ? formatterConfig : undefined
+      solver_config: solverConfig,
+      reviewer_config: reviewerConfig,
+      formatter_config: formatterConfig
     }).then(res => res.data),
   })
 

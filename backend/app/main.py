@@ -1215,7 +1215,7 @@ def build_split_export_markdown(
     if title:
         lines.append(title)
         lines.append("")
-    lines.extend(["第一部分：原卷试题版", ""])
+
     for group_index, group in enumerate(groups, start=1):
         items = group.get("items") or []
         if not items:
@@ -1233,7 +1233,6 @@ def build_split_export_markdown(
                 "（题目内容为空）",
             )
 
-    lines.extend(["第二部分：答案与解析版", ""])
     if answer_title:
         lines.append(answer_title)
         lines.append("")

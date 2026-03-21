@@ -71,6 +71,13 @@ async def format_node(state: AgentState) -> AgentState:
             "final_result": result["formatted_result"],
             "total_tokens": safe_total_tokens,
         }
+    except asyncio.CancelledError:
+        print(f"  [Formatter] LLM call cancelled for task {state['task_id']}.")
+        return {
+            **state,
+            "status": "cancelled",
+            "error_msg": "Task was manually cancelled.",
+        }
     except Exception as e:
         print(f"  [Formatter] API Error: {e}")
         return {

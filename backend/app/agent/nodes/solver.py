@@ -72,6 +72,13 @@ async def solve_node(state: AgentState) -> AgentState:
             "draft_solution": result["draft"],
             "total_tokens": safe_total_tokens,
         }
+    except asyncio.CancelledError:
+        print(f"  [Solver] LLM call cancelled for task {state['task_id']}.")
+        return {
+            **state,
+            "status": "cancelled",
+            "error_msg": "Task was manually cancelled.",
+        }
     except Exception as e:
         # 捕获网络/API错误，按照 PRD 应进入 error 状态或直接重试，此处为简化演示返回 failed
         print(f"  [Solver] API Error: {e}")

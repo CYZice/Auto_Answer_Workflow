@@ -777,14 +777,12 @@ def build_split_export_markdown(items: list[tuple[str, str]]) -> str:
         )
 
     lines: list[str] = ["# 题目", ""]
-    for index, item in enumerate(split_items, start=1):
-        lines.append(f"## {index}. {item['task_id']}")
+    for item in split_items:
         lines.append(item["question"] or "（题目内容为空）")
         lines.append("")
 
-    lines.extend(["---", "", "# 答案", ""])
-    for index, item in enumerate(split_items, start=1):
-        lines.append(f"## {index}. {item['task_id']}")
+    lines.extend(["# 答案", ""])
+    for item in split_items:
         if item["answer"]:
             lines.append(item["answer"])
         elif item["only_question"]:

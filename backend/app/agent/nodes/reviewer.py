@@ -203,6 +203,7 @@ async def review_node(state: AgentState) -> AgentState:
             fallback_models=fallback_models,
             timeout=300.0,
             max_retries=2,
+            task_id=state.get("task_id"),
         )
 
         decision_obj = None
@@ -288,6 +289,14 @@ async def review_node(state: AgentState) -> AgentState:
             "review_decision": decision,
             "review_feedback": feedback,
             "total_tokens": safe_total_tokens,
+        }
+
+    except asyncio.CancelledError:
+        print(f"  [Reviewer] LLM call cancelled for task {state['task_id']}.")
+        return {
+            **state,
+            "status": "cancelled",
+            "error_msg": "Task was manually cancelled.",
         }
 
     except Exception as e:

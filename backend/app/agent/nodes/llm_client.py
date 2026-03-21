@@ -8,6 +8,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from app.core.database import SessionLocal
 from app.models.domain import AgentLog
+from app.models.domain import Task
 from app.services.runtime_config import (
     get_prompt_bundle,
     render_user_prompt,
@@ -63,6 +64,46 @@ def log_agent_interaction(
         print(f"Failed to log agent interaction: {e}")
 
 
+def is_task_cancelled_sync(task_id: str) -> bool:
+    if not task_id:
+        return False
+    try:
+        with SessionLocal() as db:
+            task = db.query(Task).filter(Task.task_id == task_id).first()
+            return bool(task and task.state == "cancelled")
+    except Exception:
+        return False
+
+
+async def run_with_task_cancellation(
+    task_id: Optional[str],
+    awaitable,
+    poll_interval: float = 0.3,
+):
+    """
+    轮询 DB 中的任务状态；一旦外部标记 cancelled，立即取消当前 awaitable。
+    """
+    running_task = asyncio.create_task(awaitable)
+    try:
+        if not task_id:
+            return await running_task
+
+        while not running_task.done():
+            if await asyncio.to_thread(is_task_cancelled_sync, task_id):
+                running_task.cancel()
+                try:
+                    await running_task
+                except asyncio.CancelledError:
+                    pass
+                raise asyncio.CancelledError("Task was manually cancelled.")
+            await asyncio.sleep(poll_interval)
+
+        return await running_task
+    except asyncio.CancelledError:
+        running_task.cancel()
+        raise
+
+
 # 初始化模型实例，强制要求配置 api_key, base_url, model_name
 def get_llm(model_config: Optional[dict] = None):
     config = model_config or {}
@@ -109,6 +150,7 @@ async def call_with_retry_and_fallback(
     fallback_models: Optional[List[str]] = None,
     timeout: float = 300.0,
     max_retries: int = 2,
+    task_id: Optional[str] = None,
 ) -> Any:
     """
     1. 超时切断并重试 (asyncio.wait_for 切断连接)
@@ -131,6 +173,19 @@ async def call_with_retry_and_fallback(
 
     last_exception = None
 
+    async def invoke_llm_with_timeout(llm_obj):
+        use_stream_timeout = hasattr(llm_obj, "astream")
+        if use_stream_timeout:
+            stream = llm_obj.astream(messages)
+            first_chunk = await asyncio.wait_for(stream.__anext__(), timeout=timeout)
+            merged_chunk = first_chunk
+            async for chunk in stream:
+                merged_chunk = merged_chunk + chunk
+            if hasattr(merged_chunk, "to_message"):
+                return merged_chunk.to_message()
+            return merged_chunk
+        return await asyncio.wait_for(llm_obj.ainvoke(messages), timeout=timeout)
+
     for model_name in models_to_try:
         current_config = dict(model_config) if model_config else {}
         current_config["model_name"] = model_name
@@ -147,24 +202,17 @@ async def call_with_retry_and_fallback(
                 print(
                     f"  [Retry Wrapper] Calling LLM {model_name} (Attempt {attempt+1}/{max_retries+1})..."
                 )
-                use_stream_timeout = hasattr(llm, "astream")
-                if use_stream_timeout:
-                    stream = llm.astream(messages)
-                    first_chunk = await asyncio.wait_for(
-                        stream.__anext__(), timeout=timeout
-                    )
-                    merged_chunk = first_chunk
-                    async for chunk in stream:
-                        merged_chunk = merged_chunk + chunk
-                    if hasattr(merged_chunk, "to_message"):
-                        response = merged_chunk.to_message()
-                    else:
-                        response = merged_chunk
-                else:
-                    response = await asyncio.wait_for(
-                        llm.ainvoke(messages), timeout=timeout
-                    )
+                response = await run_with_task_cancellation(
+                    task_id,
+                    invoke_llm_with_timeout(llm),
+                )
                 return response
+
+            except asyncio.CancelledError:
+                print(
+                    f"  [Retry Wrapper] Task {task_id} cancelled during LLM call on {model_name}."
+                )
+                raise
 
             except asyncio.TimeoutError as e:
                 print(
@@ -266,6 +314,7 @@ async def solve_image(
         fallback_models=fallback_models,
         timeout=300.0,
         max_retries=2,
+        task_id=task_id,
     )
 
     response_metadata = getattr(response, "response_metadata", None) or {}
@@ -331,6 +380,7 @@ async def format_solution(
         fallback_models=fallback_models,
         timeout=300.0,
         max_retries=2,
+        task_id=task_id,
     )
 
     response_metadata = getattr(response, "response_metadata", None) or {}

@@ -80,6 +80,8 @@ interface PaperGroup {
 interface PaperBuilderDraftResponse {
   draft_id: string;
   name: string;
+  paper_subject?: string;
+  paper_title?: string;
   groups: Array<{
     group_id: string;
     group_name: string;
@@ -2217,6 +2219,8 @@ function PaperBuilder({
 }) {
   const [groups, setGroups] = useState<PaperGroup[]>([])
   const [draftName, setDraftName] = useState('默认排版草稿')
+  const [paperSubject, setPaperSubject] = useState('')
+  const [paperTitle, setPaperTitle] = useState('')
   const [groupNameInput, setGroupNameInput] = useState('')
   const [operationMessage, setOperationMessage] = useState<string | null>(null)
   const [isExporting, setIsExporting] = useState(false)
@@ -2274,9 +2278,16 @@ function PaperBuilder({
     return normalized
   }
 
-  const saveLocalDraft = (name: string, draftGroups: PaperGroup[]) => {
+  const saveLocalDraft = (
+    name: string,
+    subject: string,
+    title: string,
+    draftGroups: PaperGroup[],
+  ) => {
     localStorage.setItem(PAPER_BUILDER_LOCAL_DRAFT_KEY, JSON.stringify({
       name,
+      paper_subject: subject,
+      paper_title: title,
       groups: draftGroups,
       saved_at: new Date().toISOString(),
     }))
@@ -2286,10 +2297,18 @@ function PaperBuilder({
     const raw = localStorage.getItem(PAPER_BUILDER_LOCAL_DRAFT_KEY)
     if (!raw) return null
     try {
-      const parsed = JSON.parse(raw) as { name?: string; groups?: PaperGroup[]; saved_at?: string }
+      const parsed = JSON.parse(raw) as {
+        name?: string;
+        paper_subject?: string;
+        paper_title?: string;
+        groups?: PaperGroup[];
+        saved_at?: string;
+      }
       const loadedGroups = Array.isArray(parsed.groups) ? normalizeGroups(parsed.groups) : []
       return {
         name: (parsed.name || '默认排版草稿').trim() || '默认排版草稿',
+        paperSubject: (parsed.paper_subject || '').trim(),
+        paperTitle: (parsed.paper_title || '').trim(),
         groups: loadedGroups,
         savedAt: parsed.saved_at || null,
       }
@@ -2307,9 +2326,16 @@ function PaperBuilder({
         taskIds: group.task_ids,
       })))
       setDraftName((remote.name || '默认排版草稿').trim() || '默认排版草稿')
+      setPaperSubject((remote.paper_subject || '').trim())
+      setPaperTitle((remote.paper_title || '').trim())
       setGroups(loadedGroups)
       setLastSavedAt(remote.updated_at || null)
-      saveLocalDraft((remote.name || '默认排版草稿').trim() || '默认排版草稿', loadedGroups)
+      saveLocalDraft(
+        (remote.name || '默认排版草稿').trim() || '默认排版草稿',
+        (remote.paper_subject || '').trim(),
+        (remote.paper_title || '').trim(),
+        loadedGroups,
+      )
       return true
     } catch {
       return false
@@ -2323,6 +2349,8 @@ function PaperBuilder({
       const local = loadLocalDraft()
       if (active && local) {
         setDraftName(local.name)
+        setPaperSubject(local.paperSubject)
+        setPaperTitle(local.paperTitle)
         setGroups(local.groups)
         setLastSavedAt(local.savedAt)
       }
@@ -2347,13 +2375,15 @@ function PaperBuilder({
   useEffect(() => {
     if (!hasInitializedDraft) return
     const safeGroups = normalizeGroups(groups)
-    saveLocalDraft(draftName, safeGroups)
+    saveLocalDraft(draftName, paperSubject, paperTitle, safeGroups)
 
     const timer = window.setTimeout(async () => {
       setIsSavingDraft(true)
       try {
         const payload = {
           name: (draftName || '默认排版草稿').trim() || '默认排版草稿',
+          paper_subject: paperSubject.trim(),
+          paper_title: paperTitle.trim(),
           groups: safeGroups.map((group) => ({
             group_id: group.id,
             group_name: group.name,
@@ -2372,7 +2402,7 @@ function PaperBuilder({
     return () => {
       window.clearTimeout(timer)
     }
-  }, [draftName, groups, hasInitializedDraft])
+  }, [draftName, paperSubject, paperTitle, groups, hasInitializedDraft])
 
   useEffect(() => {
     if (!tasks.length) return
@@ -2564,7 +2594,11 @@ function PaperBuilder({
     try {
       const endpoint = format === 'docx' ? '/api/admin/tasks/export/docx' : '/api/admin/tasks/export/md'
       const responseType = format === 'docx' ? 'blob' : 'blob'
-      const response = await api.post(endpoint, { groups: validation.groups }, { responseType })
+      const response = await api.post(endpoint, {
+        groups: validation.groups,
+        paper_subject: paperSubject.trim(),
+        paper_title: paperTitle.trim(),
+      }, { responseType })
       const mimeType = format === 'docx'
         ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
         : 'text/markdown;charset=utf-8'
@@ -2720,6 +2754,26 @@ function PaperBuilder({
               className="w-full border rounded-lg px-3 py-2 text-sm"
               placeholder="输入草稿名称"
             />
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-gray-700">试卷科目（导出封面第一行）</label>
+              <input
+                value={paperSubject}
+                onChange={(e) => setPaperSubject(e.target.value)}
+                className="w-full border rounded-lg px-3 py-2 text-sm"
+                placeholder="例如：《电路分析》"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-gray-700">试卷名称/年份（导出封面第二行）</label>
+              <input
+                value={paperTitle}
+                onChange={(e) => setPaperTitle(e.target.value)}
+                className="w-full border rounded-lg px-3 py-2 text-sm"
+                placeholder="例如：2020-2021学年第二学期期末考试试卷"
+              />
+            </div>
           </div>
           <div className="flex items-center gap-2">
             <input

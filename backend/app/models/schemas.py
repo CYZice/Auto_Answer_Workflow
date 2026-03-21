@@ -190,6 +190,8 @@ class ExportGroupItem(BaseModel):
 class AdminExportRequest(BaseModel):
     task_ids: List[str] = Field(default_factory=list)
     groups: List[ExportGroupItem] = Field(default_factory=list)
+    paper_subject: Optional[str] = Field(default=None, description="试卷科目标题")
+    paper_title: Optional[str] = Field(default=None, description="试卷名称/年份标题")
 
 
 class PaperBuilderGroupItem(BaseModel):
@@ -200,6 +202,8 @@ class PaperBuilderGroupItem(BaseModel):
 
 class PaperBuilderDraftPayload(BaseModel):
     name: str = Field(default="默认排版草稿")
+    paper_subject: Optional[str] = Field(default="")
+    paper_title: Optional[str] = Field(default="")
     groups: List[PaperBuilderGroupItem] = Field(default_factory=list)
 
 

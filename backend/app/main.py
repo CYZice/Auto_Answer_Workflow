@@ -16,6 +16,9 @@ import asyncio
 import json
 import os
 import re
+import io
+import zipfile
+import xml.etree.ElementTree as ET
 import subprocess
 import tempfile
 from dotenv import load_dotenv
@@ -141,6 +144,8 @@ def normalize_paper_builder_group_item(raw_group: dict) -> dict | None:
 
 def normalize_paper_builder_draft_record(draft_id: str, raw_value: dict) -> dict:
     draft_name = str(raw_value.get("name") or "默认排版草稿").strip() or "默认排版草稿"
+    paper_subject = str(raw_value.get("paper_subject") or "").strip()
+    paper_title = str(raw_value.get("paper_title") or "").strip()
     raw_groups = raw_value.get("groups")
     groups: list[dict] = []
     if isinstance(raw_groups, list):
@@ -154,6 +159,8 @@ def normalize_paper_builder_draft_record(draft_id: str, raw_value: dict) -> dict
     return {
         "draft_id": draft_id,
         "name": draft_name,
+        "paper_subject": paper_subject,
+        "paper_title": paper_title,
         "groups": groups,
         "updated_at": updated_at,
     }
@@ -871,6 +878,8 @@ def put_paper_builder_draft(draft_id: str, req: PaperBuilderDraftPayload):
     drafts = store.setdefault("drafts", {})
     drafts[normalized_draft_id] = {
         "name": (payload.get("name") or "默认排版草稿").strip() or "默认排版草稿",
+        "paper_subject": str(payload.get("paper_subject") or "").strip(),
+        "paper_title": str(payload.get("paper_title") or "").strip(),
         "groups": normalized_groups,
         "updated_at": updated_at,
     }
@@ -1007,6 +1016,162 @@ def normalize_task_ids(task_ids: list[str]) -> list[str]:
     return normalized
 
 
+def apply_docx_default_style(
+    docx_bytes: bytes,
+    paper_subject: str = "",
+    paper_title: str = "",
+) -> bytes:
+    """
+    强制统一 DOCX 默认样式：
+    - 中文：宋体
+    - 英文：Times New Roman
+    - 字号：小四（12pt -> 24 half-points）
+    """
+    if not docx_bytes:
+        return docx_bytes
+
+    try:
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        ET.register_namespace("w", ns["w"])
+
+        def qn(tag: str) -> str:
+            return f"{{{ns['w']}}}{tag}"
+
+        def ensure_child(parent: ET.Element, tag: str) -> ET.Element:
+            child = parent.find(f"w:{tag}", ns)
+            if child is None:
+                child = ET.SubElement(parent, qn(tag))
+            return child
+
+        in_zip = io.BytesIO(docx_bytes)
+        out_zip = io.BytesIO()
+
+        answer_title = ""
+        if paper_title:
+            answer_title = f"{paper_title}参考答案"
+
+        with zipfile.ZipFile(in_zip, "r") as zin, zipfile.ZipFile(
+            out_zip, "w", compression=zipfile.ZIP_DEFLATED
+        ) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename == "word/styles.xml":
+                    root = ET.fromstring(data)
+
+                    # 1) docDefaults 下统一 run 默认字体与字号
+                    doc_defaults = root.find("w:docDefaults", ns)
+                    if doc_defaults is None:
+                        doc_defaults = ET.SubElement(root, qn("docDefaults"))
+
+                    rpr_default = ensure_child(doc_defaults, "rPrDefault")
+                    rpr = ensure_child(rpr_default, "rPr")
+
+                    rfonts = ensure_child(rpr, "rFonts")
+                    rfonts.set(qn("ascii"), "Times New Roman")
+                    rfonts.set(qn("hAnsi"), "Times New Roman")
+                    rfonts.set(qn("eastAsia"), "宋体")
+                    rfonts.set(qn("cs"), "Times New Roman")
+
+                    sz = ensure_child(rpr, "sz")
+                    sz.set(qn("val"), "24")  # 12pt
+                    sz_cs = ensure_child(rpr, "szCs")
+                    sz_cs.set(qn("val"), "24")
+
+                    # 2) Normal 样式再覆盖一遍，减少阅读器差异
+                    for style in root.findall("w:style", ns):
+                        if style.get(qn("styleId")) == "Normal":
+                            style_rpr = ensure_child(style, "rPr")
+                            style_rfonts = ensure_child(style_rpr, "rFonts")
+                            style_rfonts.set(qn("ascii"), "Times New Roman")
+                            style_rfonts.set(qn("hAnsi"), "Times New Roman")
+                            style_rfonts.set(qn("eastAsia"), "宋体")
+                            style_rfonts.set(qn("cs"), "Times New Roman")
+
+                            style_sz = ensure_child(style_rpr, "sz")
+                            style_sz.set(qn("val"), "24")
+                            style_sz_cs = ensure_child(style_rpr, "szCs")
+                            style_sz_cs.set(qn("val"), "24")
+                            break
+
+                    data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+                if item.filename == "word/document.xml":
+                    root = ET.fromstring(data)
+
+                    def paragraph_text(paragraph: ET.Element) -> str:
+                        texts: list[str] = []
+                        for t in paragraph.findall(".//w:t", ns):
+                            if t.text:
+                                texts.append(t.text)
+                        return "".join(texts).strip()
+
+                    def apply_paragraph_title_style(
+                        paragraph: ET.Element, size_val: str
+                    ):
+                        ppr = paragraph.find("w:pPr", ns)
+                        if ppr is None:
+                            ppr = ET.SubElement(paragraph, qn("pPr"))
+                        jc = ppr.find("w:jc", ns)
+                        if jc is None:
+                            jc = ET.SubElement(ppr, qn("jc"))
+                        jc.set(qn("val"), "center")
+
+                        runs = paragraph.findall("w:r", ns)
+                        for run in runs:
+                            rpr = run.find("w:rPr", ns)
+                            if rpr is None:
+                                rpr = ET.SubElement(run, qn("rPr"))
+
+                            rfonts = rpr.find("w:rFonts", ns)
+                            if rfonts is None:
+                                rfonts = ET.SubElement(rpr, qn("rFonts"))
+                            rfonts.set(qn("ascii"), "Times New Roman")
+                            rfonts.set(qn("hAnsi"), "Times New Roman")
+                            rfonts.set(qn("eastAsia"), "宋体")
+                            rfonts.set(qn("cs"), "Times New Roman")
+
+                            sz = rpr.find("w:sz", ns)
+                            if sz is None:
+                                sz = ET.SubElement(rpr, qn("sz"))
+                            sz.set(qn("val"), size_val)
+
+                            sz_cs = rpr.find("w:szCs", ns)
+                            if sz_cs is None:
+                                sz_cs = ET.SubElement(rpr, qn("szCs"))
+                            sz_cs.set(qn("val"), size_val)
+
+                            bold = rpr.find("w:b", ns)
+                            if bold is None:
+                                bold = ET.SubElement(rpr, qn("b"))
+                            bold_cs = rpr.find("w:bCs", ns)
+                            if bold_cs is None:
+                                bold_cs = ET.SubElement(rpr, qn("bCs"))
+
+                    subject_targets = {paper_subject} if paper_subject else set()
+                    title_targets = {paper_title, answer_title}
+                    title_targets = {text for text in title_targets if text}
+
+                    for paragraph in root.findall(".//w:p", ns):
+                        text = paragraph_text(paragraph)
+                        if not text:
+                            continue
+                        if text in subject_targets:
+                            # 20pt = 40 half-points
+                            apply_paragraph_title_style(paragraph, "40")
+                        elif text in title_targets:
+                            # 小二 18pt = 36 half-points
+                            apply_paragraph_title_style(paragraph, "36")
+
+                    data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+                zout.writestr(item, data)
+
+        return out_zip.getvalue()
+    except Exception:
+        # 样式后处理失败时回退原始 docx，不中断导出
+        return docx_bytes
+
+
 def normalize_export_block_text(text: str) -> str:
     normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     # 若模型输出了“【解析】后直接跟正文”，导出时强制换行，避免阅读拥挤。
@@ -1036,15 +1201,28 @@ def append_numbered_plain_block(
 
 def build_split_export_markdown(
     groups: list[dict],
+    paper_subject: str = "",
+    paper_title: str = "",
 ) -> str:
-    lines: list[str] = ["# 第一部分：原卷试题版", ""]
+    subject = (paper_subject or "").strip()
+    title = (paper_title or "").strip()
+    answer_title = f"{title}参考答案" if title else ""
+
+    lines: list[str] = []
+    if subject:
+        lines.append(subject)
+        lines.append("")
+    if title:
+        lines.append(title)
+        lines.append("")
+    lines.extend(["第一部分：原卷试题版", ""])
     for group_index, group in enumerate(groups, start=1):
         items = group.get("items") or []
         if not items:
             continue
         group_name = (group.get("group_name") or "未命名题型").strip()
         section_no = to_chinese_section_number(group_index)
-        lines.append(f"## {section_no}、{group_name}")
+        lines.append(f"{section_no}、{group_name}")
         lines.append("")
         for item_index, item in enumerate(items, start=1):
             question_text = strip_leading_numbering(item.get("question") or "")
@@ -1055,14 +1233,17 @@ def build_split_export_markdown(
                 "（题目内容为空）",
             )
 
-    lines.extend(["# 第二部分：答案与解析版", ""])
+    lines.extend(["第二部分：答案与解析版", ""])
+    if answer_title:
+        lines.append(answer_title)
+        lines.append("")
     for group_index, group in enumerate(groups, start=1):
         items = group.get("items") or []
         if not items:
             continue
         group_name = (group.get("group_name") or "未命名题型").strip()
         section_no = to_chinese_section_number(group_index)
-        lines.append(f"## {section_no}、{group_name}")
+        lines.append(f"{section_no}、{group_name}")
         lines.append("")
         for item_index, item in enumerate(items, start=1):
             answer_text = strip_leading_numbering(item.get("answer") or "")
@@ -1174,7 +1355,11 @@ def admin_export_tasks_md(req: AdminExportRequest, db: Session = Depends(get_db)
             detail="所选任务没有可导出的最终排版结果。",
         )
 
-    markdown_content = build_split_export_markdown(grouped_items)
+    markdown_content = build_split_export_markdown(
+        grouped_items,
+        req.paper_subject or "",
+        req.paper_title or "",
+    )
     filename = f"final_results_{uuid.uuid4().hex[:8]}.md"
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return StreamingResponse(
@@ -1202,7 +1387,11 @@ def admin_export_tasks_docx(req: AdminExportRequest, db: Session = Depends(get_d
             detail="所选任务没有可导出的最终排版结果。",
         )
 
-    markdown_content = build_split_export_markdown(grouped_items)
+    markdown_content = build_split_export_markdown(
+        grouped_items,
+        req.paper_subject or "",
+        req.paper_title or "",
+    )
 
     try:
         with tempfile.TemporaryDirectory(prefix="task_export_") as tmp_dir:
@@ -1244,6 +1433,13 @@ def admin_export_tasks_docx(req: AdminExportRequest, db: Session = Depends(get_d
 
             with open(docx_path, "rb") as docx_file:
                 docx_bytes = docx_file.read()
+
+            # 强制统一导出 DOCX 的字体与字号
+            docx_bytes = apply_docx_default_style(
+                docx_bytes,
+                req.paper_subject or "",
+                req.paper_title or "",
+            )
     except FileNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

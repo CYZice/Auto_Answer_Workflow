@@ -1,4 +1,11 @@
-from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, Query
+from fastapi import (
+    FastAPI,
+    Depends,
+    HTTPException,
+    status,
+    BackgroundTasks,
+    Query,
+)
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -7,6 +14,8 @@ import uuid
 import asyncio
 import json
 import os
+import subprocess
+import tempfile
 from dotenv import load_dotenv
 
 # 加载 .env 环境变量
@@ -23,6 +32,7 @@ from app.models.schemas import (
     AdminTaskListResponse,
     AdminTaskUpdateRequest,
     AdminTaskUpdateResponse,
+    AdminExportRequest,
     AdminLogListResponse,
     AdminLogItemResponse,
     RuntimeSettingsResponse,
@@ -724,6 +734,173 @@ def admin_list_tasks(
     )
     return AdminTaskListResponse(
         total=total, page=page, page_size=page_size, items=items
+    )
+
+
+def split_question_and_answer(final_result: str) -> tuple[str, str, bool]:
+    text = (final_result or "").strip()
+    if not text:
+        return "", "", True
+
+    answer_start = text.find("【正解】")
+    if answer_start < 0:
+        answer_start = text.find("【解析】")
+
+    if answer_start < 0:
+        return text, "", True
+
+    question_part = text[:answer_start].strip()
+
+    answer_end_marker = "【答案延伸】"
+    answer_end = text.find(answer_end_marker, answer_start)
+    if answer_end >= 0:
+        answer_part = text[answer_start : answer_end + len(answer_end_marker)].strip()
+    else:
+        answer_part = text[answer_start:].strip()
+
+    return question_part, answer_part, False
+
+
+def build_split_export_markdown(items: list[tuple[str, str]]) -> str:
+    split_items = []
+    for task_id, final_result in items:
+        question_part, answer_part, only_question = split_question_and_answer(
+            final_result
+        )
+        split_items.append(
+            {
+                "task_id": task_id,
+                "question": question_part,
+                "answer": answer_part,
+                "only_question": only_question,
+            }
+        )
+
+    lines: list[str] = ["# 题目", ""]
+    for index, item in enumerate(split_items, start=1):
+        lines.append(f"## {index}. {item['task_id']}")
+        lines.append(item["question"] or "（题目内容为空）")
+        lines.append("")
+
+    lines.extend(["---", "", "# 答案", ""])
+    for index, item in enumerate(split_items, start=1):
+        lines.append(f"## {index}. {item['task_id']}")
+        if item["answer"]:
+            lines.append(item["answer"])
+        elif item["only_question"]:
+            lines.append("（仅题目，未识别到【正解】或【解析】答案段）")
+        else:
+            lines.append("（答案内容为空）")
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def collect_export_items(task_ids: list[str], db: Session) -> list[tuple[str, str]]:
+    tasks = db.query(Task).filter(Task.task_id.in_(task_ids)).all()
+    task_map = {task.task_id: task for task in tasks}
+
+    items_with_result: list[tuple[str, str]] = []
+    for task_id in task_ids:
+        task = task_map.get(task_id)
+        if not task:
+            continue
+        final_result = (task.final_result or "").strip()
+        if final_result:
+            items_with_result.append((task_id, final_result))
+    return items_with_result
+
+
+@app.post("/api/admin/tasks/export/md")
+def admin_export_tasks_md(req: AdminExportRequest, db: Session = Depends(get_db)):
+    task_ids = [task_id.strip() for task_id in req.task_ids if task_id.strip()]
+    if not task_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="task_ids 不能为空。",
+        )
+
+    items_with_result = collect_export_items(task_ids, db)
+    if not items_with_result:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="所选任务没有可导出的最终排版结果。",
+        )
+
+    markdown_content = build_split_export_markdown(items_with_result)
+    filename = f"final_results_{uuid.uuid4().hex[:8]}.md"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(
+        iter([markdown_content.encode("utf-8")]),
+        media_type="text/markdown; charset=utf-8",
+        headers=headers,
+    )
+
+
+@app.post("/api/admin/tasks/export/docx")
+def admin_export_tasks_docx(req: AdminExportRequest, db: Session = Depends(get_db)):
+    task_ids = [task_id.strip() for task_id in req.task_ids if task_id.strip()]
+    if not task_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="task_ids 不能为空。",
+        )
+
+    items_with_result = collect_export_items(task_ids, db)
+
+    if not items_with_result:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="所选任务没有可导出的最终排版结果。",
+        )
+
+    markdown_content = build_split_export_markdown(items_with_result)
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="task_export_") as tmp_dir:
+            md_path = os.path.join(tmp_dir, "final_results.md")
+            docx_path = os.path.join(tmp_dir, "final_results.docx")
+
+            with open(md_path, "w", encoding="utf-8") as md_file:
+                md_file.write(markdown_content)
+
+            result = subprocess.run(
+                ["pandoc", md_path, "-o", docx_path],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            if result.returncode != 0:
+                last_error_text = (result.stderr or result.stdout or "").strip()
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=(
+                        "DOCX 导出失败，请确认已安装 pandoc。"
+                        + (f" 详情: {last_error_text}" if last_error_text else "")
+                    ),
+                )
+
+            if not os.path.exists(docx_path):
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="DOCX 文件生成失败。",
+                )
+
+            with open(docx_path, "rb") as docx_file:
+                docx_bytes = docx_file.read()
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="DOCX 导出失败，未找到 pandoc 命令。",
+        )
+
+    filename = f"final_results_{uuid.uuid4().hex[:8]}.docx"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(
+        iter([docx_bytes]),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers=headers,
     )
 
 

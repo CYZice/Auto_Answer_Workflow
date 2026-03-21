@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider, useMutation, useQueries, useQuery } f
 import axios from 'axios'
 import 'katex/dist/katex.min.css'
 import { Database, Download, Image as ImageIcon, Maximize2, Play, Plus, Save, Settings, Trash2, X } from 'lucide-react'
-import { ClipboardEvent, useEffect, useMemo, useState } from 'react'
+import { ClipboardEvent, DragEvent, useEffect, useMemo, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import rehypeKatex from 'rehype-katex'
 import remarkMath from 'remark-math'
@@ -1350,6 +1350,7 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
   const [stateFilter, setStateFilter] = useState('')
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
   const [selectedExportIds, setSelectedExportIds] = useState<string[]>([])
+  const [draggingExportId, setDraggingExportId] = useState<string | null>(null)
   const [isExporting, setIsExporting] = useState(false)
   const [editState, setEditState] = useState('')
   const [editHistory, setEditHistory] = useState('')
@@ -1610,6 +1611,44 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
     setSelectedExportIds(allSelected ? [] : ids)
   }
 
+  const selectedExportTasks = useMemo(() => {
+    const taskMap = new Map((listData?.items || []).map((item) => [item.task_id, item]))
+    return selectedExportIds
+      .map((taskId) => taskMap.get(taskId))
+      .filter((task): task is AdminTask => !!task)
+  }, [listData, selectedExportIds])
+
+  const reorderExportIds = (dragId: string, targetId: string) => {
+    if (dragId === targetId) return
+    setSelectedExportIds((prev) => {
+      const fromIndex = prev.indexOf(dragId)
+      const toIndex = prev.indexOf(targetId)
+      if (fromIndex < 0 || toIndex < 0) return prev
+      const next = [...prev]
+      const [moved] = next.splice(fromIndex, 1)
+      next.splice(toIndex, 0, moved)
+      return next
+    })
+  }
+
+  const handleExportDragStart = (taskId: string) => {
+    setDraggingExportId(taskId)
+  }
+
+  const handleExportDragOver = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+  }
+
+  const handleExportDrop = (targetTaskId: string) => {
+    if (!draggingExportId) return
+    reorderExportIds(draggingExportId, targetTaskId)
+    setDraggingExportId(null)
+  }
+
+  const handleExportDragEnd = () => {
+    setDraggingExportId(null)
+  }
+
   const exportFinalResults = async () => {
     if (selectedExportIds.length === 0) {
       setOperationMessage('请先勾选任务')
@@ -1617,20 +1656,12 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
     }
     setIsExporting(true)
     try {
-      const details = await Promise.all(
-        selectedExportIds.map((taskId) =>
-          api.get<AdminTask>(`/api/admin/tasks/${taskId}`).then((res) => res.data)
-        )
+      const response = await api.post(
+        '/api/admin/tasks/export/md',
+        { task_ids: selectedExportIds },
+        { responseType: 'blob' }
       )
-      const itemsWithFinalResult = details.filter((task) => (task.final_result || '').trim().length > 0)
-      if (itemsWithFinalResult.length === 0) {
-        setOperationMessage('所选任务没有可导出的最终排版结果')
-        return
-      }
-      const fileContent = itemsWithFinalResult
-        .map((task) => `# ${task.task_id}\n\n${(task.final_result || '').trim()}`)
-        .join('\n\n---\n\n')
-      const blob = new Blob([fileContent], { type: 'text/markdown;charset=utf-8' })
+      const blob = new Blob([response.data], { type: 'text/markdown;charset=utf-8' })
       const url = URL.createObjectURL(blob)
       const link = document.createElement('a')
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
@@ -1640,9 +1671,39 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
       link.click()
       document.body.removeChild(link)
       URL.revokeObjectURL(url)
-      setOperationMessage(`导出成功，共 ${itemsWithFinalResult.length} 条最终排版结果`)
+      setOperationMessage(`MD 导出成功（已按自定义顺序拆分题目与答案）`)
     } catch (error: unknown) {
-      setOperationMessage(getErrorMessage(error, '导出失败'))
+      setOperationMessage(getErrorMessage(error, 'MD 导出失败'))
+    } finally {
+      setIsExporting(false)
+    }
+  }
+
+  const exportFinalResultsDocx = async () => {
+    if (selectedExportIds.length === 0) {
+      setOperationMessage('请先勾选任务')
+      return
+    }
+    setIsExporting(true)
+    try {
+      const response = await api.post(
+        '/api/admin/tasks/export/docx',
+        { task_ids: selectedExportIds },
+        { responseType: 'blob' }
+      )
+      const blob = new Blob([response.data], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+      link.href = url
+      link.download = `final_results_${timestamp}.docx`
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      URL.revokeObjectURL(url)
+      setOperationMessage('DOCX 导出成功（已按自定义顺序拆分题目与答案）')
+    } catch (error: unknown) {
+      setOperationMessage(getErrorMessage(error, 'DOCX 导出失败（可能后端缺少 pandoc）'))
     } finally {
       setIsExporting(false)
     }
@@ -1706,16 +1767,46 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
                 >
                   全选当前列表
                 </button>
-                <button
-                  onClick={exportFinalResults}
-                  disabled={isExporting || selectedExportIds.length === 0}
-                  className="inline-flex items-center gap-1.5 text-xs px-2.5 py-1 bg-indigo-600 text-white rounded disabled:opacity-50 hover:bg-indigo-700"
-                >
-                  <Download size={12} />
-                  {isExporting ? '导出中...' : `导出最终结果(${selectedExportIds.length})`}
-                </button>
+                <div className="flex bg-indigo-600 rounded">
+                  <button
+                    onClick={exportFinalResults}
+                    disabled={isExporting || selectedExportIds.length === 0}
+                    className="inline-flex items-center gap-1 text-xs px-2.5 py-1 text-white border-r border-indigo-700 disabled:opacity-50 hover:bg-indigo-700 rounded-l"
+                  >
+                    <Download size={12} />
+                    {isExporting ? '导出中...' : `导出 MD(${selectedExportIds.length})`}
+                  </button>
+                  <button
+                    onClick={exportFinalResultsDocx}
+                    disabled={isExporting || selectedExportIds.length === 0}
+                    className="inline-flex items-center gap-1 text-xs px-2.5 py-1 text-white disabled:opacity-50 hover:bg-indigo-700 rounded-r"
+                  >
+                    <Download size={12} />
+                    导出 DOCX
+                  </button>
+                </div>
               </div>
             </div>
+            {selectedExportTasks.length > 0 && (
+              <div className="mb-3 p-2 rounded border bg-gray-50">
+                <div className="text-xs text-gray-600 mb-2">拖拽调整导出顺序（题目区和答案区使用同一顺序）</div>
+                <div className="space-y-1 max-h-36 overflow-y-auto">
+                  {selectedExportTasks.map((task, index) => (
+                    <div
+                      key={`export-order-${task.task_id}`}
+                      draggable
+                      onDragStart={() => handleExportDragStart(task.task_id)}
+                      onDragOver={handleExportDragOver}
+                      onDrop={() => handleExportDrop(task.task_id)}
+                      onDragEnd={handleExportDragEnd}
+                      className={`text-xs px-2 py-1.5 rounded border bg-white cursor-move ${draggingExportId === task.task_id ? 'opacity-60 border-indigo-300' : 'border-gray-200'}`}
+                    >
+                      {index + 1}. {task.task_id}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             <div className="space-y-2 max-h-[600px] overflow-y-auto">
               {listLoading && <div className="text-sm text-gray-500">加载中...</div>}
               {!listLoading && (listData?.items || []).map((task) => (

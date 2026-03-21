@@ -170,6 +170,10 @@ class AdminTaskUpdateResponse(BaseModel):
     task: TaskDetailResponse
 
 
+class AdminExportRequest(BaseModel):
+    task_ids: List[str] = Field(default_factory=list)
+
+
 class AdminLogItemResponse(BaseModel):
     id: int
     task_id: str

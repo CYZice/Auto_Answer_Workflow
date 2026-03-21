@@ -1,8 +1,8 @@
 import { QueryClient, QueryClientProvider, useMutation, useQueries, useQuery } from '@tanstack/react-query'
 import axios from 'axios'
 import 'katex/dist/katex.min.css'
-import { Database, Download, Image as ImageIcon, Maximize2, Play, Plus, Save, Settings, Trash2, X } from 'lucide-react'
-import { ClipboardEvent, DragEvent, MouseEvent, useEffect, useMemo, useState } from 'react'
+import { ChevronDown, ChevronUp, Database, Download, Image as ImageIcon, Maximize2, Play, Plus, Save, Settings, Trash2, X } from 'lucide-react'
+import { ChangeEvent, ClipboardEvent, DragEvent, MouseEvent, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import rehypeKatex from 'rehype-katex'
 import remarkMath from 'remark-math'
@@ -196,6 +196,7 @@ const persistTaskForDashboard = (taskId: string) => {
 // --- Components ---
 
 function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
   const [pendingInputImage, setPendingInputImage] = useState<string | null>(null)
   const [inputDraft, setInputDraft] = useState('')
   const [inputSelectedNodes, setInputSelectedNodes] = useState<WorkflowNode[]>([...WORKFLOW_NODE_ORDER])
@@ -420,6 +421,34 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     return () => window.clearTimeout(timer)
   }, [successMessage])
 
+  const readImageAsDataUrl = (file: File) => new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = (event) => {
+      const result = event.target?.result
+      if (typeof result === 'string') {
+        resolve(result)
+        return
+      }
+      reject(new Error('图片读取失败'))
+    }
+    reader.onerror = () => reject(new Error('图片读取失败'))
+    reader.readAsDataURL(file)
+  })
+
+  const loadInputImageFile = async (file: File) => {
+    if (!file.type.startsWith('image/')) {
+      setErrorMessage('请选择图片文件。')
+      return
+    }
+    try {
+      const dataUrl = await readImageAsDataUrl(file)
+      setPendingInputImage(dataUrl)
+      setErrorMessage(null)
+    } catch {
+      setErrorMessage('读取本地图片失败，请重试。')
+    }
+  }
+
   // 处理剪贴板粘贴图片
   const handlePaste = (e: ClipboardEvent<HTMLDivElement>) => {
     if (pendingInputImage) {
@@ -431,20 +460,26 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       if (items[i].type.indexOf('image') !== -1) {
         const file = items[i].getAsFile();
         if (!file) continue;
-
-        // 将文件转为 Base64 URL（为了纯本地演示，不依赖图床）
-        // 生产环境应先传给后端的 /upload 接口换取真实 URL
-        const reader = new FileReader();
-        reader.onload = (event) => {
-          if (event.target?.result) {
-            setPendingInputImage(event.target!.result as string)
-          }
-        };
-        reader.readAsDataURL(file);
+        void loadInputImageFile(file)
         break;
       }
     }
   };
+
+  const handlePickLocalImage = () => {
+    if (pendingInputImage) {
+      setErrorMessage('当前已有待提交题目，请先提交或删除后再选择下一题。')
+      return
+    }
+    fileInputRef.current?.click()
+  }
+
+  const handleLocalImageChange = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    void loadInputImageFile(file)
+    e.target.value = ''
+  }
 
   const toggleInputNodeSelection = (node: WorkflowNode) => {
     setInputSelectedNodes((prev) => {
@@ -696,20 +731,38 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
 
       {/* 单题输入区域 */}
       <div className="bg-white p-6 rounded-xl shadow-sm border space-y-4">
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          className="hidden"
+          onChange={handleLocalImageChange}
+        />
         <div className="flex justify-between items-center">
           <h2 className="text-lg font-semibold flex items-center gap-2">
             <ImageIcon size={20} className="text-blue-500" />
             当前题目输入
           </h2>
-          <button
-            onClick={handleSubmitCurrentTask}
-            disabled={!canSubmitInputTask}
-            className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg font-medium disabled:opacity-50 hover:bg-blue-700 transition-colors"
-            title={inputBlockedReason || '提交当前题目'}
-          >
-            <Play size={18} />
-            {createMutation.isPending ? '正在提交...' : '提交本题'}
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handlePickLocalImage}
+              disabled={!!pendingInputImage}
+              className="flex items-center gap-2 bg-white text-blue-700 border border-blue-200 px-4 py-2 rounded-lg font-medium disabled:opacity-50 hover:bg-blue-50 transition-colors"
+              title={pendingInputImage ? '当前已有待提交题目' : '从本地选择图片'}
+            >
+              <Plus size={18} />
+              本地选图
+            </button>
+            <button
+              onClick={handleSubmitCurrentTask}
+              disabled={!canSubmitInputTask}
+              className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg font-medium disabled:opacity-50 hover:bg-blue-700 transition-colors"
+              title={inputBlockedReason || '提交当前题目'}
+            >
+              <Play size={18} />
+              {createMutation.isPending ? '正在提交...' : '提交本题'}
+            </button>
+          </div>
         </div>
 
         {pendingInputImage ? (
@@ -778,7 +831,7 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         ) : (
           <div className="h-36 border-2 border-dashed border-gray-300 rounded-lg flex flex-col items-center justify-center text-gray-400 bg-gray-50">
             <Plus size={24} className="mb-2" />
-            <span className="text-sm">在此页面使用 Ctrl+V 粘贴题目截图</span>
+            <span className="text-sm">支持 Ctrl+V 粘贴，或点击上方“本地选图”上传题目截图</span>
             <span className="text-xs mt-1">一次只录入一题，提交后再开始下一题</span>
           </div>
         )}
@@ -1485,6 +1538,7 @@ function AdminPanel({
   const [editErrorCode, setEditErrorCode] = useState('')
   const [editManualOperator, setEditManualOperator] = useState('')
   const [operationMessage, setOperationMessage] = useState<string | null>(null)
+  const [isCustomRunPanelOpen, setIsCustomRunPanelOpen] = useState(false)
   const [customRunNodes, setCustomRunNodes] = useState<WorkflowNode[]>([...WORKFLOW_NODE_ORDER])
   const [customRunDraft, setCustomRunDraft] = useState('')
 
@@ -1542,6 +1596,10 @@ function AdminPanel({
       // 历史字段无效时保持默认值，避免 Admin 面板不可用
     }
   }, [selectedTask])
+
+  useEffect(() => {
+    setIsCustomRunPanelOpen(false)
+  }, [selectedTaskId])
 
   useEffect(() => {
     if (!selectedTaskId && listData && listData.items.length > 0) {
@@ -2053,62 +2111,94 @@ function AdminPanel({
               </div>
 
               <div className="space-y-3 border rounded-lg p-4 bg-indigo-50/40 border-indigo-100">
-                <h3 className="text-sm font-semibold text-indigo-700">自定义节点执行 (custom_run)</h3>
-                <div className="flex flex-wrap items-center gap-2">
-                  {WORKFLOW_NODE_ORDER.map((node, idx) => (
-                    <div key={`admin-${node}`} className="flex items-center gap-2">
-                      <label className="inline-flex items-center gap-2 text-xs px-2.5 py-1.5 rounded border bg-white border-gray-200">
-                        <input
-                          type="checkbox"
-                          checked={customRunNodes.includes(node)}
-                          onChange={() => {
-                            setCustomRunNodes((prev) => (
-                              prev.includes(node)
-                                ? prev.filter((item) => item !== node)
-                                : [...prev, node]
-                            ))
-                          }}
-                        />
-                        <span>{node}</span>
-                      </label>
-                      {idx < WORKFLOW_NODE_ORDER.length - 1 && <span className="text-gray-400 text-xs">-&gt;</span>}
-                    </div>
-                  ))}
-                </div>
-
-                <div className="text-xs text-gray-600 bg-white rounded border px-3 py-2">
-                  <div>入口节点: <span className="font-mono">{customRunEntryPoint || '-'}</span></div>
-                  <div>目标节点: <span className="font-mono">{orderedCustomRunNodes.join(', ') || '-'}</span></div>
-                </div>
-
-                {customRunNeedDraft && (
-                  <div className="space-y-1.5">
-                    <label className="text-xs font-medium text-gray-700">草稿文本（必填）</label>
-                    <textarea
-                      value={customRunDraft}
-                      onChange={(e) => setCustomRunDraft(e.target.value)}
-                      className="w-full min-h-24 border rounded-lg px-3 py-2 text-xs font-mono bg-white"
-                      placeholder="从 reviewer/formatter 起跑时，输入或修订 draft_solution"
-                    />
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-sm font-semibold text-indigo-700">自定义节点执行 (custom_run)</h3>
+                    {!isCustomRunPanelOpen && (
+                      <p className="text-xs text-gray-600 mt-1">
+                        入口节点: <span className="font-mono">{customRunEntryPoint || '-'}</span>
+                        {' · '}目标节点: <span className="font-mono">{orderedCustomRunNodes.join(', ') || '-'}</span>
+                      </p>
+                    )}
                   </div>
-                )}
-
-                {customRunHint && (
-                  <div className="text-xs text-red-600 bg-red-50 border border-red-100 px-3 py-2 rounded">
-                    {customRunHint}
-                  </div>
-                )}
-
-                <div className="flex justify-end">
                   <button
-                    onClick={() => customRunMutation.mutate()}
-                    disabled={!canSubmitCustomRun}
-                    className="inline-flex items-center gap-2 px-3 py-1.5 text-xs text-indigo-700 border border-indigo-200 rounded hover:bg-indigo-50 disabled:opacity-50"
-                    title={customRunHint || '按勾选节点执行'}
+                    type="button"
+                    onClick={() => setIsCustomRunPanelOpen((prev) => !prev)}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs text-indigo-700 border border-indigo-200 rounded hover:bg-indigo-100"
                   >
-                    {customRunMutation.isPending ? '执行中...' : '执行 custom_run'}
+                    {isCustomRunPanelOpen ? (
+                      <>
+                        收起
+                        <ChevronUp size={14} />
+                      </>
+                    ) : (
+                      <>
+                        展开
+                        <ChevronDown size={14} />
+                      </>
+                    )}
                   </button>
                 </div>
+
+                {isCustomRunPanelOpen && (
+                  <>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {WORKFLOW_NODE_ORDER.map((node, idx) => (
+                        <div key={`admin-${node}`} className="flex items-center gap-2">
+                          <label className="inline-flex items-center gap-2 text-xs px-2.5 py-1.5 rounded border bg-white border-gray-200">
+                            <input
+                              type="checkbox"
+                              checked={customRunNodes.includes(node)}
+                              onChange={() => {
+                                setCustomRunNodes((prev) => (
+                                  prev.includes(node)
+                                    ? prev.filter((item) => item !== node)
+                                    : [...prev, node]
+                                ))
+                              }}
+                            />
+                            <span>{node}</span>
+                          </label>
+                          {idx < WORKFLOW_NODE_ORDER.length - 1 && <span className="text-gray-400 text-xs">-&gt;</span>}
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="text-xs text-gray-600 bg-white rounded border px-3 py-2">
+                      <div>入口节点: <span className="font-mono">{customRunEntryPoint || '-'}</span></div>
+                      <div>目标节点: <span className="font-mono">{orderedCustomRunNodes.join(', ') || '-'}</span></div>
+                    </div>
+
+                    {customRunNeedDraft && (
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-medium text-gray-700">草稿文本（必填）</label>
+                        <textarea
+                          value={customRunDraft}
+                          onChange={(e) => setCustomRunDraft(e.target.value)}
+                          className="w-full min-h-24 border rounded-lg px-3 py-2 text-xs font-mono bg-white"
+                          placeholder="从 reviewer/formatter 起跑时，输入或修订 draft_solution"
+                        />
+                      </div>
+                    )}
+
+                    {customRunHint && (
+                      <div className="text-xs text-red-600 bg-red-50 border border-red-100 px-3 py-2 rounded">
+                        {customRunHint}
+                      </div>
+                    )}
+
+                    <div className="flex justify-end">
+                      <button
+                        onClick={() => customRunMutation.mutate()}
+                        disabled={!canSubmitCustomRun}
+                        className="inline-flex items-center gap-2 px-3 py-1.5 text-xs text-indigo-700 border border-indigo-200 rounded hover:bg-indigo-50 disabled:opacity-50"
+                        title={customRunHint || '按勾选节点执行'}
+                      >
+                        {customRunMutation.isPending ? '执行中...' : '执行 custom_run'}
+                      </button>
+                    </div>
+                  </>
+                )}
               </div>
 
               <div className="grid grid-cols-2 gap-4 text-sm bg-gray-50 border rounded p-4">
@@ -2144,7 +2234,7 @@ function AdminPanel({
 
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                 <div className="space-y-2">
-                  <label className="text-sm font-medium text-gray-700">question_preview（自动生成）</label>
+                  <label className="text-sm font-medium text-gray-700">question_preview</label>
                   <textarea
                     value={selectedTask.question_preview || ''}
                     readOnly
@@ -2152,7 +2242,7 @@ function AdminPanel({
                   />
                 </div>
                 <div className="space-y-2">
-                  <label className="text-sm font-medium text-gray-700">answer_preview（自动生成）</label>
+                  <label className="text-sm font-medium text-gray-700">answer_preview</label>
                   <textarea
                     value={selectedTask.answer_preview || ''}
                     readOnly
@@ -2735,7 +2825,7 @@ function PaperBuilder({
                       onClick={() => onOpenAdminTask(task.task_id)}
                       className="text-xs px-2 py-1 border rounded hover:bg-white"
                     >
-                      去数据库定位
+                      任务管理
                     </button>
                   </div>
                 </div>

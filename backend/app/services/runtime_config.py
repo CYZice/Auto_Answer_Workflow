@@ -13,10 +13,10 @@ PROMPT_TEMPLATES_PATH = CONFIG_DIR / "prompt_templates.yaml"
 DEFAULT_RUNTIME_SETTINGS = {
     "active_template_id": "workflow_a",
     "fallback": {
-        "global": ["gpt-5.4", "gemini-3-flash-preview"],
+        "global": ["gpt-5.4-medium", "gemini-3-flash-preview"],
         "nodes": {
             "solver": [],
-            "reviewer": ["gpt-5.4-medium", "gemini-3-flash-preview"],
+            "reviewer": [],
             "formatter": [],
         },
     },

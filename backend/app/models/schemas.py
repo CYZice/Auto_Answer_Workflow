@@ -181,8 +181,35 @@ class AdminTaskUpdateResponse(BaseModel):
     task: TaskDetailResponse
 
 
+class ExportGroupItem(BaseModel):
+    group_id: Optional[str] = Field(default=None)
+    group_name: str = Field(default="未命名题型")
+    task_ids: List[str] = Field(default_factory=list)
+
+
 class AdminExportRequest(BaseModel):
     task_ids: List[str] = Field(default_factory=list)
+    groups: List[ExportGroupItem] = Field(default_factory=list)
+
+
+class PaperBuilderGroupItem(BaseModel):
+    group_id: str
+    group_name: str = Field(default="未命名题型")
+    task_ids: List[str] = Field(default_factory=list)
+
+
+class PaperBuilderDraftPayload(BaseModel):
+    name: str = Field(default="默认排版草稿")
+    groups: List[PaperBuilderGroupItem] = Field(default_factory=list)
+
+
+class PaperBuilderDraftResponse(PaperBuilderDraftPayload):
+    draft_id: str
+    updated_at: Optional[datetime] = None
+
+
+class PaperBuilderDraftListResponse(BaseModel):
+    items: List[PaperBuilderDraftResponse] = Field(default_factory=list)
 
 
 class AdminLogItemResponse(BaseModel):

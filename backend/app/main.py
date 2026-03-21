@@ -15,6 +15,7 @@ import uuid
 import asyncio
 import json
 import os
+import re
 import subprocess
 import tempfile
 from dotenv import load_dotenv
@@ -42,6 +43,9 @@ from app.models.schemas import (
     PromptTemplateDetailResponse,
     PromptTemplatePayload,
     PromptTemplateCreateRequest,
+    PaperBuilderDraftPayload,
+    PaperBuilderDraftResponse,
+    PaperBuilderDraftListResponse,
 )
 from app.agent.graph import build_graph
 from app.agent.nodes.llm_client import coerce_token_count
@@ -88,6 +92,71 @@ task_events = TaskEventBus()
 VALID_RESUME_NODES = {"solver", "reviewer", "formatter"}
 WORKFLOW_ORDER = ["solver", "reviewer", "formatter"]
 graph_apps = {node: build_graph(node) for node in VALID_RESUME_NODES}
+PAPER_BUILDER_DRAFTS_PATH = os.path.join(
+    os.path.dirname(__file__), "config", "paper_builder_drafts.json"
+)
+
+
+def load_paper_builder_drafts_store() -> dict:
+    if not os.path.exists(PAPER_BUILDER_DRAFTS_PATH):
+        return {"drafts": {}}
+    try:
+        with open(PAPER_BUILDER_DRAFTS_PATH, "r", encoding="utf-8") as file:
+            data = json.load(file)
+            if not isinstance(data, dict):
+                return {"drafts": {}}
+            drafts = data.get("drafts")
+            if not isinstance(drafts, dict):
+                return {"drafts": {}}
+            return {"drafts": drafts}
+    except Exception:
+        return {"drafts": {}}
+
+
+def save_paper_builder_drafts_store(store: dict) -> None:
+    os.makedirs(os.path.dirname(PAPER_BUILDER_DRAFTS_PATH), exist_ok=True)
+    with open(PAPER_BUILDER_DRAFTS_PATH, "w", encoding="utf-8") as file:
+        json.dump(store, file, ensure_ascii=False, indent=2)
+
+
+def normalize_paper_builder_group_item(raw_group: dict) -> dict | None:
+    if not isinstance(raw_group, dict):
+        return None
+    group_id = str(raw_group.get("group_id") or "").strip()
+    if not group_id:
+        return None
+    group_name = (
+        str(raw_group.get("group_name") or "未命名题型").strip() or "未命名题型"
+    )
+    raw_task_ids = raw_group.get("task_ids")
+    if not isinstance(raw_task_ids, list):
+        raw_task_ids = []
+    task_ids = normalize_task_ids([str(task_id) for task_id in raw_task_ids])
+    return {
+        "group_id": group_id,
+        "group_name": group_name,
+        "task_ids": task_ids,
+    }
+
+
+def normalize_paper_builder_draft_record(draft_id: str, raw_value: dict) -> dict:
+    draft_name = str(raw_value.get("name") or "默认排版草稿").strip() or "默认排版草稿"
+    raw_groups = raw_value.get("groups")
+    groups: list[dict] = []
+    if isinstance(raw_groups, list):
+        for raw_group in raw_groups:
+            normalized_group = normalize_paper_builder_group_item(raw_group)
+            if normalized_group:
+                groups.append(normalized_group)
+    updated_at = raw_value.get("updated_at")
+    if not isinstance(updated_at, str):
+        updated_at = None
+    return {
+        "draft_id": draft_id,
+        "name": draft_name,
+        "groups": groups,
+        "updated_at": updated_at,
+    }
 
 
 def normalize_target_nodes(raw_nodes) -> list[str]:
@@ -739,6 +808,79 @@ def put_runtime_settings(req: RuntimeSettingsUpdateRequest):
     return update_runtime_settings(payload)
 
 
+@app.get("/api/paper-builder/drafts", response_model=PaperBuilderDraftListResponse)
+def list_paper_builder_drafts():
+    store = load_paper_builder_drafts_store()
+    drafts = store.get("drafts") or {}
+    items: list[dict] = []
+    for draft_id, raw_value in drafts.items():
+        if not isinstance(raw_value, dict):
+            continue
+        items.append(normalize_paper_builder_draft_record(draft_id, raw_value))
+    items.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
+    return {"items": items}
+
+
+@app.get(
+    "/api/paper-builder/drafts/{draft_id}",
+    response_model=PaperBuilderDraftResponse,
+)
+def get_paper_builder_draft(draft_id: str):
+    normalized_draft_id = draft_id.strip()
+    if not normalized_draft_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="draft_id 不能为空。",
+        )
+
+    store = load_paper_builder_drafts_store()
+    drafts = store.get("drafts") or {}
+    raw_value = drafts.get(normalized_draft_id)
+    if not isinstance(raw_value, dict):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Draft {normalized_draft_id} not found.",
+        )
+    return normalize_paper_builder_draft_record(normalized_draft_id, raw_value)
+
+
+@app.put(
+    "/api/paper-builder/drafts/{draft_id}",
+    response_model=PaperBuilderDraftResponse,
+)
+def put_paper_builder_draft(draft_id: str, req: PaperBuilderDraftPayload):
+    normalized_draft_id = draft_id.strip()
+    if not normalized_draft_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="draft_id 不能为空。",
+        )
+
+    payload = req.model_dump()
+    normalized_groups: list[dict] = []
+    for group in payload.get("groups") or []:
+        normalized_group = normalize_paper_builder_group_item(group)
+        if normalized_group:
+            normalized_groups.append(normalized_group)
+
+    from datetime import datetime, timezone
+
+    updated_at = datetime.now(timezone.utc).isoformat()
+
+    store = load_paper_builder_drafts_store()
+    drafts = store.setdefault("drafts", {})
+    drafts[normalized_draft_id] = {
+        "name": (payload.get("name") or "默认排版草稿").strip() or "默认排版草稿",
+        "groups": normalized_groups,
+        "updated_at": updated_at,
+    }
+    save_paper_builder_drafts_store(store)
+
+    return normalize_paper_builder_draft_record(
+        normalized_draft_id, drafts[normalized_draft_id]
+    )
+
+
 @app.get("/api/templates", response_model=list[PromptTemplateItemResponse])
 def get_templates():
     return list_templates()
@@ -826,33 +968,81 @@ def split_question_and_answer(final_result: str) -> tuple[str, str, bool]:
     return question_part, answer_part, False
 
 
-def build_split_export_markdown(
-    items: list[tuple[str, str, str, bool]],
-) -> str:
-    split_items = [
-        {
-            "task_id": task_id,
-            "question": question_part,
-            "answer": answer_part,
-            "only_question": only_question,
-        }
-        for task_id, question_part, answer_part, only_question in items
+def strip_leading_numbering(text: str) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    return re.sub(r"^\s*[（(]?\d+[）).、．]\s*", "", cleaned)
+
+
+def to_chinese_section_number(index: int) -> str:
+    numerals = [
+        "一",
+        "二",
+        "三",
+        "四",
+        "五",
+        "六",
+        "七",
+        "八",
+        "九",
+        "十",
+        "十一",
+        "十二",
     ]
+    if 1 <= index <= len(numerals):
+        return numerals[index - 1]
+    return str(index)
 
-    lines: list[str] = ["# 题目", ""]
-    for item in split_items:
-        lines.append(item["question"] or "（题目内容为空）")
-        lines.append("")
 
-    lines.extend(["# 答案", ""])
-    for item in split_items:
-        if item["answer"]:
-            lines.append(item["answer"])
-        elif item["only_question"]:
-            lines.append("（仅题目，未识别到【正解】或【解析】答案段）")
-        else:
-            lines.append("（答案内容为空）")
+def normalize_task_ids(task_ids: list[str]) -> list[str]:
+    normalized: list[str] = []
+    seen = set()
+    for raw_task_id in task_ids:
+        task_id = (raw_task_id or "").strip()
+        if not task_id or task_id in seen:
+            continue
+        seen.add(task_id)
+        normalized.append(task_id)
+    return normalized
+
+
+def build_split_export_markdown(
+    groups: list[dict],
+) -> str:
+    lines: list[str] = ["# 第一部分：原卷试题版", ""]
+    for group_index, group in enumerate(groups, start=1):
+        items = group.get("items") or []
+        if not items:
+            continue
+        group_name = (group.get("group_name") or "未命名题型").strip()
+        section_no = to_chinese_section_number(group_index)
+        lines.append(f"## {section_no}、{group_name}")
         lines.append("")
+        for item_index, item in enumerate(items, start=1):
+            question_text = strip_leading_numbering(item.get("question") or "")
+            lines.append(f"{item_index}. {question_text or '（题目内容为空）'}")
+            lines.append("")
+
+    lines.extend(["# 第二部分：答案与解析版", ""])
+    for group_index, group in enumerate(groups, start=1):
+        items = group.get("items") or []
+        if not items:
+            continue
+        group_name = (group.get("group_name") or "未命名题型").strip()
+        section_no = to_chinese_section_number(group_index)
+        lines.append(f"## {section_no}、{group_name}")
+        lines.append("")
+        for item_index, item in enumerate(items, start=1):
+            answer_text = strip_leading_numbering(item.get("answer") or "")
+            if answer_text:
+                content = answer_text
+            elif item.get("only_question"):
+                content = "（仅题目，未识别到【正解】或【解析】答案段）"
+            else:
+                content = "（答案内容为空）"
+            lines.append(f"{item_index}. {content}")
+            lines.append("")
 
     return "\n".join(lines).strip() + "\n"
 
@@ -860,11 +1050,12 @@ def build_split_export_markdown(
 def collect_export_items(
     task_ids: list[str], db: Session
 ) -> list[tuple[str, str, str, bool]]:
-    tasks = db.query(Task).filter(Task.task_id.in_(task_ids)).all()
+    normalized_task_ids = normalize_task_ids(task_ids)
+    tasks = db.query(Task).filter(Task.task_id.in_(normalized_task_ids)).all()
     task_map = {task.task_id: task for task in tasks}
 
     items_with_result: list[tuple[str, str, str, bool]] = []
-    for task_id in task_ids:
+    for task_id in normalized_task_ids:
         task = task_map.get(task_id)
         if not task:
             continue
@@ -886,23 +1077,74 @@ def collect_export_items(
     return items_with_result
 
 
+def collect_grouped_export_items(
+    req: AdminExportRequest,
+    db: Session,
+) -> list[dict]:
+    # 新版分组导出优先
+    if req.groups:
+        grouped_items: list[dict] = []
+        for index, group in enumerate(req.groups, start=1):
+            group_name = (group.group_name or "").strip() or f"题型{index}"
+            items = collect_export_items(group.task_ids, db)
+            if not items:
+                continue
+            grouped_items.append(
+                {
+                    "group_id": group.group_id or f"group-{index}",
+                    "group_name": group_name,
+                    "items": [
+                        {
+                            "task_id": task_id,
+                            "question": question_part,
+                            "answer": answer_part,
+                            "only_question": only_question,
+                        }
+                        for task_id, question_part, answer_part, only_question in items
+                    ],
+                }
+            )
+        return grouped_items
+
+    # 旧版兼容：扁平 task_ids 自动封装为单分组
+    fallback_items = collect_export_items(req.task_ids, db)
+    if not fallback_items:
+        return []
+    return [
+        {
+            "group_id": "legacy-group",
+            "group_name": "题目",
+            "items": [
+                {
+                    "task_id": task_id,
+                    "question": question_part,
+                    "answer": answer_part,
+                    "only_question": only_question,
+                }
+                for task_id, question_part, answer_part, only_question in fallback_items
+            ],
+        }
+    ]
+
+
 @app.post("/api/admin/tasks/export/md")
 def admin_export_tasks_md(req: AdminExportRequest, db: Session = Depends(get_db)):
-    task_ids = [task_id.strip() for task_id in req.task_ids if task_id.strip()]
-    if not task_ids:
+    has_groups = bool(req.groups)
+    task_ids = normalize_task_ids(req.task_ids)
+    if not has_groups and not task_ids:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="task_ids 不能为空。",
+            detail="task_ids 或 groups 至少提供一个。",
         )
 
-    items_with_result = collect_export_items(task_ids, db)
-    if not items_with_result:
+    grouped_items = collect_grouped_export_items(req, db)
+    if not grouped_items:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="所选任务没有可导出的最终排版结果。",
         )
 
-    markdown_content = build_split_export_markdown(items_with_result)
+    markdown_content = build_split_export_markdown(grouped_items)
     filename = f"final_results_{uuid.uuid4().hex[:8]}.md"
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return StreamingResponse(
@@ -914,22 +1156,23 @@ def admin_export_tasks_md(req: AdminExportRequest, db: Session = Depends(get_db)
 
 @app.post("/api/admin/tasks/export/docx")
 def admin_export_tasks_docx(req: AdminExportRequest, db: Session = Depends(get_db)):
-    task_ids = [task_id.strip() for task_id in req.task_ids if task_id.strip()]
-    if not task_ids:
+    has_groups = bool(req.groups)
+    task_ids = normalize_task_ids(req.task_ids)
+    if not has_groups and not task_ids:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="task_ids 不能为空。",
+            detail="task_ids 或 groups 至少提供一个。",
         )
 
-    items_with_result = collect_export_items(task_ids, db)
+    grouped_items = collect_grouped_export_items(req, db)
 
-    if not items_with_result:
+    if not grouped_items:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="所选任务没有可导出的最终排版结果。",
         )
 
-    markdown_content = build_split_export_markdown(items_with_result)
+    markdown_content = build_split_export_markdown(grouped_items)
 
     try:
         with tempfile.TemporaryDirectory(prefix="task_export_") as tmp_dir:

@@ -22,6 +22,8 @@ const REVIEWER_CONFIG_STORAGE_KEY = 'reviewer_config'
 const FORMATTER_CONFIG_STORAGE_KEY = 'formatter_config'
 const WORKFLOW_TEMPLATE_ID_STORAGE_KEY = 'workflow_template_id'
 const WORKFLOW_NODE_ORDER = ['solver', 'reviewer', 'formatter'] as const
+const PAPER_BUILDER_LOCAL_DRAFT_KEY = 'paper_builder_local_draft_v1'
+const PAPER_BUILDER_REMOTE_DRAFT_ID = 'default'
 
 type WorkflowNode = (typeof WORKFLOW_NODE_ORDER)[number]
 
@@ -67,6 +69,23 @@ interface AdminTaskListResponse {
   page: number;
   page_size: number;
   items: AdminTask[];
+}
+
+interface PaperGroup {
+  id: string;
+  name: string;
+  taskIds: string[];
+}
+
+interface PaperBuilderDraftResponse {
+  draft_id: string;
+  name: string;
+  groups: Array<{
+    group_id: string;
+    group_name: string;
+    task_ids: string[];
+  }>;
+  updated_at?: string | null;
 }
 
 interface AdminLogItem {
@@ -1443,10 +1462,16 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
   )
 }
 
-function AdminPanel({ onBack }: { onBack: () => void }) {
+function AdminPanel({
+  onBack,
+  initialTaskId,
+}: {
+  onBack: () => void;
+  initialTaskId?: string | null;
+}) {
   const [searchTaskId, setSearchTaskId] = useState('')
   const [stateFilter, setStateFilter] = useState('')
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(initialTaskId || null)
   const [selectedExportIds, setSelectedExportIds] = useState<string[]>([])
   const [draggingExportId, setDraggingExportId] = useState<string | null>(null)
   const [hoveredExportId, setHoveredExportId] = useState<string | null>(null)
@@ -1521,6 +1546,12 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
       setSelectedTaskId(listData.items[0].task_id)
     }
   }, [selectedTaskId, listData])
+
+  useEffect(() => {
+    if (initialTaskId && initialTaskId !== selectedTaskId) {
+      setSelectedTaskId(initialTaskId)
+    }
+  }, [initialTaskId, selectedTaskId])
 
   useEffect(() => {
     if (!listData) return
@@ -2179,16 +2210,721 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
   )
 }
 
+function PaperBuilder({
+  onOpenAdminTask,
+}: {
+  onOpenAdminTask: (taskId: string) => void;
+}) {
+  const [groups, setGroups] = useState<PaperGroup[]>([])
+  const [draftName, setDraftName] = useState('默认排版草稿')
+  const [groupNameInput, setGroupNameInput] = useState('')
+  const [operationMessage, setOperationMessage] = useState<string | null>(null)
+  const [isExporting, setIsExporting] = useState(false)
+  const [isSavingDraft, setIsSavingDraft] = useState(false)
+  const [isLoadingDraft, setIsLoadingDraft] = useState(false)
+  const [lastSavedAt, setLastSavedAt] = useState<string | null>(null)
+  const [selectedTaskIds, setSelectedTaskIds] = useState<string[]>([])
+  const [draggingTaskId, setDraggingTaskId] = useState<string | null>(null)
+  const [dragOverGroupId, setDragOverGroupId] = useState<string | null>(null)
+  const [dragOverTaskKey, setDragOverTaskKey] = useState<string | null>(null)
+  const [hasInitializedDraft, setHasInitializedDraft] = useState(false)
+
+  const { data: listData, isLoading } = useQuery({
+    queryKey: ['builder-admin-tasks'],
+    queryFn: () => api.get<AdminTaskListResponse>('/api/admin/tasks', {
+      params: { page: 1, page_size: 200 }
+    }).then((res) => res.data),
+    refetchInterval: 5000,
+  })
+
+  const tasks = listData?.items || []
+  const taskMap = useMemo(() => new Map(tasks.map((item) => [item.task_id, item])), [tasks])
+
+  const groupedTaskIdSet = useMemo(() => {
+    const ids = new Set<string>()
+    groups.forEach((group) => {
+      group.taskIds.forEach((taskId) => ids.add(taskId))
+    })
+    return ids
+  }, [groups])
+
+  const normalizeGroups = (rawGroups: PaperGroup[]): PaperGroup[] => {
+    const normalized: PaperGroup[] = []
+    const seenGroupIds = new Set<string>()
+    const globalTaskIds = new Set<string>()
+
+    rawGroups.forEach((group, index) => {
+      const rawId = typeof group.id === 'string' ? group.id.trim() : ''
+      const id = rawId.length > 0 ? rawId : `group-${Date.now()}-${index}`
+      if (seenGroupIds.has(id)) return
+      seenGroupIds.add(id)
+      const name = (group.name || '').trim() || `题型${index + 1}`
+
+      const taskIds: string[] = []
+      group.taskIds.forEach((rawTaskId) => {
+        const taskId = (rawTaskId || '').trim()
+        if (!taskId || globalTaskIds.has(taskId)) return
+        globalTaskIds.add(taskId)
+        taskIds.push(taskId)
+      })
+
+      normalized.push({ id, name, taskIds })
+    })
+
+    return normalized
+  }
+
+  const saveLocalDraft = (name: string, draftGroups: PaperGroup[]) => {
+    localStorage.setItem(PAPER_BUILDER_LOCAL_DRAFT_KEY, JSON.stringify({
+      name,
+      groups: draftGroups,
+      saved_at: new Date().toISOString(),
+    }))
+  }
+
+  const loadLocalDraft = () => {
+    const raw = localStorage.getItem(PAPER_BUILDER_LOCAL_DRAFT_KEY)
+    if (!raw) return null
+    try {
+      const parsed = JSON.parse(raw) as { name?: string; groups?: PaperGroup[]; saved_at?: string }
+      const loadedGroups = Array.isArray(parsed.groups) ? normalizeGroups(parsed.groups) : []
+      return {
+        name: (parsed.name || '默认排版草稿').trim() || '默认排版草稿',
+        groups: loadedGroups,
+        savedAt: parsed.saved_at || null,
+      }
+    } catch {
+      return null
+    }
+  }
+
+  const loadRemoteDraft = async () => {
+    try {
+      const remote = await api.get<PaperBuilderDraftResponse>(`/api/paper-builder/drafts/${PAPER_BUILDER_REMOTE_DRAFT_ID}`).then((res) => res.data)
+      const loadedGroups = normalizeGroups((remote.groups || []).map((group) => ({
+        id: group.group_id,
+        name: group.group_name,
+        taskIds: group.task_ids,
+      })))
+      setDraftName((remote.name || '默认排版草稿').trim() || '默认排版草稿')
+      setGroups(loadedGroups)
+      setLastSavedAt(remote.updated_at || null)
+      saveLocalDraft((remote.name || '默认排版草稿').trim() || '默认排版草稿', loadedGroups)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  useEffect(() => {
+    let active = true
+    const bootstrap = async () => {
+      setIsLoadingDraft(true)
+      const local = loadLocalDraft()
+      if (active && local) {
+        setDraftName(local.name)
+        setGroups(local.groups)
+        setLastSavedAt(local.savedAt)
+      }
+
+      const loadedRemote = await loadRemoteDraft()
+      if (active && !loadedRemote && local) {
+        setLastSavedAt(local.savedAt)
+      }
+
+      if (active) {
+        setIsLoadingDraft(false)
+        setHasInitializedDraft(true)
+      }
+    }
+
+    void bootstrap()
+    return () => {
+      active = false
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!hasInitializedDraft) return
+    const safeGroups = normalizeGroups(groups)
+    saveLocalDraft(draftName, safeGroups)
+
+    const timer = window.setTimeout(async () => {
+      setIsSavingDraft(true)
+      try {
+        const payload = {
+          name: (draftName || '默认排版草稿').trim() || '默认排版草稿',
+          groups: safeGroups.map((group) => ({
+            group_id: group.id,
+            group_name: group.name,
+            task_ids: group.taskIds,
+          })),
+        }
+        const remote = await api.put<PaperBuilderDraftResponse>(`/api/paper-builder/drafts/${PAPER_BUILDER_REMOTE_DRAFT_ID}`, payload).then((res) => res.data)
+        setLastSavedAt(remote.updated_at || new Date().toISOString())
+      } catch {
+        // 后端保存失败时保留本地草稿，不中断编辑
+      } finally {
+        setIsSavingDraft(false)
+      }
+    }, 800)
+
+    return () => {
+      window.clearTimeout(timer)
+    }
+  }, [draftName, groups, hasInitializedDraft])
+
+  useEffect(() => {
+    if (!tasks.length) return
+    const available = new Set(tasks.map((task) => task.task_id))
+    setSelectedTaskIds((prev) => prev.filter((taskId) => available.has(taskId)))
+  }, [tasks])
+
+  const getStateBadgeClass = (state: string) => {
+    if (state === 'completed') return 'bg-green-100 text-green-700 border-green-200'
+    if (state === 'failed') return 'bg-red-100 text-red-700 border-red-200'
+    if (state === 'manual') return 'bg-amber-100 text-amber-700 border-amber-200'
+    if (state === 'cancelled') return 'bg-gray-100 text-gray-700 border-gray-200'
+    return 'bg-blue-100 text-blue-700 border-blue-200'
+  }
+
+  const addGroup = (name: string) => {
+    const trimmed = name.trim()
+    if (!trimmed) return
+    setGroups((prev) => [...prev, { id: `${Date.now()}-${Math.random()}`, name: trimmed, taskIds: [] }])
+    setGroupNameInput('')
+  }
+
+  const getTaskTextPreview = (task: AdminTask | undefined) => {
+    if (!task) return '暂无题干预览'
+    const text = (task.question_preview || task.final_result || '暂无题干预览').replace(/\s+/g, ' ').trim()
+    return text.length > 120 ? `${text.slice(0, 120)}...` : text
+  }
+
+  const toggleTaskSelection = (taskId: string) => {
+    setSelectedTaskIds((prev) => (
+      prev.includes(taskId) ? prev.filter((id) => id !== taskId) : [...prev, taskId]
+    ))
+  }
+
+  const selectAllCompletedTasks = () => {
+    const ids = tasks.filter((task) => task.state === 'completed').map((task) => task.task_id)
+    setSelectedTaskIds(ids)
+  }
+
+  const clearTaskSelection = () => {
+    setSelectedTaskIds([])
+  }
+
+  const addSelectedTasksToGroup = (groupId: string) => {
+    if (selectedTaskIds.length === 0) {
+      setOperationMessage('请先在任务池勾选题目，再执行批量分配')
+      return
+    }
+    setGroups((prev) => prev.map((group) => {
+      if (group.id !== groupId) return group
+      const next = [...group.taskIds]
+      selectedTaskIds.forEach((taskId) => {
+        if (!next.includes(taskId)) {
+          next.push(taskId)
+        }
+      })
+      return { ...group, taskIds: next }
+    }))
+    setOperationMessage(`已批量分配 ${selectedTaskIds.length} 题到「${groups.find((group) => group.id === groupId)?.name || '目标题型'}」`)
+  }
+
+  const removeSelectedTasksFromAllGroups = () => {
+    if (selectedTaskIds.length === 0) {
+      setOperationMessage('请先勾选要移除的题目')
+      return
+    }
+    const selectedSet = new Set(selectedTaskIds)
+    setGroups((prev) => prev.map((group) => ({
+      ...group,
+      taskIds: group.taskIds.filter((taskId) => !selectedSet.has(taskId)),
+    })))
+    setOperationMessage(`已从所有题型移除 ${selectedTaskIds.length} 题`)
+  }
+
+  const removeTaskFromAllGroups = (taskId: string) => {
+    setGroups((prev) => prev.map((group) => ({
+      ...group,
+      taskIds: group.taskIds.filter((id) => id !== taskId),
+    })))
+  }
+
+  const putTaskIntoGroup = (taskId: string, targetGroupId: string, targetIndex?: number) => {
+    setGroups((prev) => {
+      const removed = prev.map((group) => ({
+        ...group,
+        taskIds: group.taskIds.filter((id) => id !== taskId),
+      }))
+      return removed.map((group) => {
+        if (group.id !== targetGroupId) return group
+        const next = [...group.taskIds]
+        const insertAt = typeof targetIndex === 'number' ? Math.max(0, Math.min(targetIndex, next.length)) : next.length
+        next.splice(insertAt, 0, taskId)
+        return { ...group, taskIds: next }
+      })
+    })
+  }
+
+  const moveGroup = (groupId: string, direction: 'up' | 'down') => {
+    setGroups((prev) => {
+      const index = prev.findIndex((group) => group.id === groupId)
+      if (index < 0) return prev
+      const target = direction === 'up' ? index - 1 : index + 1
+      if (target < 0 || target >= prev.length) return prev
+      const next = [...prev]
+      const [moved] = next.splice(index, 1)
+      next.splice(target, 0, moved)
+      return next
+    })
+  }
+
+  const buildNormalizedExportGroups = () => {
+    const preparedGroups = groups.map((group) => ({
+      group_id: group.id,
+      group_name: group.name.trim() || '未命名题型',
+      task_ids: group.taskIds,
+    }))
+
+    const emptyGroups = preparedGroups.filter((group) => group.task_ids.length === 0)
+    const nonEmptyGroups = preparedGroups.filter((group) => group.task_ids.length > 0)
+    const duplicateTaskIds: string[] = []
+    const seen = new Set<string>()
+    const nonCompletedTaskIds: string[] = []
+
+    nonEmptyGroups.forEach((group) => {
+      group.task_ids.forEach((taskId) => {
+        if (seen.has(taskId)) {
+          duplicateTaskIds.push(taskId)
+        } else {
+          seen.add(taskId)
+        }
+        const task = taskMap.get(taskId)
+        if (task && task.state !== 'completed') {
+          nonCompletedTaskIds.push(taskId)
+        }
+      })
+    })
+
+    return {
+      nonEmptyGroups,
+      emptyGroups,
+      duplicateTaskIds: Array.from(new Set(duplicateTaskIds)),
+      nonCompletedTaskIds: Array.from(new Set(nonCompletedTaskIds)),
+    }
+  }
+
+  const validateBeforeExport = () => {
+    const { nonEmptyGroups, emptyGroups, duplicateTaskIds, nonCompletedTaskIds } = buildNormalizedExportGroups()
+
+    const blockingErrors: string[] = []
+    const warnings: string[] = []
+
+    if (groups.length === 0) {
+      blockingErrors.push('尚未创建题型分组。')
+    }
+    if (nonEmptyGroups.length === 0) {
+      blockingErrors.push('所有题型都为空，无法导出。')
+    }
+    if (duplicateTaskIds.length > 0) {
+      blockingErrors.push(`存在重复分配题目：${duplicateTaskIds.slice(0, 5).join(', ')}${duplicateTaskIds.length > 5 ? '...' : ''}`)
+    }
+    if (emptyGroups.length > 0) {
+      warnings.push(`存在空题型 ${emptyGroups.length} 个，导出时会自动跳过。`)
+    }
+    if (nonCompletedTaskIds.length > 0) {
+      warnings.push(`包含非 completed 状态题目 ${nonCompletedTaskIds.length} 个，导出内容可能不完整。`)
+    }
+
+    return {
+      ok: blockingErrors.length === 0,
+      blockingErrors,
+      warnings,
+      groups: nonEmptyGroups,
+    }
+  }
+
+  const doExport = async (format: 'md' | 'docx') => {
+    const validation = validateBeforeExport()
+    if (!validation.ok) {
+      setOperationMessage(`导出校验失败：${validation.blockingErrors.join('；')}`)
+      return
+    }
+
+    if (validation.warnings.length > 0) {
+      const confirmed = window.confirm(`导出前提示：\n${validation.warnings.join('\n')}\n\n确认继续导出吗？`)
+      if (!confirmed) return
+    }
+
+    setIsExporting(true)
+    try {
+      const endpoint = format === 'docx' ? '/api/admin/tasks/export/docx' : '/api/admin/tasks/export/md'
+      const responseType = format === 'docx' ? 'blob' : 'blob'
+      const response = await api.post(endpoint, { groups: validation.groups }, { responseType })
+      const mimeType = format === 'docx'
+        ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        : 'text/markdown;charset=utf-8'
+      const blob = new Blob([response.data], { type: mimeType })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      link.href = url
+      link.download = format === 'docx' ? `paper_builder_${stamp}.docx` : `paper_builder_${stamp}.md`
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      URL.revokeObjectURL(url)
+      setOperationMessage(format === 'docx' ? '排版台 DOCX 导出成功' : '排版台 Markdown 导出成功')
+    } catch (error: unknown) {
+      setOperationMessage(getErrorMessage(error, format === 'docx' ? '排版台 DOCX 导出失败' : '排版台 Markdown 导出失败'))
+    } finally {
+      setIsExporting(false)
+    }
+  }
+
+  return (
+    <div className="max-w-7xl mx-auto p-8 space-y-6">
+      <header className="border-b pb-4 flex justify-between items-center">
+        <div>
+          <h1 className="text-3xl font-bold text-gray-900">排版台</h1>
+          <p className="text-sm text-gray-500 mt-2">按题型组卷、组内排序、导出结构化试卷</p>
+          <p className="text-xs text-gray-500 mt-1">
+            {isLoadingDraft ? '正在加载草稿...' : (isSavingDraft ? '草稿自动保存中...' : `草稿状态：已保存 ${lastSavedAt ? new Date(lastSavedAt).toLocaleString() : '（本地草稿）'}`)}
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => addGroup('选择题')}
+            className="px-3 py-2 text-sm rounded-lg border bg-white hover:bg-gray-50"
+          >
+            + 选择题
+          </button>
+          <button
+            onClick={() => addGroup('填空题')}
+            className="px-3 py-2 text-sm rounded-lg border bg-white hover:bg-gray-50"
+          >
+            + 填空题
+          </button>
+          <button
+            onClick={() => addGroup('判断题')}
+            className="px-3 py-2 text-sm rounded-lg border bg-white hover:bg-gray-50"
+          >
+            + 判断题
+          </button>
+          <button
+            onClick={() => addGroup('计算题')}
+            className="px-3 py-2 text-sm rounded-lg border bg-white hover:bg-gray-50"
+          >
+            + 计算题
+          </button>
+          <button
+            onClick={() => void doExport('md')}
+            disabled={isExporting}
+            className="px-3 py-2 text-sm rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+          >
+            {isExporting ? '导出中...' : '导出 Markdown'}
+          </button>
+          <button
+            onClick={() => void doExport('docx')}
+            disabled={isExporting}
+            className="px-3 py-2 text-sm rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+          >
+            {isExporting ? '导出中...' : '导出 DOCX'}
+          </button>
+        </div>
+      </header>
+
+      {operationMessage && (
+        <div className="bg-blue-50 border border-blue-200 text-blue-700 px-4 py-2 rounded">
+          {operationMessage}
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="bg-white border rounded-xl p-4 space-y-4">
+          <h2 className="text-lg font-semibold text-gray-800">任务池（与数据库状态一致）</h2>
+          <div className="grid grid-cols-2 gap-2">
+            <button onClick={selectAllCompletedTasks} className="text-xs px-2.5 py-1.5 border rounded hover:bg-gray-50">
+              全选已完成
+            </button>
+            <button onClick={clearTaskSelection} className="text-xs px-2.5 py-1.5 border rounded hover:bg-gray-50">
+              清空选择
+            </button>
+            <button onClick={removeSelectedTasksFromAllGroups} className="col-span-2 text-xs px-2.5 py-1.5 border rounded hover:bg-gray-50">
+              从所有题型移除已选
+            </button>
+          </div>
+          {isLoading ? (
+            <div className="text-sm text-gray-500">加载中...</div>
+          ) : (
+            <div className="space-y-3 max-h-[620px] overflow-y-auto">
+              {tasks.map((task) => (
+                <div
+                  key={task.task_id}
+                  className={`border rounded-lg p-3 ${draggingTaskId === task.task_id ? 'bg-indigo-50 border-indigo-300 opacity-70' : 'bg-gray-50'} ${groupedTaskIdSet.has(task.task_id) ? 'ring-1 ring-emerald-200' : ''}`}
+                  draggable
+                  onDragStart={(event) => {
+                    setDraggingTaskId(task.task_id)
+                    event.dataTransfer.setData('application/json', JSON.stringify({
+                      type: 'task',
+                      taskId: task.task_id,
+                    }))
+                  }}
+                  onDragEnd={() => {
+                    setDraggingTaskId(null)
+                    setDragOverGroupId(null)
+                    setDragOverTaskKey(null)
+                  }}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <input
+                        type="checkbox"
+                        checked={selectedTaskIds.includes(task.task_id)}
+                        onChange={() => toggleTaskSelection(task.task_id)}
+                      />
+                      <div className="font-mono text-xs text-gray-700 truncate">{task.task_id}</div>
+                    </div>
+                    <span className={`text-xs px-2 py-0.5 rounded border ${getStateBadgeClass(task.state)}`}>
+                      {task.state}
+                    </span>
+                  </div>
+                  <div className="text-sm text-gray-700 mt-2 line-clamp-2">
+                    {getTaskTextPreview(task)}
+                  </div>
+                  <div className="mt-2 flex justify-end">
+                    <button
+                      onClick={() => onOpenAdminTask(task.task_id)}
+                      className="text-xs px-2 py-1 border rounded hover:bg-white"
+                    >
+                      去数据库定位
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="bg-white border rounded-xl p-4 space-y-4">
+          <h2 className="text-lg font-semibold text-gray-800">组卷排版区</h2>
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-gray-700">草稿名称</label>
+            <input
+              value={draftName}
+              onChange={(e) => setDraftName(e.target.value)}
+              className="w-full border rounded-lg px-3 py-2 text-sm"
+              placeholder="输入草稿名称"
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              value={groupNameInput}
+              onChange={(e) => setGroupNameInput(e.target.value)}
+              placeholder="输入自定义题型名称"
+              className="flex-1 border rounded-lg px-3 py-2 text-sm"
+            />
+            <button
+              onClick={() => addGroup(groupNameInput)}
+              className="px-3 py-2 text-sm rounded-lg border bg-white hover:bg-gray-50"
+            >
+              新增题型
+            </button>
+          </div>
+
+          <div className="space-y-4 max-h-[620px] overflow-y-auto">
+            {groups.length === 0 && (
+              <div className="text-sm text-gray-500 border border-dashed rounded-lg p-6 text-center">
+                先创建题型，再把左侧任务拖拽到对应题型。
+              </div>
+            )}
+
+            {groups.map((group) => (
+              <div
+                key={group.id}
+                className={`border rounded-lg p-3 transition-colors ${dragOverGroupId === group.id ? 'bg-indigo-50 border-indigo-300' : 'bg-gray-50'}`}
+                onDragOver={(event) => {
+                  event.preventDefault()
+                  setDragOverGroupId(group.id)
+                }}
+                onDragLeave={() => {
+                  if (dragOverGroupId === group.id) {
+                    setDragOverGroupId(null)
+                  }
+                }}
+                onDrop={(event) => {
+                  event.preventDefault()
+                  const raw = event.dataTransfer.getData('application/json')
+                  if (!raw) return
+                  try {
+                    const payload = JSON.parse(raw) as { type?: string; taskId?: string }
+                    if (payload.type === 'task' && payload.taskId) {
+                      putTaskIntoGroup(payload.taskId, group.id)
+                    }
+                  } catch {
+                    // ignore invalid payload
+                  }
+                  setDragOverGroupId(null)
+                  setDragOverTaskKey(null)
+                }}
+              >
+                <div className="flex items-center gap-2">
+                  <input
+                    value={group.name}
+                    onChange={(e) => {
+                      const nextName = e.target.value
+                      setGroups((prev) => prev.map((item) => (
+                        item.id === group.id ? { ...item, name: nextName } : item
+                      )))
+                    }}
+                    className="flex-1 bg-white border rounded px-2 py-1 text-sm"
+                  />
+                  <button onClick={() => moveGroup(group.id, 'up')} className="text-xs px-2 py-1 border rounded bg-white">上移</button>
+                  <button onClick={() => moveGroup(group.id, 'down')} className="text-xs px-2 py-1 border rounded bg-white">下移</button>
+                  <button
+                    onClick={() => setGroups((prev) => prev.filter((item) => item.id !== group.id))}
+                    className="text-xs px-2 py-1 border rounded bg-white text-red-600"
+                  >
+                    删除
+                  </button>
+                  <button
+                    onClick={() => addSelectedTasksToGroup(group.id)}
+                    className="text-xs px-2 py-1 border rounded bg-white text-indigo-700"
+                    title="将任务池中已勾选题目批量加入当前题型"
+                  >
+                    批量放入
+                  </button>
+                </div>
+
+                <div className="mt-3 space-y-2">
+                  {group.taskIds.length === 0 && (
+                    <div className={`text-xs border border-dashed rounded p-2 ${dragOverGroupId === group.id ? 'text-indigo-600 bg-indigo-50 border-indigo-300' : 'text-gray-500 bg-white'}`}>
+                      将任务拖到此处
+                    </div>
+                  )}
+                  {group.taskIds.map((taskId, idx) => {
+                    const task = taskMap.get(taskId)
+                    const taskKey = `${group.id}-${taskId}`
+                    return (
+                      <div
+                        key={taskKey}
+                        className={`bg-white border rounded p-2 text-xs ${dragOverTaskKey === taskKey ? 'border-indigo-300 bg-indigo-50' : ''}`}
+                        draggable
+                        onDragStart={(event) => {
+                          setDraggingTaskId(taskId)
+                          event.dataTransfer.setData('application/json', JSON.stringify({
+                            type: 'task',
+                            taskId,
+                          }))
+                        }}
+                        onDragEnd={() => {
+                          setDraggingTaskId(null)
+                          setDragOverTaskKey(null)
+                          setDragOverGroupId(null)
+                        }}
+                        onDragOver={(event) => {
+                          event.preventDefault()
+                          setDragOverTaskKey(taskKey)
+                        }}
+                        onDragLeave={() => {
+                          if (dragOverTaskKey === taskKey) {
+                            setDragOverTaskKey(null)
+                          }
+                        }}
+                        onDrop={(event) => {
+                          event.preventDefault()
+                          const raw = event.dataTransfer.getData('application/json')
+                          if (!raw) return
+                          try {
+                            const payload = JSON.parse(raw) as { type?: string; taskId?: string }
+                            if (payload.type === 'task' && payload.taskId) {
+                              putTaskIntoGroup(payload.taskId, group.id, idx)
+                            }
+                          } catch {
+                            // ignore invalid payload
+                          }
+                          setDragOverTaskKey(null)
+                          setDragOverGroupId(null)
+                        }}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="font-mono truncate">{taskId}</div>
+                          <span className={`px-2 py-0.5 border rounded ${getStateBadgeClass(task?.state || '')}`}>
+                            {task?.state || 'unknown'}
+                          </span>
+                        </div>
+                        <div className="mt-1 flex justify-between items-center">
+                          <span className="text-gray-500">组内序号: {idx + 1}</span>
+                          <button
+                            onClick={() => removeTaskFromAllGroups(taskId)}
+                            className="text-xs px-2 py-0.5 border rounded"
+                          >
+                            移除
+                          </button>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function App() {
-  const [currentView, setCurrentView] = useState<'dashboard' | 'admin'>('dashboard')
+  const [currentView, setCurrentView] = useState<'dashboard' | 'admin' | 'builder'>('dashboard')
+  const [adminFocusTaskId, setAdminFocusTaskId] = useState<string | null>(null)
 
   return (
     <QueryClientProvider client={queryClient}>
       <div className="min-h-screen bg-gray-100/50 py-8 font-sans text-gray-800">
-        {currentView === 'dashboard' ? (
+        <div className="max-w-7xl mx-auto px-8 pb-4">
+          <div className="inline-flex rounded-xl border bg-white p-1 shadow-sm gap-1">
+            <button
+              onClick={() => setCurrentView('dashboard')}
+              className={`px-3 py-1.5 text-sm rounded-lg ${currentView === 'dashboard' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}
+            >
+              工作台
+            </button>
+            <button
+              onClick={() => setCurrentView('admin')}
+              className={`px-3 py-1.5 text-sm rounded-lg ${currentView === 'admin' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}
+            >
+              数据库
+            </button>
+            <button
+              onClick={() => setCurrentView('builder')}
+              className={`px-3 py-1.5 text-sm rounded-lg ${currentView === 'builder' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}
+            >
+              排版台
+            </button>
+          </div>
+        </div>
+
+        {currentView === 'dashboard' && (
           <TaskDashboard onOpenAdmin={() => setCurrentView('admin')} />
-        ) : (
-          <AdminPanel onBack={() => setCurrentView('dashboard')} />
+        )}
+        {currentView === 'admin' && (
+          <AdminPanel
+            initialTaskId={adminFocusTaskId}
+            onBack={() => setCurrentView('dashboard')}
+          />
+        )}
+        {currentView === 'builder' && (
+          <PaperBuilder
+            onOpenAdminTask={(taskId) => {
+              setAdminFocusTaskId(taskId)
+              setCurrentView('admin')
+            }}
+          />
         )}
       </div>
     </QueryClientProvider>

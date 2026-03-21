@@ -1007,6 +1007,33 @@ def normalize_task_ids(task_ids: list[str]) -> list[str]:
     return normalized
 
 
+def normalize_export_block_text(text: str) -> str:
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    # 若模型输出了“【解析】后直接跟正文”，导出时强制换行，避免阅读拥挤。
+    normalized = re.sub(r"【解析】\s*(?=\S)", "【解析】\n", normalized)
+    return normalized
+
+
+def append_numbered_plain_block(
+    lines: list[str],
+    index: int,
+    content: str,
+    fallback: str,
+) -> None:
+    block = normalize_export_block_text(content)
+    if not block:
+        lines.append(f"{index}、{fallback}")
+        lines.append("")
+        return
+
+    block_lines = block.split("\n")
+    first_line = block_lines[0].strip()
+    lines.append(f"{index}、{first_line}")
+    for line in block_lines[1:]:
+        lines.append(line)
+    lines.append("")
+
+
 def build_split_export_markdown(
     groups: list[dict],
 ) -> str:
@@ -1021,8 +1048,12 @@ def build_split_export_markdown(
         lines.append("")
         for item_index, item in enumerate(items, start=1):
             question_text = strip_leading_numbering(item.get("question") or "")
-            lines.append(f"{item_index}. {question_text or '（题目内容为空）'}")
-            lines.append("")
+            append_numbered_plain_block(
+                lines,
+                item_index,
+                question_text,
+                "（题目内容为空）",
+            )
 
     lines.extend(["# 第二部分：答案与解析版", ""])
     for group_index, group in enumerate(groups, start=1):
@@ -1041,8 +1072,7 @@ def build_split_export_markdown(
                 content = "（仅题目，未识别到【正解】或【解析】答案段）"
             else:
                 content = "（答案内容为空）"
-            lines.append(f"{item_index}. {content}")
-            lines.append("")
+            append_numbered_plain_block(lines, item_index, content, "（答案内容为空）")
 
     return "\n".join(lines).strip() + "\n"
 
@@ -1183,7 +1213,14 @@ def admin_export_tasks_docx(req: AdminExportRequest, db: Session = Depends(get_d
                 md_file.write(markdown_content)
 
             result = subprocess.run(
-                ["pandoc", md_path, "-o", docx_path],
+                [
+                    "pandoc",
+                    "-f",
+                    "markdown+hard_line_breaks",
+                    md_path,
+                    "-o",
+                    docx_path,
+                ],
                 capture_output=True,
                 text=True,
                 check=False,

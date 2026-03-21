@@ -15,12 +15,33 @@ load_dotenv()
 from app.core.database import engine, Base, get_db
 from app.models.domain import Task, AgentLog
 from app.models.schemas import (
-    TaskCreateRequest, TaskCreateResponse, TaskDetailResponse, 
-    TaskStatus, ManualSubmitRequest, AdminTaskListResponse,
-    AdminTaskUpdateRequest, AdminTaskUpdateResponse,
-    AdminLogListResponse, AdminLogItemResponse
+    TaskCreateRequest,
+    TaskCreateResponse,
+    TaskDetailResponse,
+    TaskStatus,
+    ManualSubmitRequest,
+    AdminTaskListResponse,
+    AdminTaskUpdateRequest,
+    AdminTaskUpdateResponse,
+    AdminLogListResponse,
+    AdminLogItemResponse,
+    RuntimeSettingsResponse,
+    RuntimeSettingsUpdateRequest,
+    PromptTemplateItemResponse,
+    PromptTemplateDetailResponse,
+    PromptTemplatePayload,
+    PromptTemplateCreateRequest,
 )
 from app.agent.graph import build_graph
+from app.agent.nodes.llm_client import coerce_token_count
+from app.services.runtime_config import (
+    create_template_from,
+    get_template,
+    list_templates,
+    read_runtime_settings,
+    update_runtime_settings,
+    upsert_template,
+)
 
 # 全局并发信号量，控制同时进行的大模型推理任务数（根据 PRD 要求默认为 5）
 MAX_CONCURRENT_TASKS = 5
@@ -28,39 +49,66 @@ task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 # 全局流式事件总线，用于将后台工作流的流式输出分发给所有 SSE 客户端
 from collections import defaultdict
+
+
 class TaskEventBus:
     def __init__(self):
         self.queues = defaultdict(list)
-        
+
     def subscribe(self, task_id: str) -> asyncio.Queue:
         q = asyncio.Queue()
         self.queues[task_id].append(q)
         return q
-        
+
     def publish(self, task_id: str, event_data: str):
         if task_id in self.queues:
             for q in self.queues[task_id]:
                 q.put_nowait(event_data)
-                
+
     def close(self, task_id: str):
         if task_id in self.queues:
             for q in self.queues[task_id]:
                 q.put_nowait(None)
             del self.queues[task_id]
 
+
 task_events = TaskEventBus()
 
 VALID_RESUME_NODES = {"solver", "reviewer", "formatter"}
+WORKFLOW_ORDER = ["solver", "reviewer", "formatter"]
 graph_apps = {node: build_graph(node) for node in VALID_RESUME_NODES}
 
-async def run_agent_workflow_async(task_id: str, db: Session, start_node: str = "solver"):
+
+def normalize_target_nodes(raw_nodes) -> list[str]:
+    if not isinstance(raw_nodes, list):
+        return []
+    normalized = []
+    for node in WORKFLOW_ORDER:
+        if node in raw_nodes and node not in normalized:
+            normalized.append(node)
+    return normalized
+
+
+def validate_contiguous_nodes(nodes: list[str]) -> bool:
+    if not nodes:
+        return False
+    indices = sorted(WORKFLOW_ORDER.index(node) for node in nodes)
+    return all(indices[i + 1] - indices[i] == 1 for i in range(len(indices) - 1))
+
+
+async def run_agent_workflow_async(
+    task_id: str,
+    db: Session,
+    start_node: str = "solver",
+    target_nodes: list[str] | None = None,
+):
     """
     异步执行图引擎工作流，并持久化每一步的状态。
     加入信号量以控制并发，防止触发模型 API 的 Rate Limit。
     """
     async with task_semaphore:
         print(f"[{task_id}] Acquired semaphore. Starting workflow...")
-        
+
         # 1. 查询数据库获取任务初始信息
         task_record = db.query(Task).filter(Task.task_id == task_id).first()
         if not task_record:
@@ -77,21 +125,46 @@ async def run_agent_workflow_async(task_id: str, db: Session, start_node: str = 
                 agent_configs = {
                     "solver": history_data.get("solver_config", {}),
                     "reviewer": history_data.get("reviewer_config", {}),
-                    "formatter": history_data.get("formatter_config", {})
+                    "formatter": history_data.get("formatter_config", {}),
                 }
         except Exception:
             history_data = {}
 
+        runtime_settings = read_runtime_settings()
+        workflow_template_id = history_data.get(
+            "workflow_template_id"
+        ) or runtime_settings.get("active_template_id")
+
         token_usage = {}
         try:
-            token_usage = json.loads(task_record.token_usage) if task_record.token_usage else {}
+            token_usage = (
+                json.loads(task_record.token_usage) if task_record.token_usage else {}
+            )
         except Exception:
             token_usage = {}
 
         if start_node not in VALID_RESUME_NODES:
             start_node = "solver"
-        if start_node in {"reviewer", "formatter"} and not history_data.get("draft_solution"):
+        effective_target_nodes = normalize_target_nodes(
+            target_nodes
+            if target_nodes is not None
+            else history_data.get("target_nodes")
+        )
+        if start_node in {"reviewer", "formatter"} and not history_data.get(
+            "draft_solution"
+        ):
             start_node = "solver"
+
+        if effective_target_nodes:
+            try:
+                start_index = WORKFLOW_ORDER.index(start_node)
+                effective_target_nodes = [
+                    node
+                    for node in effective_target_nodes
+                    if WORKFLOW_ORDER.index(node) >= start_index
+                ]
+            except ValueError:
+                effective_target_nodes = []
 
         initial_state = {
             "task_id": task_record.task_id,
@@ -101,46 +174,63 @@ async def run_agent_workflow_async(task_id: str, db: Session, start_node: str = 
             "draft_solution": history_data.get("draft_solution"),
             "review_decision": history_data.get("review_decision"),
             "review_feedback": history_data.get("review_feedback"),
-            "total_tokens": token_usage.get("total_tokens", 0),
-            "agent_configs": agent_configs
+            "total_tokens": coerce_token_count(token_usage.get("total_tokens"), 0),
+            "agent_configs": agent_configs,
+            "target_nodes": effective_target_nodes,
+            "workflow_template_id": workflow_template_id,
         }
         graph_app = graph_apps[start_node]
-        
+
         # 3. 运行图引擎
         try:
             config = {"configurable": {"thread_id": task_id}}
-            async for event in graph_app.astream_events(initial_state, config=config, version="v2"):
+            async for event in graph_app.astream_events(
+                initial_state, config=config, version="v2"
+            ):
                 if event["event"] == "on_chat_model_stream":
                     chunk = event["data"]["chunk"]
                     node = event.get("metadata", {}).get("langgraph_node", "unknown")
-                    data = json.dumps({
-                        "event": "on_chat_model_stream",
-                        "chunk": chunk.content,
-                        "node": node
-                    }, ensure_ascii=False)
+                    data = json.dumps(
+                        {
+                            "event": "on_chat_model_stream",
+                            "chunk": chunk.content,
+                            "node": node,
+                        },
+                        ensure_ascii=False,
+                    )
                     task_events.publish(task_id, data)
-            
+
             # 工作流执行完毕，获取最终状态
             state_tuple = graph_app.get_state(config)
             final_state = state_tuple.values
             task_events.close(task_id)
-            
+
             # 4. 工作流结束，将最终状态落库
             # 必须重新获取 session 里的 task_record，防止多线程下 session 过期或 detached
             task_record = db.query(Task).filter(Task.task_id == task_id).first()
-            if not task_record: return
+            if not task_record:
+                return
             previous_state = task_record.state
             final_status = final_state.get("status", "failed")
+            if final_status in {
+                TaskStatus.QUEUED.value,
+                TaskStatus.SOLVING.value,
+                TaskStatus.REVIEWING.value,
+                TaskStatus.FORMATTING.value,
+            }:
+                final_status = TaskStatus.COMPLETED.value
 
             # 如果在执行期间被标记为 cancelled，保持 cancelled 状态
             if task_record.state != TaskStatus.CANCELLED.value:
                 task_record.state = final_status
-            
+
             task_record.retry_count = final_state.get("retry_count", 0)
-            
+
             # 提取可能存在的历史记录或草稿并合并
             try:
-                history_data = json.loads(task_record.history) if task_record.history else {}
+                history_data = (
+                    json.loads(task_record.history) if task_record.history else {}
+                )
             except Exception:
                 history_data = {}
 
@@ -150,32 +240,55 @@ async def run_agent_workflow_async(task_id: str, db: Session, start_node: str = 
                 history_data["review_decision"] = final_state.get("review_decision")
             if final_state.get("review_feedback") is not None:
                 history_data["review_feedback"] = final_state.get("review_feedback")
+            if final_state.get("workflow_template_id") is not None:
+                history_data["workflow_template_id"] = final_state.get(
+                    "workflow_template_id"
+                )
+            if effective_target_nodes:
+                history_data["target_nodes"] = effective_target_nodes
+            else:
+                history_data.pop("target_nodes", None)
 
             failed_node = final_state.get("failed_node")
-            if not failed_node and final_status == TaskStatus.FAILED.value and previous_state in VALID_RESUME_NODES:
+            if (
+                not failed_node
+                and final_status == TaskStatus.FAILED.value
+                and previous_state in VALID_RESUME_NODES
+            ):
                 failed_node = previous_state
-            if final_status == TaskStatus.FAILED.value and failed_node in VALID_RESUME_NODES:
+            if (
+                final_status == TaskStatus.FAILED.value
+                and failed_node in VALID_RESUME_NODES
+            ):
                 history_data["failed_node"] = failed_node
             else:
                 history_data.pop("failed_node", None)
             task_record.history = json.dumps(history_data, ensure_ascii=False)
-            
+
             task_record.final_result = final_state.get("final_result")
-            task_record.token_usage = json.dumps({"total_tokens": final_state.get("total_tokens", 0)})
+            task_record.token_usage = json.dumps(
+                {"total_tokens": coerce_token_count(final_state.get("total_tokens"), 0)}
+            )
             task_record.error_code = final_state.get("error_msg")
-            
+
             db.commit()
             print(f"[{task_id}] Workflow finished with status: {task_record.state}")
-            
+
         except Exception as e:
             # 异常时进行防断保护
             print(f"[{task_id}] Workflow crashed: {e}")
             task_events.close(task_id)
             task_record = db.query(Task).filter(Task.task_id == task_id).first()
             if task_record:
-                failed_node = task_record.state if task_record.state in VALID_RESUME_NODES else "solver"
+                failed_node = (
+                    task_record.state
+                    if task_record.state in VALID_RESUME_NODES
+                    else "solver"
+                )
                 try:
-                    history_data = json.loads(task_record.history) if task_record.history else {}
+                    history_data = (
+                        json.loads(task_record.history) if task_record.history else {}
+                    )
                 except Exception:
                     history_data = {}
                 history_data["failed_node"] = failed_node
@@ -184,37 +297,38 @@ async def run_agent_workflow_async(task_id: str, db: Session, start_node: str = 
                 task_record.error_code = f"System Error: {str(e)}"
                 db.commit()
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     yield
 
+
 app = FastAPI(
-    title="智能题目解析 Agent 自动化流水线 API",
-    version="1.0.0",
-    lifespan=lifespan
+    title="智能题目解析 Agent 自动化流水线 API", version="1.0.0", lifespan=lifespan
 )
 
 # 配置 CORS，增加对大请求体（Base64图片）的支持
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 # 增大 FastAPI 接收 JSON 的默认限制（如果不加这个，太大的 Base64 会报 413 Payload Too Large）
 # 改用纯 ASGI 中间件实现，避免 BaseHTTPMiddleware 阻塞 BackgroundTasks
 class LimitUploadSizeASGI:
-    def __init__(self, app, max_upload_size: int = 50 * 1024 * 1024): # 默认 50MB
+    def __init__(self, app, max_upload_size: int = 50 * 1024 * 1024):  # 默认 50MB
         self.app = app
         self.max_upload_size = max_upload_size
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
-            
+
         if scope["method"] == "POST":
             # 尝试从 headers 获取 content-length
             content_length = 0
@@ -225,7 +339,7 @@ class LimitUploadSizeASGI:
                     except ValueError:
                         pass
                     break
-            
+
             if content_length > self.max_upload_size:
                 # 返回 413 Payload Too Large
                 response = {
@@ -236,57 +350,84 @@ class LimitUploadSizeASGI:
                     ],
                 }
                 await send(response)
-                await send({
-                    "type": "http.response.body",
-                    "body": b'{"detail": "Payload too large"}',
-                })
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": b'{"detail": "Payload too large"}',
+                    }
+                )
                 return
-                
+
         await self.app(scope, receive, send)
+
 
 app.add_middleware(LimitUploadSizeASGI)
 
-@app.post("/api/tasks", response_model=TaskCreateResponse, status_code=status.HTTP_201_CREATED)
-async def create_task(req: TaskCreateRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+
+@app.post(
+    "/api/tasks", response_model=TaskCreateResponse, status_code=status.HTTP_201_CREATED
+)
+async def create_task(
+    req: TaskCreateRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     """
     接收前端上传的题目图片地址（或 Base64），初始化一个解析任务并丢入后台队列执行。
     """
     try:
         new_task_id = f"task_{uuid.uuid4().hex[:8]}"
         new_thread_id = f"thread_{uuid.uuid4().hex[:8]}"
-        
+        runtime_settings = read_runtime_settings()
+        workflow_template_id = req.workflow_template_id or runtime_settings.get(
+            "active_template_id"
+        )
+
         new_task = Task(
             task_id=new_task_id,
             thread_id=new_thread_id,
             image_url=req.image_url,
             state=TaskStatus.QUEUED.value,
-            history=json.dumps({
-                "solver_config": req.solver_config.model_dump() if req.solver_config else {},
-                "reviewer_config": req.reviewer_config.model_dump() if req.reviewer_config else {},
-                "formatter_config": req.formatter_config.model_dump() if req.formatter_config else {}
-            }, ensure_ascii=False)
+            history=json.dumps(
+                {
+                    "solver_config": (
+                        req.solver_config.model_dump() if req.solver_config else {}
+                    ),
+                    "reviewer_config": (
+                        req.reviewer_config.model_dump() if req.reviewer_config else {}
+                    ),
+                    "formatter_config": (
+                        req.formatter_config.model_dump()
+                        if req.formatter_config
+                        else {}
+                    ),
+                    "workflow_template_id": workflow_template_id,
+                },
+                ensure_ascii=False,
+            ),
         )
-        
+
         db.add(new_task)
         db.commit()
         db.refresh(new_task)
-        
+
         # 触发后台异步任务，执行图状态机
         background_tasks.add_task(run_agent_workflow_async, new_task.task_id, db)
-        
+
         return TaskCreateResponse(
-            task_id=new_task.task_id,
-            status=TaskStatus(new_task.state)
+            task_id=new_task.task_id, status=TaskStatus(new_task.state)
         )
     except Exception as e:
         db.rollback()
         import traceback
+
         traceback.print_exc()
         print(f"❌ Failed to create task: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create task: {str(e)}"
+            detail=f"Failed to create task: {str(e)}",
         )
+
 
 @app.get("/api/logs")
 async def get_logs(task_id: str = None, db: Session = Depends(get_db)):
@@ -300,6 +441,7 @@ async def get_logs(task_id: str = None, db: Session = Depends(get_db)):
     logs = query.order_by(AgentLog.created_at.asc()).all()
     return logs
 
+
 @app.get("/api/tasks/{task_id}")
 def get_task(task_id: str, db: Session = Depends(get_db)):
     """
@@ -309,9 +451,10 @@ def get_task(task_id: str, db: Session = Depends(get_db)):
     if not task:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Task with id {task_id} not found."
+            detail=f"Task with id {task_id} not found.",
         )
     return task
+
 
 @app.get("/api/tasks/{task_id}/stream")
 async def stream_task(task_id: str, db: Session = Depends(get_db)):
@@ -326,7 +469,12 @@ async def stream_task(task_id: str, db: Session = Depends(get_db)):
 
     async def event_generator():
         # 如果任务已经处于终态，直接发送结束信号并退出，防止前端傻等
-        if task_record.state in [TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.MANUAL.value, TaskStatus.CANCELLED.value]:
+        if task_record.state in [
+            TaskStatus.COMPLETED.value,
+            TaskStatus.FAILED.value,
+            TaskStatus.MANUAL.value,
+            TaskStatus.CANCELLED.value,
+        ]:
             yield f"data: {json.dumps({'event': 'end'})}\n\n"
             return
 
@@ -334,7 +482,7 @@ async def stream_task(task_id: str, db: Session = Depends(get_db)):
         try:
             while True:
                 data = await q.get()
-                if data is None: # None 表示工作流结束
+                if data is None:  # None 表示工作流结束
                     yield f"data: {json.dumps({'event': 'end'})}\n\n"
                     break
                 yield f"data: {data}\n\n"
@@ -346,28 +494,49 @@ async def stream_task(task_id: str, db: Session = Depends(get_db)):
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
+
 @app.post("/api/tasks/{task_id}/manual")
-def submit_manual_review(task_id: str, req: ManualSubmitRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def submit_manual_review(
+    task_id: str,
+    req: ManualSubmitRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     """
     人工接管提交接口。允许管理员将 manual 或 failed 的任务重新推入工作流。
     """
     task = db.query(Task).filter(Task.task_id == task_id).first()
     if not task:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
-        
-    if task.state not in [TaskStatus.MANUAL.value, TaskStatus.FAILED.value]:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Task is in {task.state} state, cannot be manually processed.")
-        
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found."
+        )
+
+    if req.action == "custom_run":
+        allowed_states = {
+            TaskStatus.MANUAL.value,
+            TaskStatus.FAILED.value,
+            TaskStatus.COMPLETED.value,
+            TaskStatus.CANCELLED.value,
+        }
+    else:
+        allowed_states = {TaskStatus.MANUAL.value, TaskStatus.FAILED.value}
+
+    if task.state not in allowed_states:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Task is in {task.state} state, cannot be manually processed.",
+        )
+
     if req.action == "fail":
         task.state = TaskStatus.FAILED.value
         task.error_code = "Manually marked as failed."
         db.commit()
         return {"status": "success", "message": "Task marked as failed."}
-        
+
     # 如果 action 是 resume，按失败节点恢复执行
     task.state = TaskStatus.QUEUED.value
     task.error_code = None
-    
+
     # 将人工编辑的草稿注入到历史字段，供下一次执行时读取
     try:
         current_history = json.loads(task.history) if task.history else {}
@@ -381,25 +550,80 @@ def submit_manual_review(task_id: str, req: ManualSubmitRequest, background_task
         current_history["reviewer_config"] = req.reviewer_config.model_dump()
     if req.formatter_config is not None:
         current_history["formatter_config"] = req.formatter_config.model_dump()
+    if req.workflow_template_id is not None:
+        current_history["workflow_template_id"] = req.workflow_template_id
+
+    target_nodes: list[str] | None = None
     if req.action == "skip_review":
         if not current_history.get("draft_solution"):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Draft solution is required when skipping review.")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Draft solution is required when skipping review.",
+            )
         resume_node = "formatter"
+        target_nodes = ["formatter"]
         current_history["failed_node"] = "reviewer"
+    elif req.action == "custom_run":
+        if not req.entry_point:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="entry_point is required when action=custom_run.",
+            )
+        normalized_nodes = normalize_target_nodes(req.target_nodes)
+        if not normalized_nodes:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="target_nodes is required when action=custom_run.",
+            )
+        if not validate_contiguous_nodes(normalized_nodes):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="target_nodes must be a contiguous workflow chain.",
+            )
+        if req.entry_point not in normalized_nodes:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="entry_point must be included in target_nodes.",
+            )
+
+        expected_entry = normalized_nodes[0]
+        if req.entry_point != expected_entry:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"entry_point must be the first node in target_nodes: {expected_entry}.",
+            )
+
+        if req.entry_point in {"reviewer", "formatter"} and not current_history.get(
+            "draft_solution"
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="draft_solution is required when entry_point is reviewer or formatter.",
+            )
+
+        resume_node = req.entry_point
+        target_nodes = normalized_nodes
+        current_history["target_nodes"] = normalized_nodes
     else:
         resume_node = current_history.get("failed_node", "solver")
         if resume_node not in VALID_RESUME_NODES:
             resume_node = "solver"
-        if resume_node in {"reviewer", "formatter"} and not current_history.get("draft_solution"):
+        if resume_node in {"reviewer", "formatter"} and not current_history.get(
+            "draft_solution"
+        ):
             resume_node = "solver"
+        current_history.pop("target_nodes", None)
     task.history = json.dumps(current_history, ensure_ascii=False)
-    
+
     db.commit()
-    
+
     # 重新触发后台工作流
-    background_tasks.add_task(run_agent_workflow_async, task.task_id, db, resume_node)
-    
+    background_tasks.add_task(
+        run_agent_workflow_async, task.task_id, db, resume_node, target_nodes
+    )
+
     return {"status": "success", "message": f"Task resumed from node: {resume_node}."}
+
 
 @app.post("/api/tasks/{task_id}/cancel")
 def cancel_task(task_id: str, db: Session = Depends(get_db)):
@@ -408,16 +632,74 @@ def cancel_task(task_id: str, db: Session = Depends(get_db)):
     """
     task = db.query(Task).filter(Task.task_id == task_id).first()
     if not task:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
-        
-    if task.state in [TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value]:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Task is already in {task.state} state.")
-        
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found."
+        )
+
+    if task.state in [
+        TaskStatus.COMPLETED.value,
+        TaskStatus.FAILED.value,
+        TaskStatus.CANCELLED.value,
+    ]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Task is already in {task.state} state.",
+        )
+
     task.state = TaskStatus.CANCELLED.value
     task.error_code = "Manually cancelled."
     db.commit()
-    
+
     return {"status": "success", "message": "Task marked as cancelled."}
+
+
+@app.get("/api/settings/runtime", response_model=RuntimeSettingsResponse)
+def get_runtime_settings():
+    return read_runtime_settings()
+
+
+@app.put("/api/settings/runtime", response_model=RuntimeSettingsResponse)
+def put_runtime_settings(req: RuntimeSettingsUpdateRequest):
+    payload = req.model_dump(exclude_none=True, by_alias=True)
+    return update_runtime_settings(payload)
+
+
+@app.get("/api/templates", response_model=list[PromptTemplateItemResponse])
+def get_templates():
+    return list_templates()
+
+
+@app.get("/api/templates/{template_id}", response_model=PromptTemplateDetailResponse)
+def get_template_detail(template_id: str):
+    template = get_template(template_id)
+    if not template or template.get("template_id") != template_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Template {template_id} not found.",
+        )
+    return template
+
+
+@app.post("/api/templates", response_model=PromptTemplateDetailResponse)
+def create_template(req: PromptTemplateCreateRequest):
+    try:
+        return create_template_from(
+            source_template_id=req.source_template_id,
+            new_template_id=req.template_id,
+            name=req.name,
+            description=req.description or "",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@app.put("/api/templates/{template_id}", response_model=PromptTemplateDetailResponse)
+def update_template(template_id: str, req: PromptTemplatePayload):
+    try:
+        return upsert_template(template_id, req.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
 
 @app.get("/api/admin/tasks", response_model=AdminTaskListResponse)
 def admin_list_tasks(
@@ -425,7 +707,7 @@ def admin_list_tasks(
     state: TaskStatus | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=200),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     query = db.query(Task)
     if task_id:
@@ -440,20 +722,30 @@ def admin_list_tasks(
         .limit(page_size)
         .all()
     )
-    return AdminTaskListResponse(total=total, page=page, page_size=page_size, items=items)
+    return AdminTaskListResponse(
+        total=total, page=page, page_size=page_size, items=items
+    )
+
 
 @app.get("/api/admin/tasks/{task_id}", response_model=TaskDetailResponse)
 def admin_get_task(task_id: str, db: Session = Depends(get_db)):
     task = db.query(Task).filter(Task.task_id == task_id).first()
     if not task:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found."
+        )
     return task
 
+
 @app.patch("/api/admin/tasks/{task_id}", response_model=AdminTaskUpdateResponse)
-def admin_update_task(task_id: str, req: AdminTaskUpdateRequest, db: Session = Depends(get_db)):
+def admin_update_task(
+    task_id: str, req: AdminTaskUpdateRequest, db: Session = Depends(get_db)
+):
     task = db.query(Task).filter(Task.task_id == task_id).first()
     if not task:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found."
+        )
 
     updates = req.model_dump(exclude_unset=True)
     for field_name, value in updates.items():
@@ -466,18 +758,30 @@ def admin_update_task(task_id: str, req: AdminTaskUpdateRequest, db: Session = D
     db.refresh(task)
     return AdminTaskUpdateResponse(message="Task updated successfully.", task=task)
 
+
 @app.delete("/api/admin/tasks/{task_id}")
 def admin_delete_task(task_id: str, db: Session = Depends(get_db)):
     task = db.query(Task).filter(Task.task_id == task_id).first()
     if not task:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found."
+        )
 
     db.query(AgentLog).filter(AgentLog.task_id == task_id).delete()
     db.delete(task)
     db.commit()
     return {"status": "success", "message": f"Task {task_id} deleted."}
 
+
 @app.get("/api/admin/logs", response_model=AdminLogListResponse)
 def admin_list_logs(task_id: str, db: Session = Depends(get_db)):
-    logs = db.query(AgentLog).filter(AgentLog.task_id == task_id).order_by(AgentLog.created_at.asc()).all()
-    return AdminLogListResponse(total=len(logs), items=[AdminLogItemResponse.model_validate(log) for log in logs])
+    logs = (
+        db.query(AgentLog)
+        .filter(AgentLog.task_id == task_id)
+        .order_by(AgentLog.created_at.asc())
+        .all()
+    )
+    return AdminLogListResponse(
+        total=len(logs),
+        items=[AdminLogItemResponse.model_validate(log) for log in logs],
+    )

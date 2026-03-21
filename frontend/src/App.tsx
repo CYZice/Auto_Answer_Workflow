@@ -1,11 +1,11 @@
-import { useState, ClipboardEvent, useEffect, useMemo } from 'react'
-import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueries } from '@tanstack/react-query'
+import { QueryClient, QueryClientProvider, useMutation, useQueries, useQuery } from '@tanstack/react-query'
 import axios from 'axios'
-import ReactMarkdown from 'react-markdown'
-import remarkMath from 'remark-math'
-import rehypeKatex from 'rehype-katex'
-import { X, Image as ImageIcon, Play, Plus, Maximize2, Settings, Database, Save, Trash2, Download } from 'lucide-react'
 import 'katex/dist/katex.min.css'
+import { Database, Download, Image as ImageIcon, Maximize2, Play, Plus, Save, Settings, Trash2, X } from 'lucide-react'
+import { ClipboardEvent, useEffect, useMemo, useState } from 'react'
+import ReactMarkdown from 'react-markdown'
+import rehypeKatex from 'rehype-katex'
+import remarkMath from 'remark-math'
 
 const queryClient = new QueryClient()
 
@@ -20,6 +20,10 @@ const ACTIVE_TASK_ID_STORAGE_KEY = 'active_task_id'
 const SOLVER_CONFIG_STORAGE_KEY = 'solver_config'
 const REVIEWER_CONFIG_STORAGE_KEY = 'reviewer_config'
 const FORMATTER_CONFIG_STORAGE_KEY = 'formatter_config'
+const WORKFLOW_TEMPLATE_ID_STORAGE_KEY = 'workflow_template_id'
+const WORKFLOW_NODE_ORDER = ['solver', 'reviewer', 'formatter'] as const
+
+type WorkflowNode = (typeof WORKFLOW_NODE_ORDER)[number]
 
 const getErrorMessage = (error: unknown, fallback: string) => {
   if (axios.isAxiosError(error)) {
@@ -87,7 +91,55 @@ interface RetryModelConfigs {
   solver_config: ModelConfig;
   reviewer_config: ModelConfig;
   formatter_config: ModelConfig;
+  workflow_template_id: string;
 }
+
+interface RuntimeSettingsResponse {
+  active_template_id: string;
+  fallback: {
+    global: string[];
+    nodes: {
+      solver: string[];
+      reviewer: string[];
+      formatter: string[];
+    };
+  };
+}
+
+interface PromptTemplateItem {
+  template_id: string;
+  name: string;
+  description?: string;
+}
+
+interface PromptTemplateDetail extends PromptTemplateItem {
+  prompts: {
+    solver: { system: string; user: string };
+    reviewer: { system: string; user: string };
+    formatter: { system: string; user: string };
+  };
+}
+
+interface SettingsSnapshot {
+  solverConfig: ModelConfig;
+  reviewerConfig: ModelConfig;
+  formatterConfig: ModelConfig;
+  activeTemplateId: string;
+  globalFallbackText: string;
+  solverFallbackText: string;
+  reviewerFallbackText: string;
+  formatterFallbackText: string;
+  templateName: string;
+  templateDescription: string;
+  solverSystemPrompt: string;
+  solverUserPrompt: string;
+  reviewerSystemPrompt: string;
+  reviewerUserPrompt: string;
+  formatterSystemPrompt: string;
+  formatterUserPrompt: string;
+}
+
+const toSettingsSnapshotString = (snapshot: SettingsSnapshot) => JSON.stringify(snapshot)
 
 const readStoredJson = <T,>(key: string, fallback: T): T => {
   const raw = localStorage.getItem(key)
@@ -102,7 +154,8 @@ const readStoredJson = <T,>(key: string, fallback: T): T => {
 const getLatestRetryConfigs = (): RetryModelConfigs => ({
   solver_config: readStoredJson<ModelConfig>(SOLVER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 4096 }),
   reviewer_config: readStoredJson<ModelConfig>(REVIEWER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 2048 }),
-  formatter_config: readStoredJson<ModelConfig>(FORMATTER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 1024 })
+  formatter_config: readStoredJson<ModelConfig>(FORMATTER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 1024 }),
+  workflow_template_id: localStorage.getItem(WORKFLOW_TEMPLATE_ID_STORAGE_KEY) || 'workflow_a'
 })
 
 const persistTaskForDashboard = (taskId: string) => {
@@ -145,6 +198,7 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   })
   const [showSettings, setShowSettings] = useState(false)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const [successMessage, setSuccessMessage] = useState<string | null>(null)
   const [taskFilter, setTaskFilter] = useState<'all' | 'running' | 'completed' | 'exception'>('all')
   const [solverConfig, setSolverConfig] = useState<ModelConfig>(() => {
     const saved = localStorage.getItem(SOLVER_CONFIG_STORAGE_KEY)
@@ -158,14 +212,193 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     const saved = localStorage.getItem(FORMATTER_CONFIG_STORAGE_KEY)
     return saved ? JSON.parse(saved) : { model_name: '', api_key: '', base_url: '', max_tokens: 1024 }
   })
+  const [runtimeLoading, setRuntimeLoading] = useState(false)
+  const [runtimeError, setRuntimeError] = useState<string | null>(null)
+  const [activeTemplateId, setActiveTemplateId] = useState<string>(() => localStorage.getItem(WORKFLOW_TEMPLATE_ID_STORAGE_KEY) || 'workflow_a')
+  const [globalFallbackText, setGlobalFallbackText] = useState('')
+  const [solverFallbackText, setSolverFallbackText] = useState('')
+  const [reviewerFallbackText, setReviewerFallbackText] = useState('')
+  const [formatterFallbackText, setFormatterFallbackText] = useState('')
+  const [templateItems, setTemplateItems] = useState<PromptTemplateItem[]>([])
+  const [templateName, setTemplateName] = useState('')
+  const [templateDescription, setTemplateDescription] = useState('')
+  const [solverSystemPrompt, setSolverSystemPrompt] = useState('')
+  const [solverUserPrompt, setSolverUserPrompt] = useState('')
+  const [reviewerSystemPrompt, setReviewerSystemPrompt] = useState('')
+  const [reviewerUserPrompt, setReviewerUserPrompt] = useState('')
+  const [formatterSystemPrompt, setFormatterSystemPrompt] = useState('')
+  const [formatterUserPrompt, setFormatterUserPrompt] = useState('')
+  const [settingsBaseline, setSettingsBaseline] = useState('')
+  const [settingsSaving, setSettingsSaving] = useState(false)
+
+  const currentSettingsSnapshot = toSettingsSnapshotString({
+    solverConfig,
+    reviewerConfig,
+    formatterConfig,
+    activeTemplateId,
+    globalFallbackText,
+    solverFallbackText,
+    reviewerFallbackText,
+    formatterFallbackText,
+    templateName,
+    templateDescription,
+    solverSystemPrompt,
+    solverUserPrompt,
+    reviewerSystemPrompt,
+    reviewerUserPrompt,
+    formatterSystemPrompt,
+    formatterUserPrompt
+  })
+
+  const isSettingsDirty = showSettings
+    && settingsBaseline.length > 0
+    && settingsBaseline !== currentSettingsSnapshot
+
+  const listToText = (items: string[]) => items.join('\n')
+  const textToList = (text: string) => Array.from(new Set(
+    text
+      .split(/[\n,]/)
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0)
+  ))
+
+  const loadTemplateDetail = async (templateId: string) => {
+    const detail = await api.get<PromptTemplateDetail>(`/api/templates/${templateId}`).then((res) => res.data)
+    setTemplateName(detail.name || templateId)
+    setTemplateDescription(detail.description || '')
+    setSolverSystemPrompt(detail.prompts?.solver?.system || '')
+    setSolverUserPrompt(detail.prompts?.solver?.user || '')
+    setReviewerSystemPrompt(detail.prompts?.reviewer?.system || '')
+    setReviewerUserPrompt(detail.prompts?.reviewer?.user || '')
+    setFormatterSystemPrompt(detail.prompts?.formatter?.system || '')
+    setFormatterUserPrompt(detail.prompts?.formatter?.user || '')
+  }
+
+  const openSettingsModal = async () => {
+    setRuntimeLoading(true)
+    setRuntimeError(null)
+    try {
+      const [runtime, templates] = await Promise.all([
+        api.get<RuntimeSettingsResponse>('/api/settings/runtime').then((res) => res.data),
+        api.get<PromptTemplateItem[]>('/api/templates').then((res) => res.data)
+      ])
+
+      setGlobalFallbackText(listToText(runtime.fallback?.global || []))
+      setSolverFallbackText(listToText(runtime.fallback?.nodes?.solver || []))
+      setReviewerFallbackText(listToText(runtime.fallback?.nodes?.reviewer || []))
+      setFormatterFallbackText(listToText(runtime.fallback?.nodes?.formatter || []))
+
+      const normalizedTemplates = Array.isArray(templates) ? templates : []
+      setTemplateItems(normalizedTemplates)
+
+      const pickedTemplateId = runtime.active_template_id
+        || normalizedTemplates[0]?.template_id
+        || 'workflow_a'
+      const detail = await api.get<PromptTemplateDetail>(`/api/templates/${pickedTemplateId}`).then((res) => res.data)
+
+      setActiveTemplateId(pickedTemplateId)
+      setTemplateName(detail.name || pickedTemplateId)
+      setTemplateDescription(detail.description || '')
+      setSolverSystemPrompt(detail.prompts?.solver?.system || '')
+      setSolverUserPrompt(detail.prompts?.solver?.user || '')
+      setReviewerSystemPrompt(detail.prompts?.reviewer?.system || '')
+      setReviewerUserPrompt(detail.prompts?.reviewer?.user || '')
+      setFormatterSystemPrompt(detail.prompts?.formatter?.system || '')
+      setFormatterUserPrompt(detail.prompts?.formatter?.user || '')
+
+      const baseline = toSettingsSnapshotString({
+        solverConfig,
+        reviewerConfig,
+        formatterConfig,
+        activeTemplateId: pickedTemplateId,
+        globalFallbackText: listToText(runtime.fallback?.global || []),
+        solverFallbackText: listToText(runtime.fallback?.nodes?.solver || []),
+        reviewerFallbackText: listToText(runtime.fallback?.nodes?.reviewer || []),
+        formatterFallbackText: listToText(runtime.fallback?.nodes?.formatter || []),
+        templateName: detail.name || pickedTemplateId,
+        templateDescription: detail.description || '',
+        solverSystemPrompt: detail.prompts?.solver?.system || '',
+        solverUserPrompt: detail.prompts?.solver?.user || '',
+        reviewerSystemPrompt: detail.prompts?.reviewer?.system || '',
+        reviewerUserPrompt: detail.prompts?.reviewer?.user || '',
+        formatterSystemPrompt: detail.prompts?.formatter?.system || '',
+        formatterUserPrompt: detail.prompts?.formatter?.user || ''
+      })
+      setSettingsBaseline(baseline)
+      setShowSettings(true)
+    } catch (error: unknown) {
+      setRuntimeError(getErrorMessage(error, '加载设置失败'))
+    } finally {
+      setRuntimeLoading(false)
+    }
+  }
 
   // 保存设置到 localStorage
-  const saveSettings = () => {
+  const saveSettings = async () => {
+    setSettingsSaving(true)
     localStorage.setItem(SOLVER_CONFIG_STORAGE_KEY, JSON.stringify(solverConfig))
     localStorage.setItem(REVIEWER_CONFIG_STORAGE_KEY, JSON.stringify(reviewerConfig))
     localStorage.setItem(FORMATTER_CONFIG_STORAGE_KEY, JSON.stringify(formatterConfig))
+    localStorage.setItem(WORKFLOW_TEMPLATE_ID_STORAGE_KEY, activeTemplateId)
+
+    try {
+      await api.put('/api/settings/runtime', {
+        active_template_id: activeTemplateId,
+        fallback: {
+          global: textToList(globalFallbackText),
+          nodes: {
+            solver: textToList(solverFallbackText),
+            reviewer: textToList(reviewerFallbackText),
+            formatter: textToList(formatterFallbackText)
+          }
+        }
+      })
+
+      await api.put(`/api/templates/${activeTemplateId}`, {
+        name: templateName || activeTemplateId,
+        description: templateDescription,
+        prompts: {
+          solver: { system: solverSystemPrompt, user: solverUserPrompt },
+          reviewer: { system: reviewerSystemPrompt, user: reviewerUserPrompt },
+          formatter: { system: formatterSystemPrompt, user: formatterUserPrompt }
+        }
+      })
+    } catch (error: unknown) {
+      setErrorMessage(getErrorMessage(error, '保存设置失败'))
+      setSettingsSaving(false)
+      return
+    }
+
+    setSettingsBaseline(currentSettingsSnapshot)
+    setSuccessMessage('设置保存成功')
+    setSettingsSaving(false)
     setShowSettings(false)
   }
+
+  const tryCloseSettings = () => {
+    if (settingsSaving) return
+    if (isSettingsDirty) {
+      const confirmed = window.confirm('当前设置有未保存改动，确认要关闭吗？')
+      if (!confirmed) return
+    }
+    setShowSettings(false)
+  }
+
+  useEffect(() => {
+    if (!showSettings || !isSettingsDirty) return
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault()
+      e.returnValue = ''
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [showSettings, isSettingsDirty])
+
+  useEffect(() => {
+    if (!successMessage) return
+    const timer = window.setTimeout(() => setSuccessMessage(null), 2500)
+    return () => window.clearTimeout(timer)
+  }, [successMessage])
 
   // 处理剪贴板粘贴图片
   const handlePaste = (e: ClipboardEvent<HTMLDivElement>) => {
@@ -174,7 +407,7 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       if (items[i].type.indexOf('image') !== -1) {
         const file = items[i].getAsFile();
         if (!file) continue;
-        
+
         // 将文件转为 Base64 URL（为了纯本地演示，不依赖图床）
         // 生产环境应先传给后端的 /upload 接口换取真实 URL
         const reader = new FileReader();
@@ -193,11 +426,12 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
 
   // 创建任务的 Mutation
   const createMutation = useMutation({
-    mutationFn: (url: string) => api.post('/api/tasks', { 
+    mutationFn: (url: string) => api.post('/api/tasks', {
       image_url: url,
       solver_config: solverConfig,
       reviewer_config: reviewerConfig,
-      formatter_config: formatterConfig
+      formatter_config: formatterConfig,
+      workflow_template_id: activeTemplateId
     }).then(res => res.data),
   })
   const submittedTaskStatusQueries = useQueries({
@@ -291,11 +525,11 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   const handleStartProcessing = async () => {
     if (pendingQueue.length === 0) return;
     setErrorMessage(null);
-    
+
     // 复制一份当前队列，然后清空 UI 队列
     const tasksToProcess = [...pendingQueue];
     setPendingQueue([]);
-    
+
     console.log("🚀 开始提交任务队列，共", tasksToProcess.length, "个任务");
 
     // 逐个提交给后端
@@ -339,7 +573,17 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
             <p className="font-bold">发生错误</p>
             <p className="text-sm">{errorMessage}</p>
           </div>
-          <button onClick={() => setErrorMessage(null)} className="text-red-500 hover:text-red-700"><X size={18}/></button>
+          <button onClick={() => setErrorMessage(null)} className="text-red-500 hover:text-red-700"><X size={18} /></button>
+        </div>
+      )}
+
+      {successMessage && (
+        <div className="bg-green-50 border-l-4 border-green-500 p-4 rounded shadow-sm flex justify-between items-start">
+          <div className="text-green-700">
+            <p className="font-bold">操作成功</p>
+            <p className="text-sm">{successMessage}</p>
+          </div>
+          <button onClick={() => setSuccessMessage(null)} className="text-green-500 hover:text-green-700"><X size={18} /></button>
         </div>
       )}
 
@@ -357,15 +601,22 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           >
             <Database size={24} />
           </button>
-          <button 
-            onClick={() => setShowSettings(true)}
+          <button
+            onClick={() => void openSettingsModal()}
             className="p-2 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-full transition-colors"
             title="模型配置"
+            disabled={runtimeLoading}
           >
             <Settings size={24} />
           </button>
         </div>
       </header>
+
+      {runtimeError && (
+        <div className="bg-yellow-50 border-l-4 border-yellow-500 p-4 rounded shadow-sm text-yellow-700 text-sm">
+          {runtimeError}
+        </div>
+      )}
 
       {/* 待处理队列区域 */}
       <div className="bg-white p-6 rounded-xl shadow-sm border space-y-4">
@@ -374,7 +625,7 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
             <ImageIcon size={20} className="text-blue-500" />
             待处理队列 ({pendingQueue.length})
           </h2>
-          <button 
+          <button
             onClick={handleStartProcessing}
             disabled={pendingQueue.length === 0 || createMutation.isPending}
             className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg font-medium disabled:opacity-50 hover:bg-blue-700 transition-colors"
@@ -419,41 +670,37 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           <div className="flex flex-wrap gap-2">
             <button
               onClick={() => setTaskFilter('all')}
-              className={`px-3 py-1.5 rounded-lg border text-sm transition-colors ${
-                taskFilter === 'all'
-                  ? 'border-blue-500 bg-blue-50 text-blue-700'
-                  : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
-              }`}
+              className={`px-3 py-1.5 rounded-lg border text-sm transition-colors ${taskFilter === 'all'
+                ? 'border-blue-500 bg-blue-50 text-blue-700'
+                : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
+                }`}
             >
               全部 ({submittedTaskItems.length})
             </button>
             <button
               onClick={() => setTaskFilter('running')}
-              className={`px-3 py-1.5 rounded-lg border text-sm transition-colors ${
-                taskFilter === 'running'
-                  ? 'border-blue-500 bg-blue-50 text-blue-700'
-                  : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
-              }`}
+              className={`px-3 py-1.5 rounded-lg border text-sm transition-colors ${taskFilter === 'running'
+                ? 'border-blue-500 bg-blue-50 text-blue-700'
+                : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
+                }`}
             >
               运行中 ({runningCount})
             </button>
             <button
               onClick={() => setTaskFilter('completed')}
-              className={`px-3 py-1.5 rounded-lg border text-sm transition-colors ${
-                taskFilter === 'completed'
-                  ? 'border-blue-500 bg-blue-50 text-blue-700'
-                  : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
-              }`}
+              className={`px-3 py-1.5 rounded-lg border text-sm transition-colors ${taskFilter === 'completed'
+                ? 'border-blue-500 bg-blue-50 text-blue-700'
+                : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
+                }`}
             >
               已完成 ({completedCount})
             </button>
             <button
               onClick={() => setTaskFilter('exception')}
-              className={`px-3 py-1.5 rounded-lg border text-sm transition-colors ${
-                taskFilter === 'exception'
-                  ? 'border-blue-500 bg-blue-50 text-blue-700'
-                  : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
-              }`}
+              className={`px-3 py-1.5 rounded-lg border text-sm transition-colors ${taskFilter === 'exception'
+                ? 'border-blue-500 bg-blue-50 text-blue-700'
+                : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
+                }`}
             >
               异常/人工 ({exceptionCount})
             </button>
@@ -497,9 +744,9 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           <button className="absolute top-4 right-4 text-white hover:text-gray-300">
             <X size={32} />
           </button>
-          <img 
-            src={previewImage} 
-            alt="Preview" 
+          <img
+            src={previewImage}
+            alt="Preview"
             className="max-w-full max-h-full object-contain rounded bg-white shadow-2xl"
             onClick={(e) => e.stopPropagation()} // 阻止点击图片时关闭
           />
@@ -508,33 +755,125 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
 
       {/* 设置弹窗 Modal */}
       {showSettings && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={() => setShowSettings(false)}>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={tryCloseSettings}>
           <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
             <div className="p-6 border-b flex justify-between items-center bg-gray-50">
-              <h2 className="text-xl font-bold text-gray-800 flex items-center gap-2"><Settings size={20}/> 节点模型配置</h2>
-              <button onClick={() => setShowSettings(false)} className="text-gray-500 hover:text-gray-800"><X size={24} /></button>
+              <h2 className="text-xl font-bold text-gray-800 flex items-center gap-2"><Settings size={20} /> 节点模型配置</h2>
+              <button onClick={tryCloseSettings} className="text-gray-500 hover:text-gray-800"><X size={24} /></button>
             </div>
-            
+
             <div className="p-6 space-y-8 max-h-[70vh] overflow-y-auto">
+              <div className="space-y-4">
+                <h3 className="text-lg font-semibold text-indigo-600 border-b pb-2">工作流模板与 Prompt</h3>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">激活模板</label>
+                    <select
+                      value={activeTemplateId}
+                      onChange={async (e) => {
+                        const templateId = e.target.value
+                        setActiveTemplateId(templateId)
+                        await loadTemplateDetail(templateId)
+                      }}
+                      className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
+                    >
+                      {templateItems.map((item) => (
+                        <option key={item.template_id} value={item.template_id}>
+                          {item.name} ({item.template_id})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">模板名称</label>
+                    <input
+                      type="text"
+                      value={templateName}
+                      onChange={(e) => setTemplateName(e.target.value)}
+                      className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
+                    />
+                  </div>
+                  <div className="col-span-2">
+                    <label className="block text-sm font-medium text-gray-700 mb-1">模板描述</label>
+                    <input
+                      type="text"
+                      value={templateDescription}
+                      onChange={(e) => setTemplateDescription(e.target.value)}
+                      className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Solver System Prompt</label>
+                    <textarea value={solverSystemPrompt} onChange={(e) => setSolverSystemPrompt(e.target.value)} className="w-full min-h-24 border rounded-lg px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-indigo-500 outline-none" />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Solver User Prompt</label>
+                    <textarea value={solverUserPrompt} onChange={(e) => setSolverUserPrompt(e.target.value)} className="w-full min-h-20 border rounded-lg px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-indigo-500 outline-none" />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Reviewer System Prompt</label>
+                    <textarea value={reviewerSystemPrompt} onChange={(e) => setReviewerSystemPrompt(e.target.value)} className="w-full min-h-24 border rounded-lg px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-indigo-500 outline-none" />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Reviewer User Prompt</label>
+                    <textarea value={reviewerUserPrompt} onChange={(e) => setReviewerUserPrompt(e.target.value)} className="w-full min-h-20 border rounded-lg px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-indigo-500 outline-none" />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Formatter System Prompt</label>
+                    <textarea value={formatterSystemPrompt} onChange={(e) => setFormatterSystemPrompt(e.target.value)} className="w-full min-h-24 border rounded-lg px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-indigo-500 outline-none" />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Formatter User Prompt</label>
+                    <textarea value={formatterUserPrompt} onChange={(e) => setFormatterUserPrompt(e.target.value)} className="w-full min-h-20 border rounded-lg px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-indigo-500 outline-none" />
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                <h3 className="text-lg font-semibold text-amber-600 border-b pb-2">Fallback 模型列表</h3>
+                <p className="text-xs text-gray-500">每行一个模型名。节点列表为空时会回退到全局列表。</p>
+                <div className="grid grid-cols-1 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">全局 Fallback</label>
+                    <textarea value={globalFallbackText} onChange={(e) => setGlobalFallbackText(e.target.value)} className="w-full min-h-20 border rounded-lg px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-amber-500 outline-none" />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Solver 节点 Fallback</label>
+                    <textarea value={solverFallbackText} onChange={(e) => setSolverFallbackText(e.target.value)} className="w-full min-h-20 border rounded-lg px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-amber-500 outline-none" />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Reviewer 节点 Fallback</label>
+                    <textarea value={reviewerFallbackText} onChange={(e) => setReviewerFallbackText(e.target.value)} className="w-full min-h-20 border rounded-lg px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-amber-500 outline-none" />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Formatter 节点 Fallback</label>
+                    <textarea value={formatterFallbackText} onChange={(e) => setFormatterFallbackText(e.target.value)} className="w-full min-h-20 border rounded-lg px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-amber-500 outline-none" />
+                  </div>
+                </div>
+              </div>
+
               {/* Solver 配置 */}
               <div className="space-y-4">
                 <h3 className="text-lg font-semibold text-blue-600 border-b pb-2">Solver (解题) 节点</h3>
                 <div className="grid grid-cols-2 gap-4">
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">模型名称</label>
-                    <input type="text" value={solverConfig.model_name} onChange={e => setSolverConfig({...solverConfig, model_name: e.target.value})} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
+                    <input type="text" value={solverConfig.model_name} onChange={e => setSolverConfig({ ...solverConfig, model_name: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">Max Tokens</label>
-                    <input type="number" value={solverConfig.max_tokens || ''} onChange={e => setSolverConfig({...solverConfig, max_tokens: parseMaxTokens(e.target.value)})} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
+                    <input type="number" value={solverConfig.max_tokens || ''} onChange={e => setSolverConfig({ ...solverConfig, max_tokens: parseMaxTokens(e.target.value) })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
                   </div>
                   <div className="col-span-2">
                     <label className="block text-sm font-medium text-gray-700 mb-1">Base URL</label>
-                    <input type="text" value={solverConfig.base_url} onChange={e => setSolverConfig({...solverConfig, base_url: e.target.value})} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
+                    <input type="text" value={solverConfig.base_url} onChange={e => setSolverConfig({ ...solverConfig, base_url: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
                   </div>
                   <div className="col-span-2">
                     <label className="block text-sm font-medium text-gray-700 mb-1">API Key <span className="text-xs text-gray-400 font-normal">(留空则使用后端默认配置)</span></label>
-                    <input type="password" value={solverConfig.api_key} onChange={e => setSolverConfig({...solverConfig, api_key: e.target.value})} placeholder="sk-..." className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
+                    <input type="password" value={solverConfig.api_key} onChange={e => setSolverConfig({ ...solverConfig, api_key: e.target.value })} placeholder="sk-..." className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
                   </div>
                 </div>
               </div>
@@ -545,19 +884,19 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
                 <div className="grid grid-cols-2 gap-4">
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">模型名称</label>
-                    <input type="text" value={reviewerConfig.model_name} onChange={e => setReviewerConfig({...reviewerConfig, model_name: e.target.value})} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-purple-500 outline-none" />
+                    <input type="text" value={reviewerConfig.model_name} onChange={e => setReviewerConfig({ ...reviewerConfig, model_name: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-purple-500 outline-none" />
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">Max Tokens</label>
-                    <input type="number" value={reviewerConfig.max_tokens || ''} onChange={e => setReviewerConfig({...reviewerConfig, max_tokens: parseMaxTokens(e.target.value)})} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-purple-500 outline-none" />
+                    <input type="number" value={reviewerConfig.max_tokens || ''} onChange={e => setReviewerConfig({ ...reviewerConfig, max_tokens: parseMaxTokens(e.target.value) })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-purple-500 outline-none" />
                   </div>
                   <div className="col-span-2">
                     <label className="block text-sm font-medium text-gray-700 mb-1">Base URL</label>
-                    <input type="text" value={reviewerConfig.base_url} onChange={e => setReviewerConfig({...reviewerConfig, base_url: e.target.value})} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-purple-500 outline-none" />
+                    <input type="text" value={reviewerConfig.base_url} onChange={e => setReviewerConfig({ ...reviewerConfig, base_url: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-purple-500 outline-none" />
                   </div>
                   <div className="col-span-2">
                     <label className="block text-sm font-medium text-gray-700 mb-1">API Key <span className="text-xs text-gray-400 font-normal">(留空则使用后端默认配置)</span></label>
-                    <input type="password" value={reviewerConfig.api_key} onChange={e => setReviewerConfig({...reviewerConfig, api_key: e.target.value})} placeholder="sk-..." className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-purple-500 outline-none" />
+                    <input type="password" value={reviewerConfig.api_key} onChange={e => setReviewerConfig({ ...reviewerConfig, api_key: e.target.value })} placeholder="sk-..." className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-purple-500 outline-none" />
                   </div>
                 </div>
               </div>
@@ -568,27 +907,29 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
                 <div className="grid grid-cols-2 gap-4">
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">模型名称</label>
-                    <input type="text" value={formatterConfig.model_name} onChange={e => setFormatterConfig({...formatterConfig, model_name: e.target.value})} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 outline-none" />
+                    <input type="text" value={formatterConfig.model_name} onChange={e => setFormatterConfig({ ...formatterConfig, model_name: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 outline-none" />
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">Max Tokens</label>
-                    <input type="number" value={formatterConfig.max_tokens || ''} onChange={e => setFormatterConfig({...formatterConfig, max_tokens: parseMaxTokens(e.target.value)})} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 outline-none" />
+                    <input type="number" value={formatterConfig.max_tokens || ''} onChange={e => setFormatterConfig({ ...formatterConfig, max_tokens: parseMaxTokens(e.target.value) })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 outline-none" />
                   </div>
                   <div className="col-span-2">
                     <label className="block text-sm font-medium text-gray-700 mb-1">Base URL</label>
-                    <input type="text" value={formatterConfig.base_url} onChange={e => setFormatterConfig({...formatterConfig, base_url: e.target.value})} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 outline-none" />
+                    <input type="text" value={formatterConfig.base_url} onChange={e => setFormatterConfig({ ...formatterConfig, base_url: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 outline-none" />
                   </div>
                   <div className="col-span-2">
                     <label className="block text-sm font-medium text-gray-700 mb-1">API Key <span className="text-xs text-gray-400 font-normal">(留空则使用后端默认配置)</span></label>
-                    <input type="password" value={formatterConfig.api_key} onChange={e => setFormatterConfig({...formatterConfig, api_key: e.target.value})} placeholder="sk-..." className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 outline-none" />
+                    <input type="password" value={formatterConfig.api_key} onChange={e => setFormatterConfig({ ...formatterConfig, api_key: e.target.value })} placeholder="sk-..." className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 outline-none" />
                   </div>
                 </div>
               </div>
             </div>
 
             <div className="p-4 border-t bg-gray-50 flex justify-end gap-3">
-              <button onClick={() => setShowSettings(false)} className="px-4 py-2 text-gray-600 hover:bg-gray-200 rounded-lg transition-colors font-medium">取消</button>
-              <button onClick={saveSettings} className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors font-medium shadow-sm">保存配置</button>
+              <button onClick={tryCloseSettings} className="px-4 py-2 text-gray-600 hover:bg-gray-200 rounded-lg transition-colors font-medium">取消</button>
+              <button onClick={saveSettings} disabled={settingsSaving} className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors font-medium shadow-sm disabled:opacity-50">
+                {settingsSaving ? '保存中...' : '保存配置'}
+              </button>
             </div>
           </div>
         </div>
@@ -611,11 +952,10 @@ function TaskSwitcherButton({
   return (
     <button
       onClick={onSelect}
-      className={`px-3 py-1.5 rounded-lg border text-sm font-mono transition-colors ${
-        isActive
-          ? 'border-blue-500 bg-blue-50 text-blue-700'
-          : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
-      }`}
+      className={`px-3 py-1.5 rounded-lg border text-sm font-mono transition-colors ${isActive
+        ? 'border-blue-500 bg-blue-50 text-blue-700'
+        : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
+        }`}
     >
       <span>{taskId}</span>
       <TaskStatusBadge state={state} />
@@ -644,9 +984,19 @@ function TaskStatusBadge({ state }: { state: string }) {
 
 function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: string) => void }) {
   const [draftInput, setDraftInput] = useState('')
+  const [customDraftInput, setCustomDraftInput] = useState('')
+  const [selectedNodes, setSelectedNodes] = useState<WorkflowNode[]>([...WORKFLOW_NODE_ORDER])
   const [streamedContent, setStreamedContent] = useState('')
   const [currentNode, setCurrentNode] = useState('')
-  
+
+  type ManualAction = 'resume' | 'skip_review' | 'fail' | 'custom_run'
+  type ManualMutationPayload = {
+    action: ManualAction
+    draft?: string
+    entryPoint?: WorkflowNode
+    targetNodes?: WorkflowNode[]
+  }
+
   const { data: task, isLoading } = useQuery({
     queryKey: ['task', taskId],
     queryFn: () => api.get(`/api/tasks/${taskId}`).then(res => res.data),
@@ -661,16 +1011,38 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
   useEffect(() => {
     setStreamedContent('');
     setCurrentNode('');
+    setSelectedNodes([...WORKFLOW_NODE_ORDER]);
+    setCustomDraftInput('');
   }, [taskId]);
+
+  useEffect(() => {
+    if (!task) return
+    try {
+      const parsedHistory = task.history ? JSON.parse(task.history) : {}
+      if (typeof parsedHistory?.draft_solution === 'string') {
+        setCustomDraftInput(parsedHistory.draft_solution)
+      }
+      const historyTargetNodes = Array.isArray(parsedHistory?.target_nodes)
+        ? parsedHistory.target_nodes.filter((node: unknown): node is WorkflowNode => (
+          typeof node === 'string' && WORKFLOW_NODE_ORDER.includes(node as WorkflowNode)
+        ))
+        : []
+      if (historyTargetNodes.length > 0) {
+        setSelectedNodes(historyTargetNodes)
+      }
+    } catch {
+      // 历史字段非 JSON 时保持默认值，不中断详情页渲染
+    }
+  }, [task]);
 
   // Use React's useEffect to handle SSE connection
   const isTaskEnded = task?.state === 'completed' || task?.state === 'failed' || task?.state === 'manual' || task?.state === 'cancelled';
-  
+
   useEffect(() => {
     if (isTaskEnded) return;
 
     const sse = new EventSource(`http://localhost:8000/api/tasks/${taskId}/stream`);
-    
+
     sse.onmessage = (e) => {
       try {
         const data = JSON.parse(e.data);
@@ -699,10 +1071,14 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
   }, [taskId, isTaskEnded]);
 
   const manualMutation = useMutation({
-    mutationFn: ({ action, draft }: { action: 'resume' | 'skip_review' | 'fail', draft?: string }) => {
+    mutationFn: ({ action, draft, entryPoint, targetNodes }: ManualMutationPayload) => {
       const payload: Record<string, unknown> = { action, draft_solution: draft }
-      if (action === 'resume' || action === 'skip_review') {
+      if (action === 'resume' || action === 'skip_review' || action === 'custom_run') {
         Object.assign(payload, getLatestRetryConfigs())
+      }
+      if (action === 'custom_run') {
+        payload.entry_point = entryPoint
+        payload.target_nodes = targetNodes
       }
       return api.post(`/api/tasks/${taskId}/manual`, payload).then(res => res.data)
     },
@@ -721,8 +1097,63 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
   if (isLoading) return <div className="text-gray-500 p-8 text-center bg-white rounded-xl border shadow-sm">Loading task data...</div>
   if (!task) return null
 
-  const history = task.history ? JSON.parse(task.history) : {}
-  const tokens = task.token_usage ? JSON.parse(task.token_usage) : {}
+  let history: Record<string, unknown> = {}
+  try {
+    history = task.history ? JSON.parse(task.history) : {}
+  } catch {
+    history = {}
+  }
+
+  let tokens: Record<string, unknown> = {}
+  try {
+    tokens = task.token_usage ? JSON.parse(task.token_usage) : {}
+  } catch {
+    tokens = {}
+  }
+
+  const orderedSelectedNodes = WORKFLOW_NODE_ORDER.filter((node) => selectedNodes.includes(node))
+  const selectedNodeIndices = orderedSelectedNodes.map((node) => WORKFLOW_NODE_ORDER.indexOf(node))
+  const hasContiguousSelection = selectedNodeIndices.every((idx, i) => i === 0 || idx - selectedNodeIndices[i - 1] === 1)
+  const customEntryPoint = orderedSelectedNodes.length > 0 ? orderedSelectedNodes[0] : undefined
+  const customNeedsDraft = customEntryPoint === 'reviewer' || customEntryPoint === 'formatter'
+  const customDraftValue = customDraftInput.trim().length > 0
+    ? customDraftInput.trim()
+    : (typeof history.draft_solution === 'string' ? history.draft_solution : '')
+  const canSubmitCustomRun = orderedSelectedNodes.length > 0
+    && hasContiguousSelection
+    && (!customNeedsDraft || customDraftValue.trim().length > 0)
+    && !manualMutation.isPending
+  const customRunBlockedReason = orderedSelectedNodes.length === 0
+    ? '请至少选择一个节点。'
+    : (!hasContiguousSelection
+      ? '工作流节点必须连续，不能跳选。'
+      : (customNeedsDraft && customDraftValue.trim().length === 0
+        ? '从 Reviewer 或 Formatter 开始时，草稿文本为必填。'
+        : ''))
+
+  const toggleNodeSelection = (node: WorkflowNode) => {
+    setSelectedNodes((prev) => {
+      if (prev.includes(node)) {
+        return prev.filter((item) => item !== node)
+      }
+      return [...prev, node]
+    })
+  }
+
+  const handleCustomRun = () => {
+    if (!canSubmitCustomRun || !customEntryPoint) return
+    manualMutation.mutate({
+      action: 'custom_run',
+      draft: customDraftValue,
+      entryPoint: customEntryPoint,
+      targetNodes: orderedSelectedNodes
+    })
+  }
+
+  const isTerminalState = ['completed', 'failed', 'manual', 'cancelled'].includes(task.state)
+  const historyDraftSolution = typeof history.draft_solution === 'string' ? history.draft_solution : ''
+  const historyReviewFeedback = typeof history.review_feedback === 'string' ? history.review_feedback : ''
+  const totalTokens = typeof tokens.total_tokens === 'number' ? tokens.total_tokens : 0
   const shouldShowTaskError = Boolean(task.error_code) && ['failed', 'manual', 'cancelled'].includes(task.state)
 
   return (
@@ -731,20 +1162,19 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
       <div className="space-y-4 border-r pr-8">
         <div className="flex items-center justify-between">
           <h3 className="text-xl font-semibold">Task: <span className="text-sm font-mono text-gray-500">{task.task_id}</span></h3>
-          <span className={`px-3 py-1 rounded-full text-xs font-bold uppercase ${
-            task.state === 'completed' ? 'bg-green-100 text-green-700' :
+          <span className={`px-3 py-1 rounded-full text-xs font-bold uppercase ${task.state === 'completed' ? 'bg-green-100 text-green-700' :
             task.state === 'failed' ? 'bg-red-100 text-red-700' :
-            task.state === 'manual' ? 'bg-yellow-100 text-yellow-700' :
-            task.state === 'cancelled' ? 'bg-gray-200 text-gray-700' :
-            'bg-blue-100 text-blue-700'
-          }`}>
+              task.state === 'manual' ? 'bg-yellow-100 text-yellow-700' :
+                task.state === 'cancelled' ? 'bg-gray-200 text-gray-700' :
+                  'bg-blue-100 text-blue-700'
+            }`}>
             {task.state}
           </span>
         </div>
-        
+
         <div className="grid grid-cols-2 gap-4 text-sm text-gray-600 bg-gray-50 p-4 rounded">
           <div><strong>Retry Count:</strong> {task.retry_count} / 1</div>
-          <div><strong>Total Tokens:</strong> {tokens.total_tokens || 0}</div>
+          <div><strong>Total Tokens:</strong> {totalTokens}</div>
         </div>
 
         <div className="relative border rounded bg-gray-50 p-2 h-64 flex items-center justify-center group overflow-hidden cursor-pointer" onClick={() => onPreview(task.image_url)}>
@@ -763,6 +1193,67 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
 
       {/* Right: Agent Outputs & Interventions */}
       <div className="space-y-6">
+        {isTerminalState && (
+          <div className="space-y-4 border rounded-lg p-4 bg-blue-50/40 border-blue-100">
+            <div>
+              <h3 className="font-semibold text-blue-700">自定义工作流执行</h3>
+              <p className="text-xs text-gray-600 mt-1">仅针对当前任务生效，选择连续节点后可从指定入口重跑。</p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              {WORKFLOW_NODE_ORDER.map((node, idx) => (
+                <div key={node} className="flex items-center gap-2">
+                  <label className="inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded border bg-white border-gray-200">
+                    <input
+                      type="checkbox"
+                      checked={selectedNodes.includes(node)}
+                      onChange={() => toggleNodeSelection(node)}
+                    />
+                    <span className="font-medium">
+                      {node === 'solver' ? 'Solver 解题' : node === 'reviewer' ? 'Reviewer 审查' : 'Formatter 排版'}
+                    </span>
+                  </label>
+                  {idx < WORKFLOW_NODE_ORDER.length - 1 && <span className="text-gray-400">-&gt;</span>}
+                </div>
+              ))}
+            </div>
+
+            <div className="text-xs text-gray-600 bg-white rounded border px-3 py-2">
+              <div>入口节点: <span className="font-mono">{customEntryPoint || '-'}</span></div>
+              <div>目标节点: <span className="font-mono">{orderedSelectedNodes.join(', ') || '-'}</span></div>
+            </div>
+
+            {customNeedsDraft && (
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-gray-700">草稿文本（必填）</label>
+                <textarea
+                  className="w-full h-32 p-3 border rounded text-sm font-mono bg-white focus:ring-2 focus:ring-blue-500 outline-none resize-none"
+                  value={customDraftInput}
+                  onChange={(e) => setCustomDraftInput(e.target.value)}
+                  placeholder="从 Reviewer/Formatter 开始执行时，请输入可用草稿文本"
+                />
+              </div>
+            )}
+
+            {customRunBlockedReason && (
+              <div className="text-xs text-red-600 bg-red-50 border border-red-100 px-3 py-2 rounded">
+                {customRunBlockedReason}
+              </div>
+            )}
+
+            <div className="flex justify-end">
+              <button
+                onClick={handleCustomRun}
+                disabled={!canSubmitCustomRun}
+                className="bg-blue-600 text-white px-4 py-2 rounded text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
+                title={customRunBlockedReason || '执行当前自定义工作流'}
+              >
+                {manualMutation.isPending ? '执行中...' : '执行自定义工作流'}
+              </button>
+            </div>
+          </div>
+        )}
+
         {task.state === 'manual' || task.state === 'failed' ? (
           <div className="space-y-4">
             <h3 className="font-semibold text-red-600 flex items-center gap-2">
@@ -770,28 +1261,28 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
               Manual Intervention Required
             </h3>
             <div className="text-sm text-gray-700 bg-red-50 p-3 rounded border border-red-100">
-              <span className="font-bold">Reviewer Feedback:</span> {history.review_feedback || 'System Error'}
+              <span className="font-bold">Reviewer Feedback:</span> {historyReviewFeedback || 'System Error'}
             </div>
-            <textarea 
+            <textarea
               className="w-full h-[280px] p-4 border rounded font-mono text-sm bg-gray-50 focus:bg-white focus:ring-2 focus:ring-blue-500 outline-none resize-none"
-              defaultValue={history.draft_solution || ''}
+              defaultValue={historyDraftSolution}
               onChange={(e) => setDraftInput(e.target.value)}
               placeholder="Edit the draft solution here..."
             />
             <div className="flex gap-4 pt-2">
-              <button 
-                onClick={() => manualMutation.mutate({ action: 'resume', draft: draftInput || history.draft_solution })}
+              <button
+                onClick={() => manualMutation.mutate({ action: 'resume', draft: draftInput || historyDraftSolution })}
                 className="bg-green-600 text-white px-6 py-2.5 rounded font-medium hover:bg-green-700 transition-colors shadow-sm"
               >
                 Approve & Resume
               </button>
-              <button 
-                onClick={() => manualMutation.mutate({ action: 'skip_review', draft: draftInput || history.draft_solution })}
+              <button
+                onClick={() => manualMutation.mutate({ action: 'skip_review', draft: draftInput || historyDraftSolution })}
                 className="bg-blue-600 text-white px-6 py-2.5 rounded font-medium hover:bg-blue-700 transition-colors shadow-sm"
               >
                 Skip Review & Format
               </button>
-              <button 
+              <button
                 onClick={() => manualMutation.mutate({ action: 'fail' })}
                 className="bg-white border border-red-200 text-red-600 px-6 py-2.5 rounded font-medium hover:bg-red-50 transition-colors shadow-sm"
               >
@@ -835,7 +1326,7 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
                   {currentNode ? `${task.state} · ${currentNode}` : task.state}
                 </span>
               </div>
-              <button 
+              <button
                 onClick={() => cancelMutation.mutate()}
                 disabled={cancelMutation.isPending}
                 className="text-xs px-3 py-1.5 bg-red-50 text-red-600 border border-red-200 rounded-lg hover:bg-red-100 transition-colors flex items-center gap-1 disabled:opacity-50"
@@ -866,6 +1357,8 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
   const [editErrorCode, setEditErrorCode] = useState('')
   const [editManualOperator, setEditManualOperator] = useState('')
   const [operationMessage, setOperationMessage] = useState<string | null>(null)
+  const [customRunNodes, setCustomRunNodes] = useState<WorkflowNode[]>([...WORKFLOW_NODE_ORDER])
+  const [customRunDraft, setCustomRunDraft] = useState('')
 
   const { data: listData, isLoading: listLoading } = useQuery({
     queryKey: ['admin-tasks', searchTaskId, stateFilter],
@@ -901,6 +1394,25 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
     setEditFinalResult(selectedTask.final_result || '')
     setEditErrorCode(selectedTask.error_code || '')
     setEditManualOperator(selectedTask.manual_operator || '')
+    setCustomRunNodes([...WORKFLOW_NODE_ORDER])
+    setCustomRunDraft('')
+
+    try {
+      const parsedHistory = selectedTask.history ? JSON.parse(selectedTask.history) : {}
+      const historyTargetNodes = Array.isArray(parsedHistory?.target_nodes)
+        ? parsedHistory.target_nodes.filter((node: unknown): node is WorkflowNode => (
+          typeof node === 'string' && WORKFLOW_NODE_ORDER.includes(node as WorkflowNode)
+        ))
+        : []
+      if (historyTargetNodes.length > 0) {
+        setCustomRunNodes(historyTargetNodes)
+      }
+      if (typeof parsedHistory?.draft_solution === 'string') {
+        setCustomRunDraft(parsedHistory.draft_solution)
+      }
+    } catch {
+      // 历史字段无效时保持默认值，避免 Admin 面板不可用
+    }
   }, [selectedTask])
 
   useEffect(() => {
@@ -990,12 +1502,100 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
     }
   })
 
+  const customRunMutation = useMutation({
+    mutationFn: async () => {
+      if (!selectedTaskId || !selectedTask) throw new Error('请先选择任务')
+
+      const allowedStates = ['manual', 'failed', 'completed', 'cancelled']
+      if (!allowedStates.includes(selectedTask.state)) {
+        throw new Error('仅 manual/failed/completed/cancelled 任务可自定义执行')
+      }
+
+      const orderedNodes = WORKFLOW_NODE_ORDER.filter((node) => customRunNodes.includes(node))
+      if (orderedNodes.length === 0) throw new Error('请至少选择一个节点')
+
+      const nodeIndices = orderedNodes.map((node) => WORKFLOW_NODE_ORDER.indexOf(node))
+      const isContiguous = nodeIndices.every((idx, i) => i === 0 || idx - nodeIndices[i - 1] === 1)
+      if (!isContiguous) throw new Error('节点选择必须连续，不能跳选')
+
+      const entryPoint = orderedNodes[0]
+
+      let parsedHistory: Record<string, unknown> = {}
+      const trimmedHistory = (editHistory || '').trim()
+      if (trimmedHistory) {
+        try {
+          parsedHistory = JSON.parse(trimmedHistory)
+        } catch {
+          throw new Error('history 不是合法 JSON，请先修正后再执行 custom_run')
+        }
+      }
+
+      const historyDraft = typeof parsedHistory.draft_solution === 'string' ? parsedHistory.draft_solution : ''
+      const draftSolution = customRunDraft.trim().length > 0 ? customRunDraft.trim() : historyDraft
+      if ((entryPoint === 'reviewer' || entryPoint === 'formatter') && draftSolution.trim().length === 0) {
+        throw new Error('从 reviewer/formatter 开始时，draft_solution 为必填')
+      }
+
+      await api.post(`/api/tasks/${selectedTaskId}/manual`, {
+        action: 'custom_run',
+        draft_solution: draftSolution,
+        entry_point: entryPoint,
+        target_nodes: orderedNodes,
+        ...getLatestRetryConfigs()
+      })
+    },
+    onSuccess: () => {
+      if (selectedTaskId) {
+        persistTaskForDashboard(selectedTaskId)
+      }
+      setOperationMessage(`已触发自定义执行：${selectedTaskId}`)
+      queryClient.invalidateQueries({ queryKey: ['admin-task-detail', selectedTaskId] })
+      queryClient.invalidateQueries({ queryKey: ['admin-tasks'] })
+      queryClient.invalidateQueries({ queryKey: ['task', selectedTaskId] })
+    },
+    onError: (error: unknown) => {
+      setOperationMessage(getErrorMessage(error, '自定义执行失败'))
+    }
+  })
+
   const handleDelete = (taskId: string) => {
     const confirmed = window.confirm(`确认删除任务 ${taskId} 吗？`)
     if (!confirmed) return
     deleteMutation.mutate(taskId)
   }
   const canRetrySelectedTask = !!selectedTask && ['manual', 'failed'].includes(selectedTask.state)
+  const canCustomRunSelectedTask = !!selectedTask && ['manual', 'failed', 'completed', 'cancelled'].includes(selectedTask.state)
+
+  const orderedCustomRunNodes = WORKFLOW_NODE_ORDER.filter((node) => customRunNodes.includes(node))
+  const customRunEntryPoint = orderedCustomRunNodes.length > 0 ? orderedCustomRunNodes[0] : undefined
+  const customRunIndices = orderedCustomRunNodes.map((node) => WORKFLOW_NODE_ORDER.indexOf(node))
+  const customRunContiguous = customRunIndices.every((idx, i) => i === 0 || idx - customRunIndices[i - 1] === 1)
+  const customRunNeedDraft = customRunEntryPoint === 'reviewer' || customRunEntryPoint === 'formatter'
+
+  let customRunHistoryDraft = ''
+  try {
+    const parsedHistory = editHistory ? JSON.parse(editHistory) : {}
+    customRunHistoryDraft = typeof parsedHistory?.draft_solution === 'string' ? parsedHistory.draft_solution : ''
+  } catch {
+    customRunHistoryDraft = ''
+  }
+
+  const customRunDraftValue = customRunDraft.trim().length > 0 ? customRunDraft.trim() : customRunHistoryDraft
+  const canSubmitCustomRun = canCustomRunSelectedTask
+    && orderedCustomRunNodes.length > 0
+    && customRunContiguous
+    && (!customRunNeedDraft || customRunDraftValue.trim().length > 0)
+    && !customRunMutation.isPending
+
+  const customRunHint = !canCustomRunSelectedTask
+    ? '当前任务状态不支持自定义执行。'
+    : (orderedCustomRunNodes.length === 0
+      ? '请至少勾选一个节点。'
+      : (!customRunContiguous
+        ? '节点必须连续，不能跳选。'
+        : (customRunNeedDraft && customRunDraftValue.trim().length === 0
+          ? '从 Reviewer/Formatter 开始时草稿文本必填。'
+          : '')))
 
   const toggleExportSelection = (taskId: string) => {
     setSelectedExportIds((prev) => (
@@ -1121,9 +1721,8 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
               {!listLoading && (listData?.items || []).map((task) => (
                 <div
                   key={task.task_id}
-                  className={`w-full text-left p-3 rounded-lg border transition-colors ${
-                    selectedTaskId === task.task_id ? 'border-indigo-400 bg-indigo-50' : 'border-gray-200 hover:bg-gray-50'
-                  }`}
+                  className={`w-full text-left p-3 rounded-lg border transition-colors ${selectedTaskId === task.task_id ? 'border-indigo-400 bg-indigo-50' : 'border-gray-200 hover:bg-gray-50'
+                    }`}
                 >
                   <div className="flex items-start gap-2">
                     <input
@@ -1164,6 +1763,65 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
                   >
                     <Trash2 size={14} />
                     删除任务
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-3 border rounded-lg p-4 bg-indigo-50/40 border-indigo-100">
+                <h3 className="text-sm font-semibold text-indigo-700">自定义节点执行 (custom_run)</h3>
+                <div className="flex flex-wrap items-center gap-2">
+                  {WORKFLOW_NODE_ORDER.map((node, idx) => (
+                    <div key={`admin-${node}`} className="flex items-center gap-2">
+                      <label className="inline-flex items-center gap-2 text-xs px-2.5 py-1.5 rounded border bg-white border-gray-200">
+                        <input
+                          type="checkbox"
+                          checked={customRunNodes.includes(node)}
+                          onChange={() => {
+                            setCustomRunNodes((prev) => (
+                              prev.includes(node)
+                                ? prev.filter((item) => item !== node)
+                                : [...prev, node]
+                            ))
+                          }}
+                        />
+                        <span>{node}</span>
+                      </label>
+                      {idx < WORKFLOW_NODE_ORDER.length - 1 && <span className="text-gray-400 text-xs">-&gt;</span>}
+                    </div>
+                  ))}
+                </div>
+
+                <div className="text-xs text-gray-600 bg-white rounded border px-3 py-2">
+                  <div>入口节点: <span className="font-mono">{customRunEntryPoint || '-'}</span></div>
+                  <div>目标节点: <span className="font-mono">{orderedCustomRunNodes.join(', ') || '-'}</span></div>
+                </div>
+
+                {customRunNeedDraft && (
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-medium text-gray-700">草稿文本（必填）</label>
+                    <textarea
+                      value={customRunDraft}
+                      onChange={(e) => setCustomRunDraft(e.target.value)}
+                      className="w-full min-h-24 border rounded-lg px-3 py-2 text-xs font-mono bg-white"
+                      placeholder="从 reviewer/formatter 起跑时，输入或修订 draft_solution"
+                    />
+                  </div>
+                )}
+
+                {customRunHint && (
+                  <div className="text-xs text-red-600 bg-red-50 border border-red-100 px-3 py-2 rounded">
+                    {customRunHint}
+                  </div>
+                )}
+
+                <div className="flex justify-end">
+                  <button
+                    onClick={() => customRunMutation.mutate()}
+                    disabled={!canSubmitCustomRun}
+                    className="inline-flex items-center gap-2 px-3 py-1.5 text-xs text-indigo-700 border border-indigo-200 rounded hover:bg-indigo-50 disabled:opacity-50"
+                    title={customRunHint || '按勾选节点执行'}
+                  >
+                    {customRunMutation.isPending ? '执行中...' : '执行 custom_run'}
                   </button>
                 </div>
               </div>

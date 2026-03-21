@@ -1,5 +1,6 @@
 from app.agent.state import AgentState
 from app.agent.nodes.llm_client import format_solution
+from app.agent.nodes.llm_client import coerce_token_count
 from app.core.database import SessionLocal
 from app.models.domain import Task
 
@@ -48,6 +49,7 @@ async def format_node(state: AgentState) -> AgentState:
     agent_configs = state.get("agent_configs") or {}
     formatter_config = agent_configs.get("formatter") or {}
     image_url = state.get("image_url")
+    workflow_template_id = state.get("workflow_template_id")
 
     try:
         # 调用大模型进行排版润色
@@ -56,14 +58,18 @@ async def format_node(state: AgentState) -> AgentState:
             draft_solution,
             image_url=image_url,
             model_config=formatter_config,
+            workflow_template_id=workflow_template_id,
             task_id=state.get("task_id"),
         )
+        safe_total_tokens = coerce_token_count(
+            state.get("total_tokens"), 0
+        ) + coerce_token_count(result.get("tokens"), 0)
 
         return {
             **state,
             "status": "completed",
             "final_result": result["formatted_result"],
-            "total_tokens": state.get("total_tokens", 0) + result["tokens"],
+            "total_tokens": safe_total_tokens,
         }
     except Exception as e:
         print(f"  [Formatter] API Error: {e}")

@@ -6,3 +6,4 @@ httpx==0.26.0
 langgraph
 langchain-core
 langchain-openai
+PyYAML>=6.0.1

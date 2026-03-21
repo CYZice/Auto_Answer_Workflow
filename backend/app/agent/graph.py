@@ -6,7 +6,7 @@ from app.agent.nodes.solver import solve_node
 from app.agent.nodes.reviewer import review_node
 from app.agent.nodes.formatter import format_node
 
-def route_after_review(state: AgentState) -> Literal["formatter", "solver", "failed"]:
+def route_after_review(state: AgentState) -> Literal["formatter", "solver", "failed", "end"]:
     """
     条件路由：根据 Reviewer 的裁决决定下一步。
     对应 PRD：允许 1 次重做（即最多 2 次审查）；第二次审查仍 FAIL -> failed
@@ -20,6 +20,10 @@ def route_after_review(state: AgentState) -> Literal["formatter", "solver", "fai
     current_retry = state.get("retry_count", 0)
     
     if decision == "PASS":
+        target_nodes = state.get("target_nodes") or []
+        if target_nodes and "formatter" not in target_nodes:
+            print(f"  [Router] PASS but formatter not selected -> end")
+            return "end"
         print(f"  [Router] PASS -> formatting")
         return "formatter"
     
@@ -73,7 +77,8 @@ def build_graph(entry_point: Literal["solver", "reviewer", "formatter"] = "solve
         {
             "formatter": "formatter",
             "solver": "increment_retry",  # 先过递增节点
-            "failed": END
+            "failed": END,
+            "end": END
         }
     )
     

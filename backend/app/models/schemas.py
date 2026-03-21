@@ -50,6 +50,15 @@ class TaskCreateRequest(BaseModel):
     workflow_template_id: Optional[str] = Field(
         default=None, description="本次任务使用的提示词模板 ID"
     )
+    entry_point: Optional[Literal["solver", "reviewer", "formatter"]] = Field(
+        default="solver", description="自定义执行入口节点"
+    )
+    target_nodes: Optional[List[Literal["solver", "reviewer", "formatter"]]] = Field(
+        default=None, description="本次执行的节点集合，必须是有序连续子链"
+    )
+    draft_solution: Optional[str] = Field(
+        default=None, description="当跳过Solver时，初始注入的草稿内容"
+    )
 
 
 class TaskCreateResponse(BaseModel):

@@ -392,6 +392,42 @@ async def create_task(
         workflow_template_id = req.workflow_template_id or runtime_settings.get(
             "active_template_id"
         )
+        resume_node = req.entry_point or "solver"
+        normalized_nodes = normalize_target_nodes(req.target_nodes)
+
+        if req.target_nodes is not None:
+            if not normalized_nodes:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="target_nodes is invalid or empty.",
+                )
+            if not validate_contiguous_nodes(normalized_nodes):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="target_nodes must be a contiguous workflow chain.",
+                )
+            if resume_node not in normalized_nodes:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="entry_point must be included in target_nodes.",
+                )
+            if resume_node != normalized_nodes[0]:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"entry_point must be the first node in target_nodes: {normalized_nodes[0]}.",
+                )
+            target_nodes = normalized_nodes
+        elif resume_node in VALID_RESUME_NODES and resume_node != "solver":
+            start_index = WORKFLOW_ORDER.index(resume_node)
+            target_nodes = WORKFLOW_ORDER[start_index:]
+        else:
+            target_nodes = None
+
+        if resume_node in {"reviewer", "formatter"} and not req.draft_solution:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="draft_solution is required when entry_point is reviewer or formatter.",
+            )
 
         new_task = Task(
             task_id=new_task_id,
@@ -412,6 +448,7 @@ async def create_task(
                         else {}
                     ),
                     "workflow_template_id": workflow_template_id,
+                    "draft_solution": req.draft_solution,
                 },
                 ensure_ascii=False,
             ),
@@ -422,7 +459,13 @@ async def create_task(
         db.refresh(new_task)
 
         # 触发后台异步任务，执行图状态机
-        background_tasks.add_task(run_agent_workflow_async, new_task.task_id, db)
+        background_tasks.add_task(
+            run_agent_workflow_async,
+            new_task.task_id,
+            db,
+            resume_node,
+            target_nodes,
+        )
 
         return TaskCreateResponse(
             task_id=new_task.task_id, status=TaskStatus(new_task.state)

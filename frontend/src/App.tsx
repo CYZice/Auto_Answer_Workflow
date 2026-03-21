@@ -34,11 +34,6 @@ const getErrorMessage = (error: unknown, fallback: string) => {
 }
 
 // --- Types ---
-interface PendingTask {
-  id: string;
-  imageUrl: string;
-}
-
 interface SubmittedTask {
   taskId: string;
 }
@@ -178,7 +173,9 @@ const persistTaskForDashboard = (taskId: string) => {
 // --- Components ---
 
 function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
-  const [pendingQueue, setPendingQueue] = useState<PendingTask[]>([])
+  const [pendingInputImage, setPendingInputImage] = useState<string | null>(null)
+  const [inputDraft, setInputDraft] = useState('')
+  const [inputSelectedNodes, setInputSelectedNodes] = useState<WorkflowNode[]>([...WORKFLOW_NODE_ORDER])
   const [submittedTasks, setSubmittedTasks] = useState<SubmittedTask[]>(() => {
     const saved = readStoredJson<SubmittedTask[]>(SUBMITTED_TASKS_STORAGE_KEY, [])
     if (!Array.isArray(saved)) return []
@@ -402,6 +399,10 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
 
   // 处理剪贴板粘贴图片
   const handlePaste = (e: ClipboardEvent<HTMLDivElement>) => {
+    if (pendingInputImage) {
+      setErrorMessage('当前已有待提交题目，请先提交或删除后再粘贴下一题。')
+      return
+    }
     const items = e.clipboardData.items;
     for (let i = 0; i < items.length; i++) {
       if (items[i].type.indexOf('image') !== -1) {
@@ -413,27 +414,64 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         const reader = new FileReader();
         reader.onload = (event) => {
           if (event.target?.result) {
-            setPendingQueue(prev => [...prev, {
-              id: Math.random().toString(36).substring(7),
-              imageUrl: event.target!.result as string
-            }]);
+            setPendingInputImage(event.target!.result as string)
           }
         };
         reader.readAsDataURL(file);
+        break;
       }
     }
   };
 
+  const toggleInputNodeSelection = (node: WorkflowNode) => {
+    setInputSelectedNodes((prev) => {
+      if (prev.includes(node)) {
+        return prev.filter((item) => item !== node)
+      }
+      return [...prev, node]
+    })
+  }
+
   // 创建任务的 Mutation
   const createMutation = useMutation({
-    mutationFn: (url: string) => api.post('/api/tasks', {
-      image_url: url,
+    mutationFn: (payload: {
+      imageUrl: string;
+      entryPoint: WorkflowNode;
+      targetNodes: WorkflowNode[];
+      draftSolution?: string;
+    }) => api.post('/api/tasks', {
+      image_url: payload.imageUrl,
       solver_config: solverConfig,
       reviewer_config: reviewerConfig,
       formatter_config: formatterConfig,
-      workflow_template_id: activeTemplateId
+      workflow_template_id: activeTemplateId,
+      entry_point: payload.entryPoint,
+      target_nodes: payload.targetNodes,
+      draft_solution: payload.draftSolution || null
     }).then(res => res.data),
   })
+
+  const orderedInputNodes = WORKFLOW_NODE_ORDER.filter((node) => inputSelectedNodes.includes(node))
+  const inputNodeIndices = orderedInputNodes.map((node) => WORKFLOW_NODE_ORDER.indexOf(node))
+  const inputHasContiguousSelection = inputNodeIndices.every((idx, i) => i === 0 || idx - inputNodeIndices[i - 1] === 1)
+  const inputEntryPoint = orderedInputNodes.length > 0 ? orderedInputNodes[0] : undefined
+  const inputNeedsDraft = inputEntryPoint === 'reviewer' || inputEntryPoint === 'formatter'
+  const inputDraftValue = inputDraft.trim()
+  const canSubmitInputTask = Boolean(pendingInputImage)
+    && orderedInputNodes.length > 0
+    && inputHasContiguousSelection
+    && (!inputNeedsDraft || inputDraftValue.length > 0)
+    && !createMutation.isPending
+  const inputBlockedReason = !pendingInputImage
+    ? '请先粘贴一张题目图片。'
+    : (orderedInputNodes.length === 0
+      ? '请至少选择一个工作流节点。'
+      : (!inputHasContiguousSelection
+        ? '工作流节点必须连续，不能跳选。'
+        : (inputNeedsDraft && inputDraftValue.length === 0
+          ? '从 Reviewer 或 Formatter 开始时，草稿文本为必填。'
+          : '')))
+
   const submittedTaskStatusQueries = useQueries({
     queries: submittedTasks.map((task) => ({
       queryKey: ['task', task.taskId],
@@ -521,42 +559,31 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     setActiveTaskId(submittedTasks[submittedTasks.length - 1].taskId)
   }, [submittedTasks, activeTaskId])
 
-  // 处理“开始处理”逻辑
-  const handleStartProcessing = async () => {
-    if (pendingQueue.length === 0) return;
+  // 处理“提交本题”逻辑
+  const handleSubmitCurrentTask = async () => {
+    if (!canSubmitInputTask || !pendingInputImage || !inputEntryPoint) return;
     setErrorMessage(null);
 
-    // 复制一份当前队列，然后清空 UI 队列
-    const tasksToProcess = [...pendingQueue];
-    setPendingQueue([]);
-
-    console.log("🚀 开始提交任务队列，共", tasksToProcess.length, "个任务");
-
-    // 逐个提交给后端
-    for (const task of tasksToProcess) {
-      try {
-        console.log(`正在提交任务 (ID: ${task.id})...`);
-        const result = await createMutation.mutateAsync(task.imageUrl);
-        console.log(`✅ 任务提交成功，后端返回 Task ID: ${result.task_id}`);
-        setSubmittedTasks((prev) => (
-          prev.some((item) => item.taskId === result.task_id)
-            ? prev
-            : [...prev, { taskId: result.task_id }]
-        ));
-        // 将最后一个任务设为当前活跃视图
-        setActiveTaskId(result.task_id);
-      } catch (error: unknown) {
-        console.error("❌ 提交任务失败:", error);
-        const errorMsg = getErrorMessage(error, "未知错误");
-        setErrorMessage(`提交失败: ${errorMsg}`);
-        // 如果提交失败，把没提交的放回队列（可选策略）
-        // 这里为了体验，只提示错误
-      }
+    try {
+      const result = await createMutation.mutateAsync({
+        imageUrl: pendingInputImage,
+        entryPoint: inputEntryPoint,
+        targetNodes: orderedInputNodes,
+        draftSolution: inputNeedsDraft ? inputDraftValue : undefined,
+      });
+      setSubmittedTasks((prev) => (
+        prev.some((item) => item.taskId === result.task_id)
+          ? prev
+          : [...prev, { taskId: result.task_id }]
+      ));
+      setActiveTaskId(result.task_id);
+      setPendingInputImage(null);
+      setInputDraft('');
+      setInputSelectedNodes([...WORKFLOW_NODE_ORDER]);
+    } catch (error: unknown) {
+      const errorMsg = getErrorMessage(error, "未知错误");
+      setErrorMessage(`提交失败: ${errorMsg}`);
     }
-  };
-
-  const removePendingTask = (id: string) => {
-    setPendingQueue(prev => prev.filter(t => t.id !== id));
   };
 
   const parseMaxTokens = (val: string) => {
@@ -591,7 +618,7 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       <header className="border-b pb-4 flex justify-between items-start">
         <div>
           <h1 className="text-3xl font-bold text-gray-900">Zyb-Agent 生产流水线</h1>
-          <p className="text-sm text-gray-500 mt-2">提示: 直接在这个页面 <kbd className="bg-gray-100 px-1 rounded border">Ctrl+V</kbd> 粘贴图片即可添加到队列。</p>
+          <p className="text-sm text-gray-500 mt-2">提示: 直接在这个页面 <kbd className="bg-gray-100 px-1 rounded border">Ctrl+V</kbd> 粘贴图片，每次仅允许录入一题并提交后再录入下一题。</p>
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -618,49 +645,92 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         </div>
       )}
 
-      {/* 待处理队列区域 */}
+      {/* 单题输入区域 */}
       <div className="bg-white p-6 rounded-xl shadow-sm border space-y-4">
         <div className="flex justify-between items-center">
           <h2 className="text-lg font-semibold flex items-center gap-2">
             <ImageIcon size={20} className="text-blue-500" />
-            待处理队列 ({pendingQueue.length})
+            当前题目输入
           </h2>
           <button
-            onClick={handleStartProcessing}
-            disabled={pendingQueue.length === 0 || createMutation.isPending}
+            onClick={handleSubmitCurrentTask}
+            disabled={!canSubmitInputTask}
             className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg font-medium disabled:opacity-50 hover:bg-blue-700 transition-colors"
+            title={inputBlockedReason || '提交当前题目'}
           >
             <Play size={18} />
-            {createMutation.isPending ? '正在提交...' : '开始处理'}
+            {createMutation.isPending ? '正在提交...' : '提交本题'}
           </button>
         </div>
 
-        {/* 队列缩略图展示 */}
-        {pendingQueue.length > 0 ? (
-          <div className="flex gap-4 overflow-x-auto pb-4">
-            {pendingQueue.map(task => (
-              <div key={task.id} className="relative group w-32 h-32 flex-shrink-0 border rounded-lg overflow-hidden bg-gray-50">
-                <img src={task.imageUrl} alt="pending" className="w-full h-full object-cover" />
-                {/* 悬浮操作层 */}
-                <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-2">
-                  <button onClick={() => setPreviewImage(task.imageUrl)} className="p-1.5 bg-white rounded-full text-gray-700 hover:text-blue-600" title="预览">
-                    <Maximize2 size={16} />
-                  </button>
-                  <button onClick={() => removePendingTask(task.id)} className="p-1.5 bg-white rounded-full text-gray-700 hover:text-red-600" title="删除">
-                    <X size={16} />
-                  </button>
-                </div>
+        {pendingInputImage ? (
+          <div className="space-y-4">
+            <div className="relative group border rounded-lg overflow-hidden bg-gray-50 h-48 flex items-center justify-center">
+              <img src={pendingInputImage} alt="pending" className="max-h-full object-contain" />
+              <div className="absolute inset-0 bg-black/30 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-2">
+                <button onClick={() => setPreviewImage(pendingInputImage)} className="p-2 bg-white rounded-full text-gray-700 hover:text-blue-600" title="预览">
+                  <Maximize2 size={18} />
+                </button>
+                <button
+                  onClick={() => {
+                    setPendingInputImage(null)
+                    setInputDraft('')
+                    setInputSelectedNodes([...WORKFLOW_NODE_ORDER])
+                  }}
+                  className="p-2 bg-white rounded-full text-gray-700 hover:text-red-600"
+                  title="删除当前题目"
+                >
+                  <Trash2 size={18} />
+                </button>
               </div>
-            ))}
-            {/* 模拟粘贴提示框 */}
-            <div className="w-32 h-32 flex-shrink-0 border-2 border-dashed border-gray-300 rounded-lg flex flex-col items-center justify-center text-gray-400 bg-gray-50/50">
-              <Plus size={24} className="mb-2" />
-              <span className="text-xs">继续粘贴图片</span>
             </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              {WORKFLOW_NODE_ORDER.map((node, idx) => (
+                <div key={node} className="flex items-center gap-2">
+                  <label className="inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded border bg-white border-gray-200">
+                    <input
+                      type="checkbox"
+                      checked={inputSelectedNodes.includes(node)}
+                      onChange={() => toggleInputNodeSelection(node)}
+                    />
+                    <span className="font-medium">
+                      {node === 'solver' ? 'Solver 解题' : node === 'reviewer' ? 'Reviewer 审查' : 'Formatter 排版'}
+                    </span>
+                  </label>
+                  {idx < WORKFLOW_NODE_ORDER.length - 1 && <span className="text-gray-400">-&gt;</span>}
+                </div>
+              ))}
+            </div>
+
+            <div className="text-xs text-gray-600 bg-white rounded border px-3 py-2">
+              <div>入口节点: <span className="font-mono">{inputEntryPoint || '-'}</span></div>
+              <div>目标节点: <span className="font-mono">{orderedInputNodes.join(', ') || '-'}</span></div>
+            </div>
+
+            {inputNeedsDraft && (
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-gray-700">草稿文本（必填）</label>
+                <textarea
+                  className="w-full h-28 p-3 border rounded text-sm font-mono bg-white focus:ring-2 focus:ring-blue-500 outline-none resize-none"
+                  value={inputDraft}
+                  onChange={(e) => setInputDraft(e.target.value)}
+                  placeholder="从 Reviewer/Formatter 开始执行时，请输入可用草稿文本"
+                />
+              </div>
+            )}
+
+            {inputBlockedReason && !canSubmitInputTask && (
+              <div className="text-xs text-red-600 bg-red-50 border border-red-100 px-3 py-2 rounded">
+                {inputBlockedReason}
+              </div>
+            )}
           </div>
         ) : (
-          <div className="h-32 border-2 border-dashed border-gray-300 rounded-lg flex items-center justify-center text-gray-400 bg-gray-50">
-            在此处 Ctrl+V 粘贴截图，或点击任意位置粘贴
+          <div className="h-36 border-2 border-dashed border-gray-300 rounded-lg flex flex-col items-center justify-center text-gray-400 bg-gray-50">
+            <Plus size={24} className="mb-2" />
+            <span className="text-sm">在此页面使用 Ctrl+V 粘贴题目截图</span>
+            <span className="text-xs mt-1">一次只录入一题，提交后再开始下一题</span>
           </div>
         )}
       </div>

@@ -474,10 +474,27 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           ? '从 Reviewer 或 Formatter 开始时，草稿文本为必填。'
           : '')))
 
+  const { data: activeTasksFromDb } = useQuery({
+    queryKey: ['dashboard-active-tasks'],
+    queryFn: () => api.get<AdminTask[]>('/api/tasks/active').then((res) => res.data),
+    refetchInterval: 3000,
+  })
+
+  const mergedTaskIds = useMemo(() => {
+    const ids = new Set<string>()
+    submittedTasks.forEach((task) => {
+      if (task.taskId.trim().length > 0) ids.add(task.taskId)
+    })
+      ; (activeTasksFromDb || []).forEach((task) => {
+        if (task?.task_id) ids.add(task.task_id)
+      })
+    return Array.from(ids)
+  }, [submittedTasks, activeTasksFromDb])
+
   const submittedTaskStatusQueries = useQueries({
-    queries: submittedTasks.map((task) => ({
-      queryKey: ['task', task.taskId],
-      queryFn: () => api.get<AdminTask>(`/api/tasks/${task.taskId}`).then((res) => res.data),
+    queries: mergedTaskIds.map((taskId) => ({
+      queryKey: ['task', taskId],
+      queryFn: () => api.get<AdminTask>(`/api/tasks/${taskId}`).then((res) => res.data),
       refetchInterval: (query: { state: { data?: AdminTask } }) => {
         const state = query.state.data?.state;
         if (state === 'completed' || state === 'failed' || state === 'manual' || state === 'cancelled') return false;
@@ -487,20 +504,29 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   })
   const submittedTaskItems = useMemo(
     () =>
-      submittedTasks.map((task, index) => {
+      mergedTaskIds.map((taskId, index) => {
         const taskData = submittedTaskStatusQueries[index]?.data as AdminTask | undefined
         return {
-          taskId: task.taskId,
+          taskId,
           state: taskData?.state || 'queued'
         }
       }),
-    [submittedTasks, submittedTaskStatusQueries]
+    [mergedTaskIds, submittedTaskStatusQueries]
   )
+
+  const queryStateByTaskId = useMemo(() => {
+    const map = new Map<string, (typeof submittedTaskStatusQueries)[number]>()
+    mergedTaskIds.forEach((taskId, index) => {
+      map.set(taskId, submittedTaskStatusQueries[index])
+    })
+    return map
+  }, [mergedTaskIds, submittedTaskStatusQueries])
+
   useEffect(() => {
     if (submittedTasks.length === 0) return
 
-    const taskIdsToRemove = submittedTasks.reduce<string[]>((acc, task, index) => {
-      const queryState = submittedTaskStatusQueries[index]
+    const taskIdsToRemove = submittedTasks.reduce<string[]>((acc, task) => {
+      const queryState = queryStateByTaskId.get(task.taskId)
       const queryError = queryState?.error
       if (axios.isAxiosError(queryError) && queryError.response?.status === 404) {
         acc.push(task.taskId)
@@ -522,7 +548,7 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       if (taskIdsToRemoveSet.has(prev)) return null
       return prev
     })
-  }, [submittedTasks, submittedTaskStatusQueries])
+  }, [submittedTasks, queryStateByTaskId])
   const isRunningState = (state: string) => RUNNING_TASK_STATES.includes(state)
   const runningCount = submittedTaskItems.filter((task) => isRunningState(task.state)).length
   const completedCount = submittedTaskItems.filter((task) => task.state === 'completed').length
@@ -549,17 +575,17 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   }, [activeTaskId])
 
   useEffect(() => {
-    if (submittedTasks.length === 0) {
+    if (mergedTaskIds.length === 0) {
       if (activeTaskId !== null) {
         setActiveTaskId(null)
       }
       return
     }
-    if (activeTaskId && submittedTasks.some((task) => task.taskId === activeTaskId)) {
+    if (activeTaskId && mergedTaskIds.includes(activeTaskId)) {
       return
     }
-    setActiveTaskId(submittedTasks[submittedTasks.length - 1].taskId)
-  }, [submittedTasks, activeTaskId])
+    setActiveTaskId(mergedTaskIds[0])
+  }, [mergedTaskIds, activeTaskId])
 
   // 处理“提交本题”逻辑
   const handleSubmitCurrentTask = async () => {

@@ -517,6 +517,20 @@ def get_task(task_id: str, db: Session = Depends(get_db)):
     return task
 
 
+@app.get("/api/tasks/active", response_model=list[TaskDetailResponse])
+def list_active_tasks(db: Session = Depends(get_db)):
+    """
+    返回所有未完成任务，供主页面同步显示。
+    """
+    active_tasks = (
+        db.query(Task)
+        .filter(Task.state != TaskStatus.COMPLETED.value)
+        .order_by(Task.updated_at.desc(), Task.created_at.desc())
+        .all()
+    )
+    return active_tasks
+
+
 @app.get("/api/tasks/{task_id}/stream")
 async def stream_task(task_id: str, db: Session = Depends(get_db)):
     """

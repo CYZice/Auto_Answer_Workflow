@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider, useMutation, useQueries, useQuery } f
 import axios from 'axios'
 import 'katex/dist/katex.min.css'
 import { Database, Download, Image as ImageIcon, Maximize2, Play, Plus, Save, Settings, Trash2, X } from 'lucide-react'
-import { ClipboardEvent, DragEvent, useEffect, useMemo, useState } from 'react'
+import { ClipboardEvent, DragEvent, MouseEvent, useEffect, useMemo, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import rehypeKatex from 'rehype-katex'
 import remarkMath from 'remark-math'
@@ -53,6 +53,8 @@ interface AdminTask {
   retry_count: number;
   history?: string | null;
   final_result?: string | null;
+  question_preview?: string | null;
+  answer_preview?: string | null;
   token_usage?: string | null;
   error_code?: string | null;
   created_at?: string | null;
@@ -1421,6 +1423,8 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
   const [selectedExportIds, setSelectedExportIds] = useState<string[]>([])
   const [draggingExportId, setDraggingExportId] = useState<string | null>(null)
+  const [hoveredExportId, setHoveredExportId] = useState<string | null>(null)
+  const [hoverPreviewPos, setHoverPreviewPos] = useState<{ x: number; y: number } | null>(null)
   const [isExporting, setIsExporting] = useState(false)
   const [editState, setEditState] = useState('')
   const [editHistory, setEditHistory] = useState('')
@@ -1674,6 +1678,29 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
     ))
   }
 
+  const getTaskPreviewText = (task: AdminTask) => {
+    const question = (task.question_preview || '').trim()
+    if (question) return question
+
+    const full = (task.final_result || '').trim()
+    if (!full) return '暂无题目预览'
+
+    const splitIndex = (() => {
+      const solveIndex = full.indexOf('【正解】')
+      const analysisIndex = full.indexOf('【解析】')
+      if (solveIndex >= 0 && analysisIndex >= 0) return Math.min(solveIndex, analysisIndex)
+      if (solveIndex >= 0) return solveIndex
+      return analysisIndex
+    })()
+
+    return (splitIndex >= 0 ? full.slice(0, splitIndex) : full).trim() || '暂无题目预览'
+  }
+
+  const getTaskPreviewSnippet = (task: AdminTask) => {
+    const text = getTaskPreviewText(task).replace(/\s+/g, ' ').trim()
+    return text.length > 120 ? `${text.slice(0, 120)}...` : text
+  }
+
   const toggleSelectAllInList = () => {
     const ids = (listData?.items || []).map((item) => item.task_id)
     if (ids.length === 0) return
@@ -1718,6 +1745,25 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
   const handleExportDragEnd = () => {
     setDraggingExportId(null)
   }
+
+  const handleExportItemMouseEnter = (taskId: string, event: MouseEvent<HTMLDivElement>) => {
+    setHoveredExportId(taskId)
+    setHoverPreviewPos({ x: event.clientX, y: event.clientY })
+  }
+
+  const handleExportItemMouseMove = (event: MouseEvent<HTMLDivElement>) => {
+    setHoverPreviewPos({ x: event.clientX, y: event.clientY })
+  }
+
+  const handleExportItemMouseLeave = (taskId: string) => {
+    setHoveredExportId((prev) => (prev === taskId ? null : prev))
+    setHoverPreviewPos(null)
+  }
+
+  const hoveredExportTask = useMemo(() => {
+    if (!hoveredExportId) return null
+    return selectedExportTasks.find((item) => item.task_id === hoveredExportId) || null
+  }, [hoveredExportId, selectedExportTasks])
 
   const exportFinalResults = async () => {
     if (selectedExportIds.length === 0) {
@@ -1869,7 +1915,10 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
                       onDragOver={handleExportDragOver}
                       onDrop={() => handleExportDrop(task.task_id)}
                       onDragEnd={handleExportDragEnd}
-                      className={`text-xs px-2 py-1.5 rounded border bg-white cursor-move ${draggingExportId === task.task_id ? 'opacity-60 border-indigo-300' : 'border-gray-200'}`}
+                      onMouseEnter={(event) => handleExportItemMouseEnter(task.task_id, event)}
+                      onMouseMove={handleExportItemMouseMove}
+                      onMouseLeave={() => handleExportItemMouseLeave(task.task_id)}
+                      className={`relative text-xs px-2 py-1.5 rounded border bg-white cursor-move ${draggingExportId === task.task_id ? 'opacity-60 border-indigo-300' : 'border-gray-200'}`}
                     >
                       {index + 1}. {task.task_id}
                     </div>
@@ -1892,9 +1941,13 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
                       onChange={() => toggleExportSelection(task.task_id)}
                       className="mt-0.5"
                     />
-                    <button onClick={() => setSelectedTaskId(task.task_id)} className="flex-1 text-left">
+                    <button
+                      onClick={() => setSelectedTaskId(task.task_id)}
+                      className="flex-1 text-left"
+                    >
                       <div className="text-xs font-mono text-gray-700 truncate">{task.task_id}</div>
                       <div className="text-xs text-gray-500 mt-1">{task.state} · retry {task.retry_count}</div>
+                      <div className="text-[11px] text-gray-400 mt-1 truncate">题目预览：{getTaskPreviewSnippet(task)}</div>
                     </button>
                   </div>
                 </div>
@@ -1902,6 +1955,18 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
             </div>
           </div>
         </div>
+
+        {hoveredExportTask && hoverPreviewPos && (
+          <div
+            className="fixed w-72 rounded-lg border border-gray-200 bg-white shadow-lg p-3 z-50 pointer-events-none"
+            style={{ left: hoverPreviewPos.x + 14, top: hoverPreviewPos.y + 12 }}
+          >
+            <div className="text-[11px] text-gray-500 mb-1">题目预览</div>
+            <div className="text-xs text-gray-700 whitespace-pre-wrap break-words max-h-40 overflow-y-auto">
+              {getTaskPreviewText(hoveredExportTask)}
+            </div>
+          </div>
+        )}
 
         <div className="lg:col-span-2 bg-white border rounded-xl p-6 space-y-4">
           {!selectedTaskId && <div className="text-sm text-gray-500">请从左侧选择任务</div>}
@@ -2009,16 +2074,6 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
               </div>
 
               <div className="space-y-2">
-                <label className="text-sm font-medium text-gray-700">manual_operator</label>
-                <input value={editManualOperator} onChange={(e) => setEditManualOperator(e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" />
-              </div>
-
-              <div className="space-y-2">
-                <label className="text-sm font-medium text-gray-700">error_code</label>
-                <input value={editErrorCode} onChange={(e) => setEditErrorCode(e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" />
-              </div>
-
-              <div className="space-y-2">
                 <label className="text-sm font-medium text-gray-700">image_url</label>
                 <img src={selectedTask.image_url} alt="task" className="max-h-60 border rounded bg-gray-50 object-contain" />
               </div>
@@ -2026,6 +2081,35 @@ function AdminPanel({ onBack }: { onBack: () => void }) {
               <div className="space-y-2">
                 <label className="text-sm font-medium text-gray-700">final_result</label>
                 <textarea value={editFinalResult} onChange={(e) => setEditFinalResult(e.target.value)} className="w-full min-h-60 border rounded-lg px-3 py-2 text-xs font-mono" />
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-gray-700">question_preview（自动生成）</label>
+                  <textarea
+                    value={selectedTask.question_preview || ''}
+                    readOnly
+                    className="w-full min-h-32 border rounded-lg px-3 py-2 text-xs font-mono bg-gray-50"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-gray-700">answer_preview（自动生成）</label>
+                  <textarea
+                    value={selectedTask.answer_preview || ''}
+                    readOnly
+                    className="w-full min-h-32 border rounded-lg px-3 py-2 text-xs font-mono bg-gray-50"
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-gray-700">manual_operator</label>
+                <input value={editManualOperator} onChange={(e) => setEditManualOperator(e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" />
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-gray-700">error_code</label>
+                <input value={editErrorCode} onChange={(e) => setEditErrorCode(e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" />
               </div>
 
               <div className="space-y-2">

@@ -150,6 +150,8 @@ class TaskDetailResponse(BaseModel):
     retry_count: int
     history: Optional[str] = None
     final_result: Optional[str] = None
+    question_preview: Optional[str] = None
+    answer_preview: Optional[str] = None
     token_usage: Optional[str] = None
     error_code: Optional[str] = None
     created_at: Optional[datetime] = None

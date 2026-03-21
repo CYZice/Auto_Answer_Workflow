@@ -1,11 +1,11 @@
 active_template_id: workflow_a
 fallback:
-  global:
-  - gpt-5.4
-  - gemini-3-flash-preview
+  global: []
   nodes:
-    solver: []
-    reviewer:
+    solver:
     - gpt-5.4-medium
+    - gemini-3-flash-preview
+    reviewer:
+    - gemini-3.1-pro-preview-thinking
     - gemini-3-flash-preview
     formatter: []

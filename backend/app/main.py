@@ -8,6 +8,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from contextlib import asynccontextmanager
 import uuid
@@ -275,7 +276,13 @@ async def run_agent_workflow_async(
                 history_data.pop("failed_node", None)
             task_record.history = json.dumps(history_data, ensure_ascii=False)
 
-            task_record.final_result = final_state.get("final_result")
+            final_result = final_state.get("final_result")
+            task_record.final_result = final_result
+            question_part, answer_part, _ = split_question_and_answer(
+                final_result or ""
+            )
+            task_record.question_preview = question_part or None
+            task_record.answer_preview = answer_part or None
             task_record.token_usage = json.dumps(
                 {"total_tokens": coerce_token_count(final_state.get("total_tokens"), 0)}
             )
@@ -311,6 +318,7 @@ async def run_agent_workflow_async(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    ensure_task_preview_columns()
     yield
 
 
@@ -804,20 +812,18 @@ def split_question_and_answer(final_result: str) -> tuple[str, str, bool]:
     return question_part, answer_part, False
 
 
-def build_split_export_markdown(items: list[tuple[str, str]]) -> str:
-    split_items = []
-    for task_id, final_result in items:
-        question_part, answer_part, only_question = split_question_and_answer(
-            final_result
-        )
-        split_items.append(
-            {
-                "task_id": task_id,
-                "question": question_part,
-                "answer": answer_part,
-                "only_question": only_question,
-            }
-        )
+def build_split_export_markdown(
+    items: list[tuple[str, str, str, bool]],
+) -> str:
+    split_items = [
+        {
+            "task_id": task_id,
+            "question": question_part,
+            "answer": answer_part,
+            "only_question": only_question,
+        }
+        for task_id, question_part, answer_part, only_question in items
+    ]
 
     lines: list[str] = ["# 题目", ""]
     for item in split_items:
@@ -837,18 +843,32 @@ def build_split_export_markdown(items: list[tuple[str, str]]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def collect_export_items(task_ids: list[str], db: Session) -> list[tuple[str, str]]:
+def collect_export_items(
+    task_ids: list[str], db: Session
+) -> list[tuple[str, str, str, bool]]:
     tasks = db.query(Task).filter(Task.task_id.in_(task_ids)).all()
     task_map = {task.task_id: task for task in tasks}
 
-    items_with_result: list[tuple[str, str]] = []
+    items_with_result: list[tuple[str, str, str, bool]] = []
     for task_id in task_ids:
         task = task_map.get(task_id)
         if not task:
             continue
-        final_result = (task.final_result or "").strip()
-        if final_result:
-            items_with_result.append((task_id, final_result))
+        question_part = (task.question_preview or "").strip()
+        answer_part = (task.answer_preview or "").strip()
+
+        # 兼容旧数据：若历史任务未持久化拆分字段，则回退到 final_result 现场切分。
+        if not question_part and not answer_part:
+            final_result = (task.final_result or "").strip()
+            if not final_result:
+                continue
+            question_part, answer_part, only_question = split_question_and_answer(
+                final_result
+            )
+        else:
+            only_question = not bool(answer_part)
+
+        items_with_result.append((task_id, question_part, answer_part, only_question))
     return items_with_result
 
 
@@ -972,6 +992,13 @@ def admin_update_task(
         else:
             setattr(task, field_name, value)
 
+    if "final_result" in updates:
+        question_part, answer_part, _ = split_question_and_answer(
+            updates.get("final_result") or ""
+        )
+        task.question_preview = question_part or None
+        task.answer_preview = answer_part or None
+
     db.commit()
     db.refresh(task)
     return AdminTaskUpdateResponse(message="Task updated successfully.", task=task)
@@ -989,6 +1016,22 @@ def admin_delete_task(task_id: str, db: Session = Depends(get_db)):
     db.delete(task)
     db.commit()
     return {"status": "success", "message": f"Task {task_id} deleted."}
+
+
+def ensure_task_preview_columns() -> None:
+    """为已有 SQLite 数据库补齐新列，避免老库缺列导致查询失败。"""
+    try:
+        with engine.begin() as conn:
+            columns = {
+                row[1]
+                for row in conn.execute(text("PRAGMA table_info(tasks)")).fetchall()
+            }
+            if "question_preview" not in columns:
+                conn.execute(text("ALTER TABLE tasks ADD COLUMN question_preview TEXT"))
+            if "answer_preview" not in columns:
+                conn.execute(text("ALTER TABLE tasks ADD COLUMN answer_preview TEXT"))
+    except Exception as exc:
+        print(f"[DB] Failed to ensure preview columns: {exc}")
 
 
 @app.get("/api/admin/logs", response_model=AdminLogListResponse)

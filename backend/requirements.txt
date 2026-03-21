@@ -1,7 +1,8 @@
 fastapi==0.109.2
 uvicorn==0.27.1
 sqlalchemy==2.0.25
-pydantic==2.6.1
+pydantic>=2.8.2
+python-dotenv
 httpx==0.26.0
 langgraph
 langchain-core

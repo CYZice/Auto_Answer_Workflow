@@ -176,6 +176,26 @@ def normalize_target_nodes(raw_nodes) -> list[str]:
     return normalized
 
 
+def normalize_image_urls(
+    raw_image_urls, fallback_image_url: str | None = None
+) -> list[str]:
+    normalized: list[str] = []
+
+    if isinstance(raw_image_urls, list):
+        for raw_url in raw_image_urls:
+            if isinstance(raw_url, str):
+                cleaned = raw_url.strip()
+                if cleaned and cleaned not in normalized:
+                    normalized.append(cleaned)
+
+    if isinstance(fallback_image_url, str):
+        cleaned = fallback_image_url.strip()
+        if cleaned and cleaned not in normalized:
+            normalized.append(cleaned)
+
+    return normalized
+
+
 def validate_contiguous_nodes(nodes: list[str]) -> bool:
     if not nodes:
         return False
@@ -253,9 +273,14 @@ async def run_agent_workflow_async(
             except ValueError:
                 effective_target_nodes = []
 
+        effective_image_urls = normalize_image_urls(
+            history_data.get("image_urls"), task_record.image_url
+        )
+
         initial_state = {
             "task_id": task_record.task_id,
-            "image_url": task_record.image_url,
+            "image_url": effective_image_urls[0] if effective_image_urls else "",
+            "image_urls": effective_image_urls,
             "status": task_record.state,
             "retry_count": task_record.retry_count,
             "draft_solution": history_data.get("draft_solution"),
@@ -331,6 +356,12 @@ async def run_agent_workflow_async(
                 history_data["workflow_template_id"] = final_state.get(
                     "workflow_template_id"
                 )
+            final_image_urls = normalize_image_urls(
+                final_state.get("image_urls"), task_record.image_url
+            )
+            if final_image_urls:
+                history_data["image_urls"] = final_image_urls
+                task_record.image_url = final_image_urls[0]
             if effective_target_nodes:
                 history_data["target_nodes"] = effective_target_nodes
             else:
@@ -476,6 +507,12 @@ async def create_task(
         workflow_template_id = req.workflow_template_id or runtime_settings.get(
             "active_template_id"
         )
+        normalized_image_urls = normalize_image_urls(req.image_urls, req.image_url)
+        if not normalized_image_urls:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="image_url 或 image_urls 至少提供一个有效值。",
+            )
         resume_node = req.entry_point or "solver"
         normalized_nodes = normalize_target_nodes(req.target_nodes)
 
@@ -516,10 +553,11 @@ async def create_task(
         new_task = Task(
             task_id=new_task_id,
             thread_id=new_thread_id,
-            image_url=req.image_url,
+            image_url=normalized_image_urls[0],
             state=TaskStatus.QUEUED.value,
             history=json.dumps(
                 {
+                    "image_urls": normalized_image_urls,
                     "solver_config": (
                         req.solver_config.model_dump() if req.solver_config else {}
                     ),
@@ -554,6 +592,8 @@ async def create_task(
         return TaskCreateResponse(
             task_id=new_task.task_id, status=TaskStatus(new_task.state)
         )
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         import traceback
@@ -579,7 +619,7 @@ async def get_logs(task_id: str = None, db: Session = Depends(get_db)):
     return logs
 
 
-@app.get("/api/tasks/{task_id}")
+@app.get("/api/tasks/{task_id}", response_model=TaskDetailResponse)
 def get_task(task_id: str, db: Session = Depends(get_db)):
     """
     根据 task_id 获取任务的完整详情

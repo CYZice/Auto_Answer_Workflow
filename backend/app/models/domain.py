@@ -1,6 +1,7 @@
 from sqlalchemy import Column, String, Integer, DateTime, Text
 from sqlalchemy.sql import func
 from app.core.database import Base
+import json
 
 
 class Task(Base):
@@ -55,6 +56,28 @@ class Task(Base):
     manual_updated_at = Column(
         DateTime(timezone=True), nullable=True, doc="人工提交时间（如有）"
     )
+
+    @property
+    def image_urls(self) -> list[str]:
+        urls: list[str] = []
+        try:
+            history_data = json.loads(self.history) if self.history else {}
+            raw_urls = (
+                history_data.get("image_urls") if isinstance(history_data, dict) else []
+            )
+            if isinstance(raw_urls, list):
+                for raw_url in raw_urls:
+                    if isinstance(raw_url, str):
+                        cleaned = raw_url.strip()
+                        if cleaned and cleaned not in urls:
+                            urls.append(cleaned)
+        except Exception:
+            pass
+
+        fallback = (self.image_url or "").strip()
+        if not urls and fallback:
+            urls.append(fallback)
+        return urls
 
 
 class AgentLog(Base):

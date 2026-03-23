@@ -9,6 +9,7 @@ class AgentState(TypedDict):
 
     task_id: str
     image_url: str
+    image_urls: list[str]
 
     # 当前流程的内部状态
     status: Literal[

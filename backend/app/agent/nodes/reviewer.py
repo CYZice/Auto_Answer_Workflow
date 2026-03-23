@@ -185,14 +185,17 @@ async def review_node(state: AgentState) -> AgentState:
             {"draft_solution": draft},
         )
 
+        image_urls = state.get("image_urls") or []
+        if not image_urls and state.get("image_url"):
+            image_urls = [state.get("image_url")]
+
+        human_content = [{"type": "text", "text": text_prompt}]
+        for image_url in image_urls:
+            human_content.append({"type": "image_url", "image_url": {"url": image_url}})
+
         messages = [
             SystemMessage(content=sys_prompt),
-            HumanMessage(
-                content=[
-                    {"type": "text", "text": text_prompt},
-                    {"type": "image_url", "image_url": {"url": state.get("image_url")}},
-                ]
-            ),
+            HumanMessage(content=human_content),
         ]
 
         fallback_models = resolve_fallback_models("reviewer", reviewer_runtime_config)

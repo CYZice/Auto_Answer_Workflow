@@ -269,7 +269,7 @@ async def call_with_retry_and_fallback(
 
 
 async def solve_image(
-    image_url: str,
+    image_urls: List[str],
     review_feedback: Optional[str] = None,
     model_config: Optional[dict] = None,
     workflow_template_id: Optional[str] = None,
@@ -295,14 +295,13 @@ async def solve_image(
             f"\n\n【注意】之前的解答有以下问题，请在此次解答中修复：\n{review_feedback}"
         )
 
+    human_content = [{"type": "text", "text": text_prompt}]
+    for image_url in image_urls:
+        human_content.append({"type": "image_url", "image_url": {"url": image_url}})
+
     messages = [
         SystemMessage(content=sys_prompt),
-        HumanMessage(
-            content=[
-                {"type": "text", "text": text_prompt},
-                {"type": "image_url", "image_url": {"url": image_url}},
-            ]
-        ),
+        HumanMessage(content=human_content),
     ]
 
     # 调用模型
@@ -341,7 +340,7 @@ async def solve_image(
 
 async def format_solution(
     draft_solution: str,
-    image_url: Optional[str] = None,
+    image_urls: Optional[List[str]] = None,
     model_config: Optional[dict] = None,
     workflow_template_id: Optional[str] = None,
     task_id: str = None,
@@ -361,11 +360,10 @@ async def format_solution(
         {"draft_solution": draft_solution},
     )
 
-    if image_url:
-        human_content = [
-            {"type": "text", "text": user_prompt},
-            {"type": "image_url", "image_url": {"url": image_url}},
-        ]
+    if image_urls:
+        human_content = [{"type": "text", "text": user_prompt}]
+        for image_url in image_urls:
+            human_content.append({"type": "image_url", "image_url": {"url": image_url}})
     else:
         human_content = user_prompt
 

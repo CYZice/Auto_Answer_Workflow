@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Optional, List, Literal, Dict, Any
 from enum import Enum
 from datetime import datetime
@@ -37,7 +37,12 @@ class ModelConfig(BaseModel):
 
 
 class TaskCreateRequest(BaseModel):
-    image_url: str = Field(..., description="题目图片本地存储路径或云端链接")
+    image_url: Optional[str] = Field(
+        default=None, description="题目图片本地存储路径或云端链接（兼容旧字段）"
+    )
+    image_urls: Optional[List[str]] = Field(
+        default=None, description="题目图片列表（单题多图）"
+    )
     solver_config: Optional[ModelConfig] = Field(
         default=None, description="Solver(解题)节点的大模型配置"
     )
@@ -59,6 +64,17 @@ class TaskCreateRequest(BaseModel):
     draft_solution: Optional[str] = Field(
         default=None, description="当跳过Solver时，初始注入的草稿内容"
     )
+
+    @model_validator(mode="after")
+    def validate_images(self):
+        has_single = bool((self.image_url or "").strip())
+        has_multi = bool(
+            isinstance(self.image_urls, list)
+            and any(isinstance(item, str) and item.strip() for item in self.image_urls)
+        )
+        if not has_single and not has_multi:
+            raise ValueError("image_url 或 image_urls 至少提供一个。")
+        return self
 
 
 class TaskCreateResponse(BaseModel):
@@ -146,6 +162,7 @@ class TaskDetailResponse(BaseModel):
     task_id: str
     thread_id: str
     image_url: str
+    image_urls: List[str] = Field(default_factory=list)
     state: TaskStatus
     retry_count: int
     history: Optional[str] = None

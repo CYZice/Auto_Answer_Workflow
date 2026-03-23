@@ -35,6 +35,25 @@ const getErrorMessage = (error: unknown, fallback: string) => {
   return fallback
 }
 
+const normalizeImageUrls = (imageUrls?: string[] | null, fallbackImageUrl?: string | null) => {
+  const normalized: string[] = []
+  if (Array.isArray(imageUrls)) {
+    imageUrls.forEach((imageUrl) => {
+      if (typeof imageUrl !== 'string') return
+      const cleaned = imageUrl.trim()
+      if (!cleaned || normalized.includes(cleaned)) return
+      normalized.push(cleaned)
+    })
+  }
+  if (typeof fallbackImageUrl === 'string') {
+    const cleaned = fallbackImageUrl.trim()
+    if (cleaned && !normalized.includes(cleaned)) {
+      normalized.push(cleaned)
+    }
+  }
+  return normalized
+}
+
 // --- Types ---
 interface SubmittedTask {
   taskId: string;
@@ -51,6 +70,7 @@ interface AdminTask {
   task_id: string;
   thread_id: string;
   image_url: string;
+  image_urls?: string[];
   state: string;
   retry_count: number;
   history?: string | null;
@@ -197,7 +217,7 @@ const persistTaskForDashboard = (taskId: string) => {
 
 function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
-  const [pendingInputImage, setPendingInputImage] = useState<string | null>(null)
+  const [pendingInputImages, setPendingInputImages] = useState<string[]>([])
   const [inputDraft, setInputDraft] = useState('')
   const [inputSelectedNodes, setInputSelectedNodes] = useState<WorkflowNode[]>([...WORKFLOW_NODE_ORDER])
   const [submittedTasks, setSubmittedTasks] = useState<SubmittedTask[]>(() => {
@@ -442,7 +462,10 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     }
     try {
       const dataUrl = await readImageAsDataUrl(file)
-      setPendingInputImage(dataUrl)
+      setPendingInputImages((prev) => {
+        if (prev.includes(dataUrl)) return prev
+        return [...prev, dataUrl]
+      })
       setErrorMessage(null)
     } catch {
       setErrorMessage('读取本地图片失败，请重试。')
@@ -451,34 +474,36 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
 
   // 处理剪贴板粘贴图片
   const handlePaste = (e: ClipboardEvent<HTMLDivElement>) => {
-    if (pendingInputImage) {
-      setErrorMessage('当前已有待提交题目，请先提交或删除后再粘贴下一题。')
-      return
-    }
     const items = e.clipboardData.items;
+    let hasImage = false
     for (let i = 0; i < items.length; i++) {
       if (items[i].type.indexOf('image') !== -1) {
+        hasImage = true
         const file = items[i].getAsFile();
         if (!file) continue;
         void loadInputImageFile(file)
-        break;
       }
+    }
+    if (!hasImage) {
+      setErrorMessage('剪贴板中未检测到图片。')
     }
   };
 
   const handlePickLocalImage = () => {
-    if (pendingInputImage) {
-      setErrorMessage('当前已有待提交题目，请先提交或删除后再选择下一题。')
-      return
-    }
     fileInputRef.current?.click()
   }
 
   const handleLocalImageChange = (e: ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    void loadInputImageFile(file)
+    const files = Array.from(e.target.files || [])
+    if (files.length === 0) return
+    files.forEach((file) => {
+      void loadInputImageFile(file)
+    })
     e.target.value = ''
+  }
+
+  const removePendingInputImage = (indexToDelete: number) => {
+    setPendingInputImages((prev) => prev.filter((_, index) => index !== indexToDelete))
   }
 
   const toggleInputNodeSelection = (node: WorkflowNode) => {
@@ -493,12 +518,12 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   // 创建任务的 Mutation
   const createMutation = useMutation({
     mutationFn: (payload: {
-      imageUrl: string;
+      imageUrls: string[];
       entryPoint: WorkflowNode;
       targetNodes: WorkflowNode[];
       draftSolution?: string;
     }) => api.post('/api/tasks', {
-      image_url: payload.imageUrl,
+      image_urls: payload.imageUrls,
       solver_config: solverConfig,
       reviewer_config: reviewerConfig,
       formatter_config: formatterConfig,
@@ -515,13 +540,13 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   const inputEntryPoint = orderedInputNodes.length > 0 ? orderedInputNodes[0] : undefined
   const inputNeedsDraft = inputEntryPoint === 'reviewer' || inputEntryPoint === 'formatter'
   const inputDraftValue = inputDraft.trim()
-  const canSubmitInputTask = Boolean(pendingInputImage)
+  const canSubmitInputTask = pendingInputImages.length > 0
     && orderedInputNodes.length > 0
     && inputHasContiguousSelection
     && (!inputNeedsDraft || inputDraftValue.length > 0)
     && !createMutation.isPending
-  const inputBlockedReason = !pendingInputImage
-    ? '请先粘贴一张题目图片。'
+  const inputBlockedReason = pendingInputImages.length === 0
+    ? '请先添加至少一张题目图片。'
     : (orderedInputNodes.length === 0
       ? '请至少选择一个工作流节点。'
       : (!inputHasContiguousSelection
@@ -645,12 +670,12 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
 
   // 处理“提交本题”逻辑
   const handleSubmitCurrentTask = async () => {
-    if (!canSubmitInputTask || !pendingInputImage || !inputEntryPoint) return;
+    if (!canSubmitInputTask || pendingInputImages.length === 0 || !inputEntryPoint) return;
     setErrorMessage(null);
 
     try {
       const result = await createMutation.mutateAsync({
-        imageUrl: pendingInputImage,
+        imageUrls: pendingInputImages,
         entryPoint: inputEntryPoint,
         targetNodes: orderedInputNodes,
         draftSolution: inputNeedsDraft ? inputDraftValue : undefined,
@@ -661,7 +686,7 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           : [...prev, { taskId: result.task_id }]
       ));
       setActiveTaskId(result.task_id);
-      setPendingInputImage(null);
+      setPendingInputImages([]);
       setInputDraft('');
       setInputSelectedNodes([...WORKFLOW_NODE_ORDER]);
     } catch (error: unknown) {
@@ -735,6 +760,7 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           ref={fileInputRef}
           type="file"
           accept="image/*"
+          multiple
           className="hidden"
           onChange={handleLocalImageChange}
         />
@@ -746,9 +772,8 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           <div className="flex items-center gap-2">
             <button
               onClick={handlePickLocalImage}
-              disabled={!!pendingInputImage}
               className="flex items-center gap-2 bg-white text-blue-700 border border-blue-200 px-4 py-2 rounded-lg font-medium disabled:opacity-50 hover:bg-blue-50 transition-colors"
-              title={pendingInputImage ? '当前已有待提交题目' : '从本地选择图片'}
+              title="从本地选择一张或多张图片"
             >
               <Plus size={18} />
               本地选图
@@ -765,26 +790,40 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           </div>
         </div>
 
-        {pendingInputImage ? (
+        {pendingInputImages.length > 0 ? (
           <div className="space-y-4">
-            <div className="relative group border rounded-lg overflow-hidden bg-gray-50 h-48 flex items-center justify-center">
-              <img src={pendingInputImage} alt="pending" className="max-h-full object-contain" />
-              <div className="absolute inset-0 bg-black/30 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-2">
-                <button onClick={() => setPreviewImage(pendingInputImage)} className="p-2 bg-white rounded-full text-gray-700 hover:text-blue-600" title="预览">
-                  <Maximize2 size={18} />
-                </button>
-                <button
-                  onClick={() => {
-                    setPendingInputImage(null)
-                    setInputDraft('')
-                    setInputSelectedNodes([...WORKFLOW_NODE_ORDER])
-                  }}
-                  className="p-2 bg-white rounded-full text-gray-700 hover:text-red-600"
-                  title="删除当前题目"
-                >
-                  <Trash2 size={18} />
-                </button>
-              </div>
+            <div className="flex items-center justify-between text-xs text-gray-600">
+              <span>当前题目已添加 {pendingInputImages.length} 张图片</span>
+              <button
+                onClick={() => {
+                  setPendingInputImages([])
+                  setInputDraft('')
+                  setInputSelectedNodes([...WORKFLOW_NODE_ORDER])
+                }}
+                className="text-red-600 hover:text-red-700"
+              >
+                清空本题图片
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+              {pendingInputImages.map((imageUrl, index) => (
+                <div key={`${imageUrl.slice(0, 24)}-${index}`} className="relative group border rounded-lg overflow-hidden bg-gray-50 h-36 flex items-center justify-center">
+                  <img src={imageUrl} alt={`pending-${index + 1}`} className="max-h-full object-contain" />
+                  <div className="absolute inset-0 bg-black/30 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-2">
+                    <button onClick={() => setPreviewImage(imageUrl)} className="p-2 bg-white rounded-full text-gray-700 hover:text-blue-600" title="预览">
+                      <Maximize2 size={18} />
+                    </button>
+                    <button
+                      onClick={() => removePendingInputImage(index)}
+                      className="p-2 bg-white rounded-full text-gray-700 hover:text-red-600"
+                      title="删除这张图"
+                    >
+                      <Trash2 size={18} />
+                    </button>
+                  </div>
+                </div>
+              ))}
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
@@ -831,8 +870,8 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         ) : (
           <div className="h-36 border-2 border-dashed border-gray-300 rounded-lg flex flex-col items-center justify-center text-gray-400 bg-gray-50">
             <Plus size={24} className="mb-2" />
-            <span className="text-sm">支持 Ctrl+V 粘贴，或点击上方“本地选图”上传题目截图</span>
-            <span className="text-xs mt-1">一次只录入一题，提交后再开始下一题</span>
+            <span className="text-sm">支持 Ctrl+V 粘贴，或点击上方“本地选图”上传一张或多张题目截图</span>
+            <span className="text-xs mt-1">一次只录入一题，可包含多张图片，提交后再开始下一题</span>
           </div>
         )}
       </div>
@@ -1323,6 +1362,7 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
   }
 
   const isTerminalState = ['completed', 'failed', 'manual', 'cancelled'].includes(task.state)
+  const taskImageUrls = normalizeImageUrls(task.image_urls, task.image_url)
   const historyDraftSolution = typeof history.draft_solution === 'string' ? history.draft_solution : ''
   const historyReviewFeedback = typeof history.review_feedback === 'string' ? history.review_feedback : ''
   const totalTokens = typeof tokens.total_tokens === 'number' ? tokens.total_tokens : 0
@@ -1349,11 +1389,26 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
           <div><strong>Total Tokens:</strong> {totalTokens}</div>
         </div>
 
-        <div className="relative border rounded bg-gray-50 p-2 h-64 flex items-center justify-center group overflow-hidden cursor-pointer" onClick={() => onPreview(task.image_url)}>
-          <img src={task.image_url} alt="Task target" className="max-h-full object-contain" />
-          <div className="absolute inset-0 bg-black/10 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-            <Maximize2 className="text-gray-700 bg-white/80 p-2 rounded-full w-10 h-10 shadow-sm" />
-          </div>
+        <div className="grid grid-cols-2 gap-3">
+          {taskImageUrls.map((imageUrl, index) => (
+            <div
+              key={`${task.task_id}-image-${index}`}
+              className="relative border rounded bg-gray-50 p-2 h-48 flex items-center justify-center group overflow-hidden cursor-pointer"
+              onClick={() => onPreview(imageUrl)}
+            >
+              <img src={imageUrl} alt={`Task target ${index + 1}`} className="max-h-full object-contain" />
+              <div className="absolute inset-0 bg-black/10 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                <Maximize2 className="text-gray-700 bg-white/80 p-2 rounded-full w-10 h-10 shadow-sm" />
+              </div>
+            </div>
+          ))}
+          {taskImageUrls.length === 0 && (
+            <div className="col-span-2 text-sm text-gray-500 border rounded p-4 bg-gray-50">无题目图片</div>
+          )}
+        </div>
+
+        <div className="text-xs text-gray-500">
+          图片数量: {taskImageUrls.length}
         </div>
 
         {shouldShowTaskError && (
@@ -2224,7 +2279,11 @@ function AdminPanel({
 
               <div className="space-y-2">
                 <label className="text-sm font-medium text-gray-700">image_url</label>
-                <img src={selectedTask.image_url} alt="task" className="max-h-60 border rounded bg-gray-50 object-contain" />
+                <div className="grid grid-cols-2 gap-3">
+                  {normalizeImageUrls(selectedTask.image_urls, selectedTask.image_url).map((imageUrl, index) => (
+                    <img key={`admin-task-image-${index}`} src={imageUrl} alt={`task-${index + 1}`} className="max-h-60 border rounded bg-gray-50 object-contain" />
+                  ))}
+                </div>
               </div>
 
               <div className="space-y-2">

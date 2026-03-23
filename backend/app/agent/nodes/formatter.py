@@ -48,7 +48,9 @@ async def format_node(state: AgentState) -> AgentState:
 
     agent_configs = state.get("agent_configs") or {}
     formatter_config = agent_configs.get("formatter") or {}
-    image_url = state.get("image_url")
+    image_urls = state.get("image_urls") or []
+    if not image_urls and state.get("image_url"):
+        image_urls = [state.get("image_url")]
     workflow_template_id = state.get("workflow_template_id")
 
     try:
@@ -56,7 +58,7 @@ async def format_node(state: AgentState) -> AgentState:
         print(f"  -> Calling LLM (Formatter)...")
         result = await format_solution(
             draft_solution,
-            image_url=image_url,
+            image_urls=image_urls,
             model_config=formatter_config,
             workflow_template_id=workflow_template_id,
             task_id=state.get("task_id"),

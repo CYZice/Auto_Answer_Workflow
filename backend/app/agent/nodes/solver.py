@@ -37,26 +37,28 @@ async def solve_node(state: AgentState) -> AgentState:
         }
 
     # 获取输入参数
-    image_url = state.get("image_url")
+    image_urls = state.get("image_urls") or []
+    if not image_urls and state.get("image_url"):
+        image_urls = [state.get("image_url")]
     review_feedback = state.get("review_feedback")
     agent_configs = state.get("agent_configs") or {}
     solver_config = agent_configs.get("solver") or {}
     workflow_template_id = state.get("workflow_template_id")
 
     # 防御性编程：如果没有图片地址，直接失败
-    if not image_url:
+    if not image_urls:
         return {
             **state,
             "status": "failed",
             "failed_node": "solver",
-            "error_msg": "Missing image_url in state.",
+            "error_msg": "Missing image_urls in state.",
         }
 
     try:
         # 调用大模型解题
         print(f"  -> Calling LLM (Solver)...")
         result = await solve_image(
-            image_url,
+            image_urls,
             review_feedback,
             solver_config,
             workflow_template_id,

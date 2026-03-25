@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 # 加载 .env 环境变量
 load_dotenv()
 
-from app.core.database import engine, Base, get_db
+from app.core.database import engine, Base, get_db, SessionLocal
 from app.models.domain import Task, AgentLog
 from app.models.schemas import (
     TaskCreateRequest,
@@ -205,7 +205,6 @@ def validate_contiguous_nodes(nodes: list[str]) -> bool:
 
 async def run_agent_workflow_async(
     task_id: str,
-    db: Session,
     start_node: str = "solver",
     target_nodes: list[str] | None = None,
 ):
@@ -216,81 +215,84 @@ async def run_agent_workflow_async(
     async with task_semaphore:
         print(f"[{task_id}] Acquired semaphore. Starting workflow...")
 
-        # 1. 查询数据库获取任务初始信息
-        task_record = db.query(Task).filter(Task.task_id == task_id).first()
-        if not task_record:
-            print(f"[{task_id}] Error: Task not found in DB.")
-            return
+        # 1. 查询数据库获取任务初始信息；使用短生命周期会话，避免连接长时间占用
+        with SessionLocal() as db:
+            task_record = db.query(Task).filter(Task.task_id == task_id).first()
+            if not task_record:
+                print(f"[{task_id}] Error: Task not found in DB.")
+                return
 
-        # 2. 构造图引擎的初始状态
-        # 尝试从 history 中提取动态模型配置和可恢复数据
-        agent_configs = {}
-        history_data = {}
-        try:
-            if task_record.history:
-                history_data = json.loads(task_record.history)
-                agent_configs = {
-                    "solver": history_data.get("solver_config", {}),
-                    "reviewer": history_data.get("reviewer_config", {}),
-                    "formatter": history_data.get("formatter_config", {}),
-                }
-        except Exception:
+            # 2. 构造图引擎的初始状态
+            # 尝试从 history 中提取动态模型配置和可恢复数据
+            agent_configs = {}
             history_data = {}
-
-        runtime_settings = read_runtime_settings()
-        workflow_template_id = history_data.get(
-            "workflow_template_id"
-        ) or runtime_settings.get("active_template_id")
-
-        token_usage = {}
-        try:
-            token_usage = (
-                json.loads(task_record.token_usage) if task_record.token_usage else {}
-            )
-        except Exception:
-            token_usage = {}
-
-        if start_node not in VALID_RESUME_NODES:
-            start_node = "solver"
-        effective_target_nodes = normalize_target_nodes(
-            target_nodes
-            if target_nodes is not None
-            else history_data.get("target_nodes")
-        )
-        if start_node in {"reviewer", "formatter"} and not history_data.get(
-            "draft_solution"
-        ):
-            start_node = "solver"
-
-        if effective_target_nodes:
             try:
-                start_index = WORKFLOW_ORDER.index(start_node)
-                effective_target_nodes = [
-                    node
-                    for node in effective_target_nodes
-                    if WORKFLOW_ORDER.index(node) >= start_index
-                ]
-            except ValueError:
-                effective_target_nodes = []
+                if task_record.history:
+                    history_data = json.loads(task_record.history)
+                    agent_configs = {
+                        "solver": history_data.get("solver_config", {}),
+                        "reviewer": history_data.get("reviewer_config", {}),
+                        "formatter": history_data.get("formatter_config", {}),
+                    }
+            except Exception:
+                history_data = {}
 
-        effective_image_urls = normalize_image_urls(
-            history_data.get("image_urls"), task_record.image_url
-        )
+            runtime_settings = read_runtime_settings()
+            workflow_template_id = history_data.get(
+                "workflow_template_id"
+            ) or runtime_settings.get("active_template_id")
 
-        initial_state = {
-            "task_id": task_record.task_id,
-            "image_url": effective_image_urls[0] if effective_image_urls else "",
-            "image_urls": effective_image_urls,
-            "status": task_record.state,
-            "retry_count": task_record.retry_count,
-            "draft_solution": history_data.get("draft_solution"),
-            "review_decision": history_data.get("review_decision"),
-            "review_feedback": history_data.get("review_feedback"),
-            "total_tokens": coerce_token_count(token_usage.get("total_tokens"), 0),
-            "agent_configs": agent_configs,
-            "target_nodes": effective_target_nodes,
-            "workflow_template_id": workflow_template_id,
-        }
+            token_usage = {}
+            try:
+                token_usage = (
+                    json.loads(task_record.token_usage)
+                    if task_record.token_usage
+                    else {}
+                )
+            except Exception:
+                token_usage = {}
+
+            if start_node not in VALID_RESUME_NODES:
+                start_node = "solver"
+            effective_target_nodes = normalize_target_nodes(
+                target_nodes
+                if target_nodes is not None
+                else history_data.get("target_nodes")
+            )
+            if start_node in {"reviewer", "formatter"} and not history_data.get(
+                "draft_solution"
+            ):
+                start_node = "solver"
+
+            if effective_target_nodes:
+                try:
+                    start_index = WORKFLOW_ORDER.index(start_node)
+                    effective_target_nodes = [
+                        node
+                        for node in effective_target_nodes
+                        if WORKFLOW_ORDER.index(node) >= start_index
+                    ]
+                except ValueError:
+                    effective_target_nodes = []
+
+            effective_image_urls = normalize_image_urls(
+                history_data.get("image_urls"), task_record.image_url
+            )
+
+            initial_state = {
+                "task_id": task_record.task_id,
+                "image_url": effective_image_urls[0] if effective_image_urls else "",
+                "image_urls": effective_image_urls,
+                "status": task_record.state,
+                "retry_count": task_record.retry_count,
+                "draft_solution": history_data.get("draft_solution"),
+                "review_decision": history_data.get("review_decision"),
+                "review_feedback": history_data.get("review_feedback"),
+                "total_tokens": coerce_token_count(token_usage.get("total_tokens"), 0),
+                "agent_configs": agent_configs,
+                "target_nodes": effective_target_nodes,
+                "workflow_template_id": workflow_template_id,
+            }
         graph_app = graph_apps[start_node]
 
         # 3. 运行图引擎
@@ -317,109 +319,116 @@ async def run_agent_workflow_async(
             final_state = state_tuple.values
             task_events.close(task_id)
 
-            # 4. 工作流结束，将最终状态落库
-            # 必须重新获取 session 里的 task_record，防止多线程下 session 过期或 detached
-            task_record = db.query(Task).filter(Task.task_id == task_id).first()
-            if not task_record:
-                return
-            previous_state = task_record.state
-            final_status = final_state.get("status", "failed")
-            if final_status in {
-                TaskStatus.QUEUED.value,
-                TaskStatus.SOLVING.value,
-                TaskStatus.REVIEWING.value,
-                TaskStatus.FORMATTING.value,
-            }:
-                final_status = TaskStatus.COMPLETED.value
+            # 4. 工作流结束，将最终状态落库；使用新的短生命周期会话
+            with SessionLocal() as db:
+                task_record = db.query(Task).filter(Task.task_id == task_id).first()
+                if not task_record:
+                    return
+                previous_state = task_record.state
+                final_status = final_state.get("status", "failed")
+                if final_status in {
+                    TaskStatus.QUEUED.value,
+                    TaskStatus.SOLVING.value,
+                    TaskStatus.REVIEWING.value,
+                    TaskStatus.FORMATTING.value,
+                }:
+                    final_status = TaskStatus.COMPLETED.value
 
-            # 如果在执行期间被标记为 cancelled，保持 cancelled 状态
-            if task_record.state != TaskStatus.CANCELLED.value:
-                task_record.state = final_status
+                # 如果在执行期间被标记为 cancelled，保持 cancelled 状态
+                if task_record.state != TaskStatus.CANCELLED.value:
+                    task_record.state = final_status
 
-            task_record.retry_count = final_state.get("retry_count", 0)
+                task_record.retry_count = final_state.get("retry_count", 0)
 
-            # 提取可能存在的历史记录或草稿并合并
-            try:
-                history_data = (
-                    json.loads(task_record.history) if task_record.history else {}
-                )
-            except Exception:
-                history_data = {}
-
-            if final_state.get("draft_solution") is not None:
-                history_data["draft_solution"] = final_state.get("draft_solution")
-            if final_state.get("review_decision") is not None:
-                history_data["review_decision"] = final_state.get("review_decision")
-            if final_state.get("review_feedback") is not None:
-                history_data["review_feedback"] = final_state.get("review_feedback")
-            if final_state.get("workflow_template_id") is not None:
-                history_data["workflow_template_id"] = final_state.get(
-                    "workflow_template_id"
-                )
-            final_image_urls = normalize_image_urls(
-                final_state.get("image_urls"), task_record.image_url
-            )
-            if final_image_urls:
-                history_data["image_urls"] = final_image_urls
-                task_record.image_url = final_image_urls[0]
-            if effective_target_nodes:
-                history_data["target_nodes"] = effective_target_nodes
-            else:
-                history_data.pop("target_nodes", None)
-
-            failed_node = final_state.get("failed_node")
-            if (
-                not failed_node
-                and final_status == TaskStatus.FAILED.value
-                and previous_state in VALID_RESUME_NODES
-            ):
-                failed_node = previous_state
-            if (
-                final_status == TaskStatus.FAILED.value
-                and failed_node in VALID_RESUME_NODES
-            ):
-                history_data["failed_node"] = failed_node
-            else:
-                history_data.pop("failed_node", None)
-            task_record.history = json.dumps(history_data, ensure_ascii=False)
-
-            final_result = final_state.get("final_result")
-            task_record.final_result = final_result
-            question_part, answer_part, _ = split_question_and_answer(
-                final_result or ""
-            )
-            task_record.question_preview = question_part or None
-            task_record.answer_preview = answer_part or None
-            task_record.token_usage = json.dumps(
-                {"total_tokens": coerce_token_count(final_state.get("total_tokens"), 0)}
-            )
-            task_record.error_code = final_state.get("error_msg")
-
-            db.commit()
-            print(f"[{task_id}] Workflow finished with status: {task_record.state}")
-
-        except Exception as e:
-            # 异常时进行防断保护
-            print(f"[{task_id}] Workflow crashed: {e}")
-            task_events.close(task_id)
-            task_record = db.query(Task).filter(Task.task_id == task_id).first()
-            if task_record:
-                failed_node = (
-                    task_record.state
-                    if task_record.state in VALID_RESUME_NODES
-                    else "solver"
-                )
+                # 提取可能存在的历史记录或草稿并合并
                 try:
                     history_data = (
                         json.loads(task_record.history) if task_record.history else {}
                     )
                 except Exception:
                     history_data = {}
-                history_data["failed_node"] = failed_node
+
+                if final_state.get("draft_solution") is not None:
+                    history_data["draft_solution"] = final_state.get("draft_solution")
+                if final_state.get("review_decision") is not None:
+                    history_data["review_decision"] = final_state.get("review_decision")
+                if final_state.get("review_feedback") is not None:
+                    history_data["review_feedback"] = final_state.get("review_feedback")
+                if final_state.get("workflow_template_id") is not None:
+                    history_data["workflow_template_id"] = final_state.get(
+                        "workflow_template_id"
+                    )
+                final_image_urls = normalize_image_urls(
+                    final_state.get("image_urls"), task_record.image_url
+                )
+                if final_image_urls:
+                    history_data["image_urls"] = final_image_urls
+                    task_record.image_url = final_image_urls[0]
+                if effective_target_nodes:
+                    history_data["target_nodes"] = effective_target_nodes
+                else:
+                    history_data.pop("target_nodes", None)
+
+                failed_node = final_state.get("failed_node")
+                if (
+                    not failed_node
+                    and final_status == TaskStatus.FAILED.value
+                    and previous_state in VALID_RESUME_NODES
+                ):
+                    failed_node = previous_state
+                if (
+                    final_status == TaskStatus.FAILED.value
+                    and failed_node in VALID_RESUME_NODES
+                ):
+                    history_data["failed_node"] = failed_node
+                else:
+                    history_data.pop("failed_node", None)
                 task_record.history = json.dumps(history_data, ensure_ascii=False)
-                task_record.state = TaskStatus.FAILED.value
-                task_record.error_code = f"System Error: {str(e)}"
+
+                final_result = final_state.get("final_result")
+                task_record.final_result = final_result
+                question_part, answer_part, _ = split_question_and_answer(
+                    final_result or ""
+                )
+                task_record.question_preview = question_part or None
+                task_record.answer_preview = answer_part or None
+                task_record.token_usage = json.dumps(
+                    {
+                        "total_tokens": coerce_token_count(
+                            final_state.get("total_tokens"), 0
+                        )
+                    }
+                )
+                task_record.error_code = final_state.get("error_msg")
+
                 db.commit()
+                print(f"[{task_id}] Workflow finished with status: {task_record.state}")
+
+        except Exception as e:
+            # 异常时进行防断保护
+            print(f"[{task_id}] Workflow crashed: {e}")
+            task_events.close(task_id)
+            with SessionLocal() as db:
+                task_record = db.query(Task).filter(Task.task_id == task_id).first()
+                if task_record:
+                    failed_node = (
+                        task_record.state
+                        if task_record.state in VALID_RESUME_NODES
+                        else "solver"
+                    )
+                    try:
+                        history_data = (
+                            json.loads(task_record.history)
+                            if task_record.history
+                            else {}
+                        )
+                    except Exception:
+                        history_data = {}
+                    history_data["failed_node"] = failed_node
+                    task_record.history = json.dumps(history_data, ensure_ascii=False)
+                    task_record.state = TaskStatus.FAILED.value
+                    task_record.error_code = f"System Error: {str(e)}"
+                    db.commit()
 
 
 @asynccontextmanager
@@ -584,7 +593,6 @@ async def create_task(
         background_tasks.add_task(
             run_agent_workflow_async,
             new_task.task_id,
-            db,
             resume_node,
             target_nodes,
         )
@@ -648,13 +656,14 @@ def list_active_tasks(db: Session = Depends(get_db)):
 
 
 @app.get("/api/tasks/{task_id}/stream")
-async def stream_task(task_id: str, db: Session = Depends(get_db)):
+async def stream_task(task_id: str):
     """
     Returns: Server-Sent Events (SSE)
     Format: data: {"event": "on_chat_model_stream", "chunk": "...", "node": "solver"}
     Description: 包含模型的流式输出（含思考过程）。只负责监听全局总线，不负责执行图。
     """
-    task_record = db.query(Task).filter(Task.task_id == task_id).first()
+    with SessionLocal() as db:
+        task_record = db.query(Task).filter(Task.task_id == task_id).first()
     if not task_record:
         raise HTTPException(status_code=404, detail="Task not found")
 
@@ -810,7 +819,7 @@ def submit_manual_review(
 
     # 重新触发后台工作流
     background_tasks.add_task(
-        run_agent_workflow_async, task.task_id, db, resume_node, target_nodes
+        run_agent_workflow_async, task.task_id, resume_node, target_nodes
     )
 
     return {"status": "success", "message": f"Task resumed from node: {resume_node}."}

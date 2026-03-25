@@ -332,7 +332,9 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       const normalizedTemplates = Array.isArray(templates) ? templates : []
       setTemplateItems(normalizedTemplates)
 
-      const pickedTemplateId = runtime.active_template_id
+      const runtimeTemplateId = (runtime.active_template_id || '').trim()
+      const hasRuntimeTemplate = normalizedTemplates.some((item) => item.template_id === runtimeTemplateId)
+      const pickedTemplateId = (hasRuntimeTemplate ? runtimeTemplateId : '')
         || normalizedTemplates[0]?.template_id
         || 'workflow_a'
       const detail = await api.get<PromptTemplateDetail>(`/api/templates/${pickedTemplateId}`).then((res) => res.data)
@@ -1997,6 +1999,16 @@ function AdminPanel({
     }
   }
 
+  const copyAnswerPreview = async () => {
+    const sanitizedText = (selectedTask?.answer_preview || '').replace(/\$/g, '')
+    try {
+      await navigator.clipboard.writeText(sanitizedText)
+      setOperationMessage('answer_preview 已复制（已移除 $ 符号）')
+    } catch {
+      setOperationMessage('复制失败，请检查浏览器剪贴板权限')
+    }
+  }
+
   return (
     <div className="max-w-7xl mx-auto p-8 space-y-6">
       <header className="border-b pb-4 flex justify-between items-center">
@@ -2301,12 +2313,30 @@ function AdminPanel({
                   />
                 </div>
                 <div className="space-y-2">
-                  <label className="text-sm font-medium text-gray-700">answer_preview</label>
+                  <div className="flex items-center justify-between">
+                    <label className="text-sm font-medium text-gray-700">answer_preview</label>
+                    <button
+                      type="button"
+                      onClick={() => void copyAnswerPreview()}
+                      className="text-xs px-2.5 py-1 border rounded hover:bg-gray-50"
+                    >
+                      复制
+                    </button>
+                  </div>
                   <textarea
                     value={selectedTask.answer_preview || ''}
                     readOnly
                     className="w-full min-h-32 border rounded-lg px-3 py-2 text-xs font-mono bg-gray-50"
                   />
+                </div>
+
+                <div className="space-y-1 lg:col-span-2">
+                  <div className="text-xs text-gray-500">Markdown 渲染预览（截图建议使用此区域）</div>
+                  <div className="prose prose-sm max-w-none border rounded-lg p-4 bg-white">
+                    <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
+                      {selectedTask.answer_preview || '暂无 answer_preview 内容'}
+                    </ReactMarkdown>
+                  </div>
                 </div>
               </div>
 

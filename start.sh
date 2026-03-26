@@ -46,9 +46,9 @@ echo -e "${YELLOW}正在检查后端依赖...${NC}"
 pip install -r requirements.txt -q
 
 # 启动后端服务 (后台运行)
-echo -e "${GREEN}启动后端服务 (端口 8000)...${NC}"
+echo -e "${GREEN}启动后端服务 (端口 8080)...${NC}"
 # uvicorn 会继承当前 shell 的 stdout，把它放在后台运行
-uvicorn app.main:app --reload --port 8000 &
+uvicorn app.main:app --reload --port 8080 &
 BACKEND_PID=$!
 # 等待1秒确保后端如果报错能打印出来
 sleep 1
@@ -72,7 +72,7 @@ FRONTEND_PID=$!
 echo -e "\n${GREEN}===========================================${NC}"
 echo -e "${GREEN}  服务已启动！${NC}"
 echo -e "${GREEN}  前端页面: http://localhost:5173${NC}"
-echo -e "${GREEN}  后端 API: http://localhost:8000${NC}"
+echo -e "${GREEN}  后端 API: http://localhost:8080${NC}"
 echo -e "${GREEN}===========================================${NC}"
 echo -e "${YELLOW}按 Ctrl+C 可以同时关闭前端和后端服务${NC}"
 

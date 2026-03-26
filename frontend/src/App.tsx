@@ -10,7 +10,7 @@ import remarkMath from 'remark-math'
 const queryClient = new QueryClient()
 
 const api = axios.create({
-  baseURL: 'http://localhost:8000',
+  baseURL: 'http://localhost:8080',
 })
 
 const RUNNING_TASK_STATES = ['queued', 'solving', 'reviewing', 'formatting']
@@ -1254,7 +1254,7 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
   useEffect(() => {
     if (isTaskEnded) return;
 
-    const sse = new EventSource(`http://localhost:8000/api/tasks/${taskId}/stream`);
+    const sse = new EventSource(`http://localhost:8080/api/tasks/${taskId}/stream`);
 
     sse.onmessage = (e) => {
       try {
@@ -1589,6 +1589,7 @@ function AdminPanel({
   const [hoveredExportId, setHoveredExportId] = useState<string | null>(null)
   const [hoverPreviewPos, setHoverPreviewPos] = useState<{ x: number; y: number } | null>(null)
   const [isExporting, setIsExporting] = useState(false)
+  const [isBatchDeleting, setIsBatchDeleting] = useState(false)
   const [editState, setEditState] = useState('')
   const [editHistory, setEditHistory] = useState('')
   const [editFinalResult, setEditFinalResult] = useState('')
@@ -1812,6 +1813,45 @@ function AdminPanel({
     if (!confirmed) return
     deleteMutation.mutate(taskId)
   }
+
+  const handleBatchDelete = async () => {
+    if (selectedExportIds.length === 0) {
+      setOperationMessage('请先勾选任务')
+      return
+    }
+
+    const confirmed = window.confirm(`确认删除已勾选的 ${selectedExportIds.length} 条任务吗？`)
+    if (!confirmed) return
+
+    setIsBatchDeleting(true)
+    try {
+      const results = await Promise.allSettled(selectedExportIds.map((taskId) => api.delete(`/api/admin/tasks/${taskId}`)))
+      const successCount = results.filter((result) => result.status === 'fulfilled').length
+      const failedCount = results.length - successCount
+
+      if (successCount > 0) {
+        queryClient.invalidateQueries({ queryKey: ['admin-tasks'] })
+        queryClient.invalidateQueries({ queryKey: ['admin-task-detail'] })
+        queryClient.invalidateQueries({ queryKey: ['admin-logs'] })
+
+        setSelectedExportIds((prev) => prev.filter((_, index) => results[index]?.status !== 'fulfilled'))
+        if (selectedTaskId && selectedExportIds.includes(selectedTaskId)) {
+          setSelectedTaskId(null)
+        }
+      }
+
+      if (failedCount === 0) {
+        setOperationMessage(`批量删除成功，共删除 ${successCount} 条`)
+      } else {
+        setOperationMessage(`批量删除完成，成功 ${successCount} 条，失败 ${failedCount} 条`)
+      }
+    } catch (error: unknown) {
+      setOperationMessage(getErrorMessage(error, '批量删除失败'))
+    } finally {
+      setIsBatchDeleting(false)
+    }
+  }
+
   const canRetrySelectedTask = !!selectedTask && ['manual', 'failed'].includes(selectedTask.state)
   const canCustomRunSelectedTask = !!selectedTask && ['manual', 'failed', 'completed', 'cancelled'].includes(selectedTask.state)
 
@@ -2066,6 +2106,14 @@ function AdminPanel({
                   className="text-xs px-2.5 py-1 border rounded hover:bg-gray-50"
                 >
                   全选当前列表
+                </button>
+                <button
+                  onClick={() => void handleBatchDelete()}
+                  disabled={isBatchDeleting || selectedExportIds.length === 0}
+                  className="inline-flex items-center gap-1 text-xs px-2.5 py-1 text-red-600 border border-red-200 rounded disabled:opacity-50 hover:bg-red-50"
+                >
+                  <Trash2 size={12} />
+                  {isBatchDeleting ? '删除中...' : `批量删除(${selectedExportIds.length})`}
                 </button>
                 <div className="flex bg-indigo-600 rounded">
                   <button

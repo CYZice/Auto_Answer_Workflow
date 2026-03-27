@@ -1385,6 +1385,8 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
         if (data.event === 'on_chat_model_stream') {
           setStreamedContent(prev => prev + (data.chunk || ''));
           if (data.node) setCurrentNode(data.node);
+        } else if (data.event === 'node_start') {
+          if (data.node) setCurrentNode(data.node);
         } else if (data.event === 'model_request_start') {
           setModelRequest({
             modelName: data.model_name,

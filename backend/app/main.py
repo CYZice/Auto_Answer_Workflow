@@ -274,17 +274,30 @@ async def run_agent_workflow_async(
         # 3. 运行图引擎
         try:
             config = {"configurable": {"thread_id": task_id}}
+            last_announced_node = None
             async for event in graph_app.astream_events(
                 initial_state, config=config, version="v2"
             ):
+                node = event.get("metadata", {}).get("langgraph_node")
+                if (
+                    node in VALID_RESUME_NODES
+                    and node != last_announced_node
+                ):
+                    task_events.publish(
+                        task_id,
+                        json.dumps(
+                            {"event": "node_start", "node": node},
+                            ensure_ascii=False,
+                        ),
+                    )
+                    last_announced_node = node
                 if event["event"] == "on_chat_model_stream":
                     chunk = event["data"]["chunk"]
-                    node = event.get("metadata", {}).get("langgraph_node", "unknown")
                     data = json.dumps(
                         {
                             "event": "on_chat_model_stream",
                             "chunk": chunk.content,
-                            "node": node,
+                            "node": node or "unknown",
                         },
                         ensure_ascii=False,
                     )

@@ -186,7 +186,7 @@ async def call_with_retry_and_fallback(
             if hasattr(merged_chunk, "to_message"):
                 return merged_chunk.to_message()
             return merged_chunk
-        return await asyncio.wait_for(llm_obj.ainvoke(messages), timeout=timeout)
+        return await llm_obj.ainvoke(messages)
 
     for model_name in models_to_try:
         current_config = dict(model_config) if model_config else {}

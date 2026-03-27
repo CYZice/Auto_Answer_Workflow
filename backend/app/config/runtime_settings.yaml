@@ -1,4 +1,4 @@
-active_template_id: workflow_a
+active_template_id: workflow_b
 fallback:
   global: []
   nodes:

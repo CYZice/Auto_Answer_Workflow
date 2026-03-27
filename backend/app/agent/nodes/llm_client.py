@@ -7,6 +7,7 @@ from typing import Optional, Literal, List, Callable, Any
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from app.core.database import SessionLocal
+from app.core.events import task_events
 from app.models.domain import AgentLog
 from app.models.domain import Task
 from app.services.runtime_config import (
@@ -202,6 +203,18 @@ async def call_with_retry_and_fallback(
                 print(
                     f"  [Retry Wrapper] Calling LLM {model_name} (Attempt {attempt+1}/{max_retries+1})..."
                 )
+                if task_id:
+                    task_events.publish(
+                        task_id,
+                        json.dumps({
+                            "event": "model_request_start",
+                            "model_name": model_name,
+                            "timeout": timeout,
+                            "attempt": attempt + 1,
+                            "max_retries": max_retries
+                        }, ensure_ascii=False)
+                    )
+
                 response = await run_with_task_cancellation(
                     task_id,
                     invoke_llm_with_timeout(llm),

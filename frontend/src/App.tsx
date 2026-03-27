@@ -1201,6 +1201,14 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
   const [selectedNodes, setSelectedNodes] = useState<WorkflowNode[]>([...WORKFLOW_NODE_ORDER])
   const [streamedContent, setStreamedContent] = useState('')
   const [currentNode, setCurrentNode] = useState('')
+  const [modelRequest, setModelRequest] = useState<{
+    modelName: string;
+    timeout: number;
+    attempt: number;
+    maxRetries: number;
+    startTime: number;
+  } | null>(null);
+  const [elapsedTime, setElapsedTime] = useState<number>(0);
 
   type ManualAction = 'resume' | 'skip_review' | 'fail' | 'custom_run'
   type ManualMutationPayload = {
@@ -1226,6 +1234,8 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
     setCurrentNode('');
     setSelectedNodes([...WORKFLOW_NODE_ORDER]);
     setCustomDraftInput('');
+    setModelRequest(null);
+    setElapsedTime(0);
   }, [taskId]);
 
   useEffect(() => {
@@ -1252,6 +1262,16 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
   const isTaskEnded = task?.state === 'completed' || task?.state === 'failed' || task?.state === 'manual' || task?.state === 'cancelled';
 
   useEffect(() => {
+    let interval: ReturnType<typeof setInterval>;
+    if (modelRequest) {
+      interval = setInterval(() => {
+        setElapsedTime(Math.floor((Date.now() - modelRequest.startTime) / 1000));
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [modelRequest]);
+
+  useEffect(() => {
     if (isTaskEnded) return;
 
     const sse = new EventSource(`http://localhost:8080/api/tasks/${taskId}/stream`);
@@ -1262,8 +1282,18 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
         if (data.event === 'on_chat_model_stream') {
           setStreamedContent(prev => prev + (data.chunk || ''));
           if (data.node) setCurrentNode(data.node);
+        } else if (data.event === 'model_request_start') {
+          setModelRequest({
+            modelName: data.model_name,
+            timeout: data.timeout,
+            attempt: data.attempt,
+            maxRetries: data.max_retries,
+            startTime: Date.now()
+          });
+          setElapsedTime(0);
         } else if (data.event === 'end') {
           sse.close(); // 后端主动通知结束，断开连接避免重试
+          setModelRequest(null);
         } else if (data.error) {
           console.error("SSE Error:", data.error);
         }
@@ -1550,7 +1580,15 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
             <div className="flex items-center justify-between shrink-0">
               <div className="flex items-center gap-3">
                 <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-600"></div>
-                <p className="font-medium text-gray-700">Agent is working...</p>
+                <div className="flex flex-col">
+                  <p className="font-medium text-gray-700">Agent is working...</p>
+                  {modelRequest && (
+                    <p className="text-xs text-gray-500 font-mono mt-0.5">
+                      Model: {modelRequest.modelName} ({modelRequest.attempt}/{modelRequest.maxRetries + 1}) |
+                      Time: <span className={elapsedTime > (modelRequest.timeout * 0.8) ? 'text-red-500' : ''}>{elapsedTime}s</span> / {modelRequest.timeout}s
+                    </p>
+                  )}
+                </div>
                 <span className="text-xs px-3 py-1 bg-white border rounded-full shadow-sm text-blue-600 font-mono">
                   {currentNode ? `${task.state} · ${currentNode}` : task.state}
                 </span>

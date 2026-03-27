@@ -66,31 +66,7 @@ MAX_CONCURRENT_TASKS = 5
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 # 全局流式事件总线，用于将后台工作流的流式输出分发给所有 SSE 客户端
-from collections import defaultdict
-
-
-class TaskEventBus:
-    def __init__(self):
-        self.queues = defaultdict(list)
-
-    def subscribe(self, task_id: str) -> asyncio.Queue:
-        q = asyncio.Queue()
-        self.queues[task_id].append(q)
-        return q
-
-    def publish(self, task_id: str, event_data: str):
-        if task_id in self.queues:
-            for q in self.queues[task_id]:
-                q.put_nowait(event_data)
-
-    def close(self, task_id: str):
-        if task_id in self.queues:
-            for q in self.queues[task_id]:
-                q.put_nowait(None)
-            del self.queues[task_id]
-
-
-task_events = TaskEventBus()
+from app.core.events import task_events
 
 VALID_RESUME_NODES = {"solver", "reviewer", "formatter"}
 WORKFLOW_ORDER = ["solver", "reviewer", "formatter"]

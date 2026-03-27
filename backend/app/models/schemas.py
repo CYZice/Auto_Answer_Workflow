@@ -123,11 +123,15 @@ class FallbackConfig(BaseModel):
 class RuntimeSettingsResponse(BaseModel):
     active_template_id: str
     fallback: FallbackConfig
+    request_timeout_seconds: int = Field(default=300, ge=1)
+    max_retries: int = Field(default=2, ge=0)
 
 
 class RuntimeSettingsUpdateRequest(BaseModel):
     active_template_id: Optional[str] = None
     fallback: Optional[FallbackConfig] = None
+    request_timeout_seconds: Optional[int] = Field(default=None, ge=1)
+    max_retries: Optional[int] = Field(default=None, ge=0)
 
 
 class PromptNodeBundle(BaseModel):

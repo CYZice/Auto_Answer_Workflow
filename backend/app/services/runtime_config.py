@@ -12,6 +12,8 @@ PROMPT_TEMPLATES_PATH = CONFIG_DIR / "prompt_templates.yaml"
 
 DEFAULT_RUNTIME_SETTINGS = {
     "active_template_id": "workflow_a",
+    "request_timeout_seconds": 300,
+    "max_retries": 2,
     "fallback": {
         "global": ["gpt-5.4-medium", "gemini-3-flash-preview"],
         "nodes": {
@@ -88,6 +90,16 @@ def normalize_fallback_list(value: Any) -> list[str]:
     return normalized
 
 
+def normalize_positive_int(value: Any, default: int, minimum: int = 0) -> int:
+    try:
+        normalized = int(value)
+    except Exception:
+        return default
+    if normalized < minimum:
+        return default
+    return normalized
+
+
 def read_runtime_settings() -> dict[str, Any]:
     with _LOCK:
         raw = _safe_read_yaml(RUNTIME_SETTINGS_PATH, DEFAULT_RUNTIME_SETTINGS)
@@ -100,9 +112,21 @@ def read_runtime_settings() -> dict[str, Any]:
     fallback_nodes = (
         fallback.get("nodes") if isinstance(fallback.get("nodes"), dict) else {}
     )
+    request_timeout_seconds = normalize_positive_int(
+        raw.get("request_timeout_seconds"),
+        DEFAULT_RUNTIME_SETTINGS["request_timeout_seconds"],
+        minimum=1,
+    )
+    max_retries = normalize_positive_int(
+        raw.get("max_retries"),
+        DEFAULT_RUNTIME_SETTINGS["max_retries"],
+        minimum=0,
+    )
 
     return {
         "active_template_id": active_template_id,
+        "request_timeout_seconds": request_timeout_seconds,
+        "max_retries": max_retries,
         "fallback": {
             "global": fallback_global,
             "nodes": {
@@ -145,9 +169,21 @@ def update_runtime_settings(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(current_fallback.get("nodes"), dict)
         else {}
     )
+    request_timeout_seconds = normalize_positive_int(
+        payload.get("request_timeout_seconds", current.get("request_timeout_seconds")),
+        DEFAULT_RUNTIME_SETTINGS["request_timeout_seconds"],
+        minimum=1,
+    )
+    max_retries = normalize_positive_int(
+        payload.get("max_retries", current.get("max_retries")),
+        DEFAULT_RUNTIME_SETTINGS["max_retries"],
+        minimum=0,
+    )
 
     normalized = {
         "active_template_id": active_template_id,
+        "request_timeout_seconds": request_timeout_seconds,
+        "max_retries": max_retries,
         "fallback": {
             "global": global_models,
             "nodes": {

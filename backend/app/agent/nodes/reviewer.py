@@ -167,7 +167,11 @@ async def review_node(state: AgentState) -> AgentState:
         reviewer_runtime_config["streaming"] = False
         workflow_template_id = state.get("workflow_template_id")
 
-        from app.agent.nodes.llm_client import get_llm, call_with_retry_and_fallback
+        from app.agent.nodes.llm_client import (
+            get_llm,
+            call_with_retry_and_fallback,
+            get_runtime_request_settings,
+        )
 
         def create_structured_llm(config):
             llm = get_llm(config)
@@ -199,13 +203,14 @@ async def review_node(state: AgentState) -> AgentState:
         ]
 
         fallback_models = resolve_fallback_models("reviewer", reviewer_runtime_config)
+        timeout_seconds, max_retries = get_runtime_request_settings()
         structured_result = await call_with_retry_and_fallback(
             create_llm_func=create_structured_llm,
             messages=messages,
             model_config=reviewer_runtime_config,
             fallback_models=fallback_models,
-            timeout=300.0,
-            max_retries=2,
+            timeout=timeout_seconds,
+            max_retries=max_retries,
             task_id=state.get("task_id"),
         )
 

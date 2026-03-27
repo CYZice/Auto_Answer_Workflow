@@ -12,6 +12,7 @@ from app.models.domain import AgentLog
 from app.models.domain import Task
 from app.services.runtime_config import (
     get_prompt_bundle,
+    read_runtime_settings,
     render_user_prompt,
     resolve_fallback_models,
 )
@@ -281,6 +282,20 @@ async def call_with_retry_and_fallback(
     )
 
 
+def get_runtime_request_settings() -> tuple[float, int]:
+    try:
+        settings = read_runtime_settings()
+    except Exception:
+        settings = {}
+    timeout_value = coerce_token_count(settings.get("request_timeout_seconds"), 300)
+    if timeout_value < 1:
+        timeout_value = 300
+    max_retries = coerce_token_count(settings.get("max_retries"), 2)
+    if max_retries < 0:
+        max_retries = 2
+    return float(timeout_value), max_retries
+
+
 async def solve_image(
     image_urls: List[str],
     review_feedback: Optional[str] = None,
@@ -319,13 +334,14 @@ async def solve_image(
 
     # 调用模型
     fallback_models = resolve_fallback_models("solver", model_config or {})
+    timeout_seconds, max_retries = get_runtime_request_settings()
     response = await call_with_retry_and_fallback(
         create_llm_func=get_llm,
         messages=messages,
         model_config=model_config or {},
         fallback_models=fallback_models,
-        timeout=300.0,
-        max_retries=2,
+        timeout=timeout_seconds,
+        max_retries=max_retries,
         task_id=task_id,
     )
 
@@ -384,13 +400,14 @@ async def format_solution(
 
     # 调用模型
     fallback_models = resolve_fallback_models("formatter", model_config or {})
+    timeout_seconds, max_retries = get_runtime_request_settings()
     response = await call_with_retry_and_fallback(
         create_llm_func=get_llm,
         messages=messages,
         model_config=model_config or {},
         fallback_models=fallback_models,
-        timeout=300.0,
-        max_retries=2,
+        timeout=timeout_seconds,
+        max_retries=max_retries,
         task_id=task_id,
     )
 

@@ -20,6 +20,8 @@ const ACTIVE_TASK_ID_STORAGE_KEY = 'active_task_id'
 const SOLVER_CONFIG_STORAGE_KEY = 'solver_config'
 const REVIEWER_CONFIG_STORAGE_KEY = 'reviewer_config'
 const FORMATTER_CONFIG_STORAGE_KEY = 'formatter_config'
+const SHARED_BASE_URL_STORAGE_KEY = 'shared_base_url'
+const SHARED_API_KEY_STORAGE_KEY = 'shared_api_key'
 const WORKFLOW_TEMPLATE_ID_STORAGE_KEY = 'workflow_template_id'
 const WORKFLOW_NODE_ORDER = ['solver', 'reviewer', 'formatter'] as const
 const PAPER_BUILDER_LOCAL_DRAFT_KEY = 'paper_builder_local_draft_v1'
@@ -134,6 +136,8 @@ interface RetryModelConfigs {
 
 interface RuntimeSettingsResponse {
   active_template_id: string;
+  request_timeout_seconds: number;
+  max_retries: number;
   fallback: {
     global: string[];
     nodes: {
@@ -162,7 +166,11 @@ interface SettingsSnapshot {
   solverConfig: ModelConfig;
   reviewerConfig: ModelConfig;
   formatterConfig: ModelConfig;
+  sharedBaseUrl: string;
+  sharedApiKey: string;
   activeTemplateId: string;
+  requestTimeoutSeconds: number;
+  maxRetries: number;
   globalFallbackText: string;
   solverFallbackText: string;
   reviewerFallbackText: string;
@@ -189,10 +197,36 @@ const readStoredJson = <T,>(key: string, fallback: T): T => {
   }
 }
 
+const mergeModelConfigWithShared = (
+  config: ModelConfig,
+  sharedBaseUrl: string,
+  sharedApiKey: string
+): ModelConfig => {
+  const normalizedSharedBaseUrl = sharedBaseUrl.trim()
+  const normalizedSharedApiKey = sharedApiKey.trim()
+  return {
+    ...config,
+    base_url: normalizedSharedBaseUrl || (config.base_url || '').trim(),
+    api_key: normalizedSharedApiKey || (config.api_key || '').trim(),
+  }
+}
+
 const getLatestRetryConfigs = (): RetryModelConfigs => ({
-  solver_config: readStoredJson<ModelConfig>(SOLVER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 4096 }),
-  reviewer_config: readStoredJson<ModelConfig>(REVIEWER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 2048 }),
-  formatter_config: readStoredJson<ModelConfig>(FORMATTER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 1024 }),
+  solver_config: mergeModelConfigWithShared(
+    readStoredJson<ModelConfig>(SOLVER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 4096 }),
+    localStorage.getItem(SHARED_BASE_URL_STORAGE_KEY) || '',
+    localStorage.getItem(SHARED_API_KEY_STORAGE_KEY) || ''
+  ),
+  reviewer_config: mergeModelConfigWithShared(
+    readStoredJson<ModelConfig>(REVIEWER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 2048 }),
+    localStorage.getItem(SHARED_BASE_URL_STORAGE_KEY) || '',
+    localStorage.getItem(SHARED_API_KEY_STORAGE_KEY) || ''
+  ),
+  formatter_config: mergeModelConfigWithShared(
+    readStoredJson<ModelConfig>(FORMATTER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 1024 }),
+    localStorage.getItem(SHARED_BASE_URL_STORAGE_KEY) || '',
+    localStorage.getItem(SHARED_API_KEY_STORAGE_KEY) || ''
+  ),
   workflow_template_id: localStorage.getItem(WORKFLOW_TEMPLATE_ID_STORAGE_KEY) || 'workflow_a'
 })
 
@@ -253,9 +287,27 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     const saved = localStorage.getItem(FORMATTER_CONFIG_STORAGE_KEY)
     return saved ? JSON.parse(saved) : { model_name: '', api_key: '', base_url: '', max_tokens: 1024 }
   })
+  const [sharedBaseUrl, setSharedBaseUrl] = useState<string>(() => {
+    const shared = (localStorage.getItem(SHARED_BASE_URL_STORAGE_KEY) || '').trim()
+    if (shared) return shared
+    const solverSaved = readStoredJson<ModelConfig>(SOLVER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 4096 })
+    const reviewerSaved = readStoredJson<ModelConfig>(REVIEWER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 2048 })
+    const formatterSaved = readStoredJson<ModelConfig>(FORMATTER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 1024 })
+    return (solverSaved.base_url || reviewerSaved.base_url || formatterSaved.base_url || '').trim()
+  })
+  const [sharedApiKey, setSharedApiKey] = useState<string>(() => {
+    const shared = (localStorage.getItem(SHARED_API_KEY_STORAGE_KEY) || '').trim()
+    if (shared) return shared
+    const solverSaved = readStoredJson<ModelConfig>(SOLVER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 4096 })
+    const reviewerSaved = readStoredJson<ModelConfig>(REVIEWER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 2048 })
+    const formatterSaved = readStoredJson<ModelConfig>(FORMATTER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 1024 })
+    return (solverSaved.api_key || reviewerSaved.api_key || formatterSaved.api_key || '').trim()
+  })
   const [runtimeLoading, setRuntimeLoading] = useState(false)
   const [runtimeError, setRuntimeError] = useState<string | null>(null)
   const [activeTemplateId, setActiveTemplateId] = useState<string>(() => localStorage.getItem(WORKFLOW_TEMPLATE_ID_STORAGE_KEY) || 'workflow_a')
+  const [requestTimeoutSeconds, setRequestTimeoutSeconds] = useState<number>(300)
+  const [maxRetries, setMaxRetries] = useState<number>(2)
   const [globalFallbackText, setGlobalFallbackText] = useState('')
   const [solverFallbackText, setSolverFallbackText] = useState('')
   const [reviewerFallbackText, setReviewerFallbackText] = useState('')
@@ -276,7 +328,11 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     solverConfig,
     reviewerConfig,
     formatterConfig,
+    sharedBaseUrl,
+    sharedApiKey,
     activeTemplateId,
+    requestTimeoutSeconds,
+    maxRetries,
     globalFallbackText,
     solverFallbackText,
     reviewerFallbackText,
@@ -328,6 +384,8 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       setSolverFallbackText(listToText(runtime.fallback?.nodes?.solver || []))
       setReviewerFallbackText(listToText(runtime.fallback?.nodes?.reviewer || []))
       setFormatterFallbackText(listToText(runtime.fallback?.nodes?.formatter || []))
+      setRequestTimeoutSeconds(runtime.request_timeout_seconds || 300)
+      setMaxRetries(runtime.max_retries ?? 2)
 
       const normalizedTemplates = Array.isArray(templates) ? templates : []
       setTemplateItems(normalizedTemplates)
@@ -348,12 +406,20 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       setReviewerUserPrompt(detail.prompts?.reviewer?.user || '')
       setFormatterSystemPrompt(detail.prompts?.formatter?.system || '')
       setFormatterUserPrompt(detail.prompts?.formatter?.user || '')
+      const nextSharedBaseUrl = (localStorage.getItem(SHARED_BASE_URL_STORAGE_KEY) || solverConfig.base_url || reviewerConfig.base_url || formatterConfig.base_url || '').trim()
+      const nextSharedApiKey = (localStorage.getItem(SHARED_API_KEY_STORAGE_KEY) || solverConfig.api_key || reviewerConfig.api_key || formatterConfig.api_key || '').trim()
+      setSharedBaseUrl(nextSharedBaseUrl)
+      setSharedApiKey(nextSharedApiKey)
 
       const baseline = toSettingsSnapshotString({
         solverConfig,
         reviewerConfig,
         formatterConfig,
+        sharedBaseUrl: nextSharedBaseUrl,
+        sharedApiKey: nextSharedApiKey,
         activeTemplateId: pickedTemplateId,
+        requestTimeoutSeconds: runtime.request_timeout_seconds || 300,
+        maxRetries: runtime.max_retries ?? 2,
         globalFallbackText: listToText(runtime.fallback?.global || []),
         solverFallbackText: listToText(runtime.fallback?.nodes?.solver || []),
         reviewerFallbackText: listToText(runtime.fallback?.nodes?.reviewer || []),
@@ -379,14 +445,18 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   // 保存设置到 localStorage
   const saveSettings = async () => {
     setSettingsSaving(true)
-    localStorage.setItem(SOLVER_CONFIG_STORAGE_KEY, JSON.stringify(solverConfig))
-    localStorage.setItem(REVIEWER_CONFIG_STORAGE_KEY, JSON.stringify(reviewerConfig))
-    localStorage.setItem(FORMATTER_CONFIG_STORAGE_KEY, JSON.stringify(formatterConfig))
+    localStorage.setItem(SOLVER_CONFIG_STORAGE_KEY, JSON.stringify({ ...solverConfig, base_url: '', api_key: '' }))
+    localStorage.setItem(REVIEWER_CONFIG_STORAGE_KEY, JSON.stringify({ ...reviewerConfig, base_url: '', api_key: '' }))
+    localStorage.setItem(FORMATTER_CONFIG_STORAGE_KEY, JSON.stringify({ ...formatterConfig, base_url: '', api_key: '' }))
+    localStorage.setItem(SHARED_BASE_URL_STORAGE_KEY, sharedBaseUrl.trim())
+    localStorage.setItem(SHARED_API_KEY_STORAGE_KEY, sharedApiKey.trim())
     localStorage.setItem(WORKFLOW_TEMPLATE_ID_STORAGE_KEY, activeTemplateId)
 
     try {
       await api.put('/api/settings/runtime', {
         active_template_id: activeTemplateId,
+        request_timeout_seconds: requestTimeoutSeconds,
+        max_retries: maxRetries,
         fallback: {
           global: textToList(globalFallbackText),
           nodes: {
@@ -526,9 +596,9 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       draftSolution?: string;
     }) => api.post('/api/tasks', {
       image_urls: payload.imageUrls,
-      solver_config: solverConfig,
-      reviewer_config: reviewerConfig,
-      formatter_config: formatterConfig,
+      solver_config: withSharedConnection(solverConfig),
+      reviewer_config: withSharedConnection(reviewerConfig),
+      formatter_config: withSharedConnection(formatterConfig),
       workflow_template_id: activeTemplateId,
       entry_point: payload.entryPoint,
       target_nodes: payload.targetNodes,
@@ -701,6 +771,24 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     const parsed = parseInt(val, 10);
     return isNaN(parsed) ? 0 : parsed;
   };
+
+  const parseNonNegativeInt = (val: string, fallback: number) => {
+    const parsed = parseInt(val, 10)
+    if (Number.isNaN(parsed) || parsed < 0) return fallback
+    return parsed
+  }
+
+  const parsePositiveInt = (val: string, fallback: number) => {
+    const parsed = parseInt(val, 10)
+    if (Number.isNaN(parsed) || parsed < 1) return fallback
+    return parsed
+  }
+
+  const withSharedConnection = (config: ModelConfig): ModelConfig => mergeModelConfigWithShared(
+    config,
+    sharedBaseUrl,
+    sharedApiKey
+  )
 
   return (
     <div className="max-w-7xl mx-auto p-8 space-y-8" onPaste={handlePaste}>
@@ -971,13 +1059,13 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={tryCloseSettings}>
           <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
             <div className="p-6 border-b flex justify-between items-center bg-gray-50">
-              <h2 className="text-xl font-bold text-gray-800 flex items-center gap-2"><Settings size={20} /> 节点模型配置</h2>
+              <h2 className="text-xl font-bold text-gray-800 flex items-center gap-2"><Settings size={20} /> 全局运行设置</h2>
               <button onClick={tryCloseSettings} className="text-gray-500 hover:text-gray-800"><X size={24} /></button>
             </div>
 
             <div className="p-6 space-y-8 max-h-[70vh] overflow-y-auto">
-              <div className="space-y-4">
-                <h3 className="text-lg font-semibold text-indigo-600 border-b pb-2">工作流模板与 Prompt</h3>
+              <div className="space-y-4 border border-indigo-100 rounded-xl p-4 bg-indigo-50/30">
+                <h3 className="text-lg font-semibold text-indigo-700 border-b border-indigo-100 pb-2">提示词设置</h3>
                 <div className="grid grid-cols-2 gap-4">
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">激活模板</label>
@@ -1016,7 +1104,6 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
                     />
                   </div>
                 </div>
-
                 <div className="grid grid-cols-1 gap-4">
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">Solver System Prompt</label>
@@ -1045,94 +1132,110 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
                 </div>
               </div>
 
-              <div className="space-y-4">
-                <h3 className="text-lg font-semibold text-amber-600 border-b pb-2">Fallback 模型列表</h3>
-                <p className="text-xs text-gray-500">每行一个模型名。节点列表为空时会回退到全局列表。</p>
+              <div className="space-y-6 border border-amber-100 rounded-xl p-4 bg-amber-50/30">
+                <h3 className="text-lg font-semibold text-amber-700 border-b border-amber-100 pb-2">模型设置</h3>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">全局超时时间（秒）</label>
+                    <input
+                      type="number"
+                      min={1}
+                      value={requestTimeoutSeconds}
+                      onChange={(e) => setRequestTimeoutSeconds(parsePositiveInt(e.target.value, 300))}
+                      className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-amber-500 outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">全局重试次数</label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={maxRetries}
+                      onChange={(e) => setMaxRetries(parseNonNegativeInt(e.target.value, 2))}
+                      className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-amber-500 outline-none"
+                    />
+                  </div>
+                </div>
                 <div className="grid grid-cols-1 gap-4">
                   <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">全局 Fallback</label>
-                    <textarea value={globalFallbackText} onChange={(e) => setGlobalFallbackText(e.target.value)} className="w-full min-h-20 border rounded-lg px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-amber-500 outline-none" />
+                    <label className="block text-sm font-medium text-gray-700 mb-1">共享 Base URL</label>
+                    <input
+                      type="text"
+                      value={sharedBaseUrl}
+                      onChange={(e) => setSharedBaseUrl(e.target.value)}
+                      className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-amber-500 outline-none"
+                    />
                   </div>
                   <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Solver 节点 Fallback</label>
-                    <textarea value={solverFallbackText} onChange={(e) => setSolverFallbackText(e.target.value)} className="w-full min-h-20 border rounded-lg px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-amber-500 outline-none" />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Reviewer 节点 Fallback</label>
-                    <textarea value={reviewerFallbackText} onChange={(e) => setReviewerFallbackText(e.target.value)} className="w-full min-h-20 border rounded-lg px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-amber-500 outline-none" />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Formatter 节点 Fallback</label>
-                    <textarea value={formatterFallbackText} onChange={(e) => setFormatterFallbackText(e.target.value)} className="w-full min-h-20 border rounded-lg px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-amber-500 outline-none" />
+                    <label className="block text-sm font-medium text-gray-700 mb-1">共享 API Key <span className="text-xs text-gray-400 font-normal">(留空则使用后端默认配置)</span></label>
+                    <input
+                      type="password"
+                      value={sharedApiKey}
+                      onChange={(e) => setSharedApiKey(e.target.value)}
+                      placeholder="sk-..."
+                      className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-amber-500 outline-none"
+                    />
                   </div>
                 </div>
-              </div>
-
-              {/* Solver 配置 */}
-              <div className="space-y-4">
-                <h3 className="text-lg font-semibold text-blue-600 border-b pb-2">Solver (解题) 节点</h3>
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">模型名称</label>
-                    <input type="text" value={solverConfig.model_name} onChange={e => setSolverConfig({ ...solverConfig, model_name: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Max Tokens</label>
-                    <input type="number" value={solverConfig.max_tokens || ''} onChange={e => setSolverConfig({ ...solverConfig, max_tokens: parseMaxTokens(e.target.value) })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
-                  </div>
-                  <div className="col-span-2">
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Base URL</label>
-                    <input type="text" value={solverConfig.base_url} onChange={e => setSolverConfig({ ...solverConfig, base_url: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
-                  </div>
-                  <div className="col-span-2">
-                    <label className="block text-sm font-medium text-gray-700 mb-1">API Key <span className="text-xs text-gray-400 font-normal">(留空则使用后端默认配置)</span></label>
-                    <input type="password" value={solverConfig.api_key} onChange={e => setSolverConfig({ ...solverConfig, api_key: e.target.value })} placeholder="sk-..." className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
-                  </div>
-                </div>
-              </div>
-
-              {/* Reviewer 配置 */}
-              <div className="space-y-4">
-                <h3 className="text-lg font-semibold text-purple-600 border-b pb-2">Reviewer (审查) 节点</h3>
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">模型名称</label>
-                    <input type="text" value={reviewerConfig.model_name} onChange={e => setReviewerConfig({ ...reviewerConfig, model_name: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-purple-500 outline-none" />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Max Tokens</label>
-                    <input type="number" value={reviewerConfig.max_tokens || ''} onChange={e => setReviewerConfig({ ...reviewerConfig, max_tokens: parseMaxTokens(e.target.value) })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-purple-500 outline-none" />
-                  </div>
-                  <div className="col-span-2">
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Base URL</label>
-                    <input type="text" value={reviewerConfig.base_url} onChange={e => setReviewerConfig({ ...reviewerConfig, base_url: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-purple-500 outline-none" />
-                  </div>
-                  <div className="col-span-2">
-                    <label className="block text-sm font-medium text-gray-700 mb-1">API Key <span className="text-xs text-gray-400 font-normal">(留空则使用后端默认配置)</span></label>
-                    <input type="password" value={reviewerConfig.api_key} onChange={e => setReviewerConfig({ ...reviewerConfig, api_key: e.target.value })} placeholder="sk-..." className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-purple-500 outline-none" />
+                <div className="space-y-4">
+                  <h4 className="text-sm font-semibold text-amber-700">Fallback 模型列表</h4>
+                  <p className="text-xs text-gray-500">每行一个模型名。节点列表为空时会回退到全局列表。</p>
+                  <div className="grid grid-cols-1 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">全局 Fallback</label>
+                      <textarea value={globalFallbackText} onChange={(e) => setGlobalFallbackText(e.target.value)} className="w-full min-h-20 border rounded-lg px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-amber-500 outline-none" />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">Solver 节点 Fallback</label>
+                      <textarea value={solverFallbackText} onChange={(e) => setSolverFallbackText(e.target.value)} className="w-full min-h-20 border rounded-lg px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-amber-500 outline-none" />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">Reviewer 节点 Fallback</label>
+                      <textarea value={reviewerFallbackText} onChange={(e) => setReviewerFallbackText(e.target.value)} className="w-full min-h-20 border rounded-lg px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-amber-500 outline-none" />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">Formatter 节点 Fallback</label>
+                      <textarea value={formatterFallbackText} onChange={(e) => setFormatterFallbackText(e.target.value)} className="w-full min-h-20 border rounded-lg px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-amber-500 outline-none" />
+                    </div>
                   </div>
                 </div>
-              </div>
-
-              {/* Formatter 配置 */}
-              <div className="space-y-4">
-                <h3 className="text-lg font-semibold text-green-600 border-b pb-2">Formatter (排版) 节点</h3>
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">模型名称</label>
-                    <input type="text" value={formatterConfig.model_name} onChange={e => setFormatterConfig({ ...formatterConfig, model_name: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 outline-none" />
+                <div className="space-y-4">
+                  <h4 className="text-lg font-semibold text-blue-600 border-b pb-2">Solver (解题) 节点</h4>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">模型名称</label>
+                      <input type="text" value={solverConfig.model_name} onChange={e => setSolverConfig({ ...solverConfig, model_name: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">Max Tokens</label>
+                      <input type="number" value={solverConfig.max_tokens || ''} onChange={e => setSolverConfig({ ...solverConfig, max_tokens: parseMaxTokens(e.target.value) })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
+                    </div>
                   </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Max Tokens</label>
-                    <input type="number" value={formatterConfig.max_tokens || ''} onChange={e => setFormatterConfig({ ...formatterConfig, max_tokens: parseMaxTokens(e.target.value) })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 outline-none" />
+                </div>
+                <div className="space-y-4">
+                  <h4 className="text-lg font-semibold text-purple-600 border-b pb-2">Reviewer (审查) 节点</h4>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">模型名称</label>
+                      <input type="text" value={reviewerConfig.model_name} onChange={e => setReviewerConfig({ ...reviewerConfig, model_name: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-purple-500 outline-none" />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">Max Tokens</label>
+                      <input type="number" value={reviewerConfig.max_tokens || ''} onChange={e => setReviewerConfig({ ...reviewerConfig, max_tokens: parseMaxTokens(e.target.value) })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-purple-500 outline-none" />
+                    </div>
                   </div>
-                  <div className="col-span-2">
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Base URL</label>
-                    <input type="text" value={formatterConfig.base_url} onChange={e => setFormatterConfig({ ...formatterConfig, base_url: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 outline-none" />
-                  </div>
-                  <div className="col-span-2">
-                    <label className="block text-sm font-medium text-gray-700 mb-1">API Key <span className="text-xs text-gray-400 font-normal">(留空则使用后端默认配置)</span></label>
-                    <input type="password" value={formatterConfig.api_key} onChange={e => setFormatterConfig({ ...formatterConfig, api_key: e.target.value })} placeholder="sk-..." className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 outline-none" />
+                </div>
+                <div className="space-y-4">
+                  <h4 className="text-lg font-semibold text-green-600 border-b pb-2">Formatter (排版) 节点</h4>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">模型名称</label>
+                      <input type="text" value={formatterConfig.model_name} onChange={e => setFormatterConfig({ ...formatterConfig, model_name: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 outline-none" />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">Max Tokens</label>
+                      <input type="number" value={formatterConfig.max_tokens || ''} onChange={e => setFormatterConfig({ ...formatterConfig, max_tokens: parseMaxTokens(e.target.value) })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 outline-none" />
+                    </div>
                   </div>
                 </div>
               </div>

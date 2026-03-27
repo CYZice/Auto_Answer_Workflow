@@ -326,13 +326,25 @@ async def run_agent_workflow_async(
                     return
                 previous_state = task_record.state
                 final_status = final_state.get("status", "failed")
+                review_decision = final_state.get("review_decision")
+                retry_count_value = final_state.get(
+                    "retry_count", task_record.retry_count
+                )
+                reached_review_failure_terminal = (
+                    review_decision == "FAIL"
+                    and coerce_token_count(retry_count_value, 0) >= 1
+                )
                 if final_status in {
                     TaskStatus.QUEUED.value,
                     TaskStatus.SOLVING.value,
                     TaskStatus.REVIEWING.value,
                     TaskStatus.FORMATTING.value,
                 }:
-                    final_status = TaskStatus.COMPLETED.value
+                    final_status = (
+                        TaskStatus.FAILED.value
+                        if reached_review_failure_terminal
+                        else TaskStatus.COMPLETED.value
+                    )
 
                 # 如果在执行期间被标记为 cancelled，保持 cancelled 状态
                 if task_record.state != TaskStatus.CANCELLED.value:
@@ -370,6 +382,8 @@ async def run_agent_workflow_async(
                     history_data.pop("target_nodes", None)
 
                 failed_node = final_state.get("failed_node")
+                if not failed_node and reached_review_failure_terminal:
+                    failed_node = "reviewer"
                 if (
                     not failed_node
                     and final_status == TaskStatus.FAILED.value

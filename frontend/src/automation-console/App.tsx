@@ -22,6 +22,8 @@ import { RunControls } from './components/RunControls'
 import { TaskTable } from './components/TaskTable'
 import type { LogItem, RunStatus, TaskItem } from './types'
 
+const LAST_RUN_ID_KEY = 'automation_console_last_run_id'
+
 function App() {
     const [username, setUsername] = useState('13320115908')
     const [password, setPassword] = useState('2011590xue')
@@ -38,19 +40,50 @@ function App() {
 
     const refresh = async () => {
         if (!runId) return
-        const [statusResp, taskResp, logResp] = await Promise.all([
+        const [statusResp, taskResp, logResp] = await Promise.allSettled([
             getRunStatus(runId),
             listTasks(runId),
             listLogs(runId),
         ])
-        setRunState(statusResp.state)
-        setTasks(taskResp.items)
-        setLogs(logResp)
-        if (activeReview) {
-            const latest = taskResp.items.find((item) => item.task_id === activeReview.task_id) || null
-            setActiveReview(latest)
+
+        if (statusResp.status === 'fulfilled') {
+            setRunState(statusResp.value.state)
+        } else {
+            setRunState('idle')
+        }
+
+        if (taskResp.status === 'fulfilled') {
+            setTasks(taskResp.value.items)
+            if (activeReview) {
+                const latest = taskResp.value.items.find((item) => item.task_id === activeReview.task_id) || null
+                setActiveReview(latest)
+            }
+        } else {
+            setTasks([])
+            setActiveReview(null)
+        }
+
+        if (logResp.status === 'fulfilled') {
+            setLogs(logResp.value)
+        } else {
+            setLogs([])
         }
     }
+
+    useEffect(() => {
+        const savedRunId = window.localStorage.getItem(LAST_RUN_ID_KEY)
+        if (savedRunId) {
+            setRunId(savedRunId)
+        }
+    }, [])
+
+    useEffect(() => {
+        if (!runId) {
+            window.localStorage.removeItem(LAST_RUN_ID_KEY)
+            return
+        }
+        window.localStorage.setItem(LAST_RUN_ID_KEY, runId)
+    }, [runId])
 
     useEffect(() => {
         if (!runId) return

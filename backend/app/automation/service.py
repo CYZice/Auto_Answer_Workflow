@@ -257,11 +257,23 @@ class AutomationService:
                         self._check_stopped(run)
                         task.run_id = run_id
                         db.commit()
+
+                        def _grab_logger(level: str, step: str, message: str) -> None:
+                            self._log_runtime(
+                                run_id,
+                                step,
+                                message,
+                                level=level,
+                                task_id=task.task_id,
+                                school_name=school_name,
+                            )
+
                         ok = await self._browser.grab_task(
                             run_id,
                             task.task_id,
                             task.school_name or "",
                             task.topic_title or "",
+                            on_log=_grab_logger,
                         )
                         if not ok:
                             repo.update_task_content(

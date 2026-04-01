@@ -93,11 +93,24 @@ class BrowserWorker:
             "div:has-text('待开始')",
             "div:has-text('待解题')",
         ]
-        self._task_action_button_selector = "button:has-text('我会做，抢单答题'), button:has-text('我会做'), button:has-text('抢单答题')"
+        self._task_action_button_selector = "button:has-text('我会做，抢单答题'), button:has-text('我会做'), button:has-text('抢单答题'), button:has-text('接单'), span:has-text('我会做，抢单答题'), span:has-text('我会做'), span:has-text('抢单答题'), span:has-text('接单')"
         self._task_rows_selector = ".d2-container-full__body .el-table__body-wrapper .el-table__body tbody tr.el-table__row"
         self._view_button_selector = (
-            "td:nth-child(4) .cell button.el-button.el-button--text.el-button--default:has(span:has-text('查看')), "
-            "td:last-child .cell button.el-button.el-button--text.el-button--default:has(span:has-text('查看'))"
+            "td:nth-child(4) button:has(span:has-text('查看')), "
+            "td:nth-child(4) button:has-text('查看'), "
+            "td:nth-child(4) span:has-text('查看'), "
+            "td:last-child button:has(span:has-text('查看')), "
+            "td:last-child button:has-text('查看')"
+        )
+        self._dialog_grab_button_selector = (
+            ".el-dialog__footer button:has-text('我会做，抢单答题'), "
+            ".el-dialog__footer button:has-text('我会做'), "
+            ".el-dialog__footer button:has-text('抢单答题'), "
+            ".el-dialog__footer button:has-text('接单'), "
+            ".el-dialog__footer span:has-text('我会做，抢单答题'), "
+            ".el-dialog__footer span:has-text('我会做'), "
+            ".el-dialog__footer span:has-text('抢单答题'), "
+            ".el-dialog__footer span:has-text('接单')"
         )
         self._scan_noise_keywords = {
             "薪酬统计",
@@ -444,6 +457,25 @@ class BrowserWorker:
 
         return topic_title, topic_image_url
 
+    async def _extract_preview_title_from_row(self, row: Any) -> str:
+        selectors = [
+            "td:nth-child(2) .topic p",
+            "td:nth-child(2) .topic",
+            "td:nth-child(2) p",
+            "td:nth-child(2)",
+        ]
+        for selector in selectors:
+            try:
+                node = row.locator(selector).first
+                if await node.count() == 0:
+                    continue
+                text = (await node.inner_text()).replace("\n", " ").strip()
+                if len(text) >= 4:
+                    return text
+            except Exception:
+                continue
+        return ""
+
     async def _extract_table_tasks(
         self,
         page: Any,
@@ -532,7 +564,9 @@ class BrowserWorker:
                 emit("INFO", f"row {idx}: 状态非待处理({status_cell})，跳过")
                 continue
 
-            topic_title = title_cell or row_text
+            preview_title = await self._extract_preview_title_from_row(row)
+            topic_title = preview_title or title_cell or row_text
+            topic_title = topic_title.replace("\n", " ").strip()
             if len(topic_title) < 4:
                 emit("INFO", f"row {idx}: 标题过短，跳过")
                 continue
@@ -543,7 +577,10 @@ class BrowserWorker:
                 topic_title,
                 on_log=on_log,
             )
-            topic_title = (full_title or topic_title).replace("\n", " ").strip()
+            # 扫描阶段统一保存“列表预览文本”为后续接单/解题匹配基准；
+            # 查看详情仅用于补充题图链接与兜底文本。
+            if not topic_title and full_title:
+                topic_title = full_title.replace("\n", " ").strip()
             if len(topic_title) > 280:
                 topic_title = topic_title[:280]
 
@@ -763,6 +800,41 @@ class BrowserWorker:
         ratio = len(overlap) / max(1, min(len(row_tokens), len(title_tokens)))
         return ratio >= 0.3
 
+    def _is_row_text_match_with_reason(
+        self, row_text: str, topic_title: str
+    ) -> tuple[bool, str]:
+        normalized_row = self._normalize_preview_text(row_text)
+        normalized_title = self._normalize_preview_text(topic_title)
+        if not normalized_row:
+            return False, "row_text_empty"
+        if not normalized_title:
+            return False, "topic_text_empty"
+
+        if normalized_title in normalized_row:
+            return True, "full_contains"
+        if normalized_row in normalized_title:
+            return True, "reverse_contains"
+
+        keywords = self._build_title_keywords(topic_title)
+        if any(key in normalized_row for key in keywords):
+            return True, "keyword_contains"
+
+        row_tokens = self._extract_match_tokens(row_text)
+        title_tokens = self._extract_match_tokens(topic_title)
+        if not row_tokens or not title_tokens:
+            return False, "token_empty"
+        overlap = row_tokens.intersection(title_tokens)
+        if len(overlap) >= 2:
+            return True, f"token_overlap:{len(overlap)}"
+        long_overlap = [token for token in overlap if len(token) >= 6]
+        if len(long_overlap) >= 1:
+            return True, "long_token_overlap"
+
+        ratio = len(overlap) / max(1, min(len(row_tokens), len(title_tokens)))
+        if ratio >= 0.3:
+            return True, f"token_ratio:{ratio:.2f}"
+        return False, f"no_match(overlap={len(overlap)},ratio={ratio:.2f})"
+
     async def _select_school(self, page: Any, school_name: str) -> bool:
         if not school_name:
             return True
@@ -782,41 +854,222 @@ class BrowserWorker:
         except Exception:
             return False
 
-    async def _click_grab_button_in_row(self, row: Any) -> bool:
-        button = row.locator(self._task_action_button_selector).first
-        if await button.count() == 0:
-            return False
-        try:
-            await button.click(timeout=2000)
-            return True
-        except Exception:
-            return False
+    async def _open_row_view_dialog(
+        self,
+        page: Any,
+        row: Any,
+        on_log: Callable[[str, str, str], None] | None = None,
+        school_name: str | None = None,
+        task_id: str | None = None,
+        row_index: int | None = None,
+    ) -> tuple[bool, Any | None, str]:
+        def emit(level: str, message: str) -> None:
+            if on_log is None:
+                return
+            prefix_parts = []
+            if school_name:
+                prefix_parts.append(f"school={school_name}")
+            if task_id:
+                prefix_parts.append(f"task={task_id}")
+            if row_index is not None:
+                prefix_parts.append(f"row={row_index}")
+            prefix = f"[{' '.join(prefix_parts)}] " if prefix_parts else ""
+            on_log(level, "grab.view", f"{prefix}{message}")
 
-    async def _grab_task_from_current_table(self, page: Any, topic_title: str) -> bool:
+        view_trigger = row.locator(self._view_button_selector).first
+        if await view_trigger.count() == 0:
+            emit("WARN", "view button not found in row")
+            return False, None, "view_button_not_found"
+
+        try:
+            await view_trigger.scroll_into_view_if_needed()
+        except Exception:
+            pass
+
+        for attempt in ({"timeout": 1800, "force": False}, {"timeout": 1800, "force": True}):
+            try:
+                await view_trigger.click(**attempt)
+                emit("INFO", f"view clicked force={attempt['force']}")
+                break
+            except Exception as exc:
+                emit("WARN", f"view click failed force={attempt['force']}: {exc}")
+        else:
+            return False, None, "view_click_failed"
+
+        dialog = None
+        for _ in range(20):
+            dialog = await self._get_visible_dialog_wrapper(page)
+            if dialog is not None:
+                return True, dialog, "dialog_opened"
+            await page.wait_for_timeout(120)
+
+        emit("WARN", "dialog not visible after clicking view")
+        return False, None, "dialog_not_visible"
+
+    async def _close_dialog_best_effort(self, page: Any, dialog: Any | None) -> None:
+        if dialog is not None:
+            closed = await self._click_first_available(
+                dialog,
+                [
+                    "button:has-text('返回')",
+                    "button:has-text('关闭')",
+                    ".el-dialog__headerbtn",
+                ],
+            )
+            if closed:
+                await page.wait_for_timeout(180)
+                return
+
+        await self._click_first_available(
+            page,
+            [
+                ".el-dialog__wrapper .el-dialog__headerbtn",
+                ".el-dialog__headerbtn",
+            ],
+        )
+        await page.wait_for_timeout(180)
+
+    async def _click_grab_button_in_dialog(
+        self,
+        page: Any,
+        dialog: Any,
+        on_log: Callable[[str, str, str], None] | None = None,
+        school_name: str | None = None,
+        task_id: str | None = None,
+        row_index: int | None = None,
+    ) -> tuple[bool, str]:
+        def emit(level: str, message: str) -> None:
+            if on_log is None:
+                return
+            prefix_parts = []
+            if school_name:
+                prefix_parts.append(f"school={school_name}")
+            if task_id:
+                prefix_parts.append(f"task={task_id}")
+            if row_index is not None:
+                prefix_parts.append(f"row={row_index}")
+            prefix = f"[{' '.join(prefix_parts)}] " if prefix_parts else ""
+            on_log(level, "grab.click", f"{prefix}{message}")
+
+        button = dialog.locator(self._dialog_grab_button_selector).first
+        if await button.count() == 0:
+            emit("WARN", "dialog footer grab button not found")
+            return False, "dialog_grab_button_not_found"
+
+        try:
+            await button.scroll_into_view_if_needed()
+        except Exception:
+            pass
+
+        try:
+            await button.click(timeout=2500)
+            emit("INFO", "dialog grab button clicked")
+            await page.wait_for_timeout(220)
+            return True, "dialog_grab_clicked"
+        except Exception as exc:
+            emit("WARN", f"dialog grab click failed: {exc}")
+            try:
+                handle = await button.element_handle()
+                if handle is not None:
+                    await handle.evaluate("el => el.click()")
+                    emit("INFO", "dialog grab clicked via js evaluate")
+                    await page.wait_for_timeout(220)
+                    return True, "dialog_grab_clicked_js"
+            except Exception as inner_exc:
+                emit("WARN", f"dialog grab js click failed: {inner_exc}")
+            return False, "dialog_grab_all_click_methods_failed"
+
+    async def _grab_task_from_current_table(
+        self,
+        page: Any,
+        topic_title: str,
+        on_log: Callable[[str, str, str], None] | None = None,
+        school_name: str | None = None,
+        task_id: str | None = None,
+    ) -> bool:
+        def emit(level: str, message: str) -> None:
+            if on_log is None:
+                return
+            prefix_parts = []
+            if school_name:
+                prefix_parts.append(f"school={school_name}")
+            if task_id:
+                prefix_parts.append(f"task={task_id}")
+            prefix = f"[{' '.join(prefix_parts)}] " if prefix_parts else ""
+            on_log(level, "grab.match", f"{prefix}{message}")
+
         rows = page.locator(self._task_rows_selector)
         row_count = min(await rows.count(), 120)
+        emit("INFO", f"candidate rows: {row_count}")
         if row_count == 0:
+            emit("WARN", "no rows found in current table")
             return False
 
+        miss_count = 0
+        matched_count = 0
         for idx in range(row_count):
             row = rows.nth(idx)
             try:
                 if not await row.is_visible():
+                    if idx < 5:
+                        emit("INFO", f"row {idx}: not visible")
                     continue
             except Exception:
                 continue
 
             row_text = (await row.inner_text()).strip()
             if not row_text:
+                if idx < 5:
+                    emit("INFO", f"row {idx}: empty row text")
                 continue
 
-            if not self._is_row_text_match(row_text, topic_title):
+            preview_title = await self._extract_preview_title_from_row(row)
+            candidate_text = preview_title or row_text
+
+            matched, reason = self._is_row_text_match_with_reason(
+                candidate_text, topic_title
+            )
+            if not matched:
+                miss_count += 1
+                if idx < 5:
+                    snippet = candidate_text.replace("\n", " ").strip()[:80]
+                    emit("INFO", f"row {idx}: miss {reason}; text={snippet}")
                 continue
 
-            if await self._click_grab_button_in_row(row):
+            matched_count += 1
+            opened, dialog, open_reason = await self._open_row_view_dialog(
+                page,
+                row,
+                on_log=on_log,
+                school_name=school_name,
+                task_id=task_id,
+                row_index=idx,
+            )
+            if not opened or dialog is None:
+                emit("WARN", f"row {idx}: matched but open view failed ({open_reason})")
+                continue
+
+            clicked, click_reason = await self._click_grab_button_in_dialog(
+                page,
+                dialog,
+                on_log=on_log,
+                school_name=school_name,
+                task_id=task_id,
+                row_index=idx,
+            )
+            if clicked:
                 await page.wait_for_timeout(250)
+                await self._close_dialog_best_effort(page, dialog)
+                emit("INFO", f"row {idx}: matched and clicked ({reason}, {click_reason})")
                 return True
 
+            await self._close_dialog_best_effort(page, dialog)
+            emit("WARN", f"row {idx}: matched but grab button click failed ({click_reason})")
+
+        emit(
+            "WARN",
+            f"grab not completed after scanning {row_count} rows, matches={matched_count}, misses={miss_count}",
+        )
         return False
 
     async def scan_discovered_tasks(
@@ -963,7 +1216,13 @@ class BrowserWorker:
         task_id: str,
         school_name: str,
         topic_title: str,
+        on_log: Callable[[str, str, str], None] | None = None,
     ) -> bool:
+        def emit(level: str, step: str, message: str) -> None:
+            if on_log is None:
+                return
+            on_log(level, step, f"task={task_id} school={school_name} {message}")
+
         if self._use_mock:
             await asyncio.sleep(0.05)
             return True
@@ -975,25 +1234,40 @@ class BrowserWorker:
         page = session.page
 
         if not await self._ensure_single_research_ready(page):
+            emit("WARN", "grab.nav", "failed to enter 单题研发")
             return False
         await self._switch_to_pending(page)
+        emit("INFO", "grab.nav", "switched to pending tab")
 
         selected = await self._select_school(page, school_name)
         if not selected:
+            emit("WARN", "grab.school", "school selection failed")
             return False
+        emit("INFO", "grab.school", "school selected")
 
         # 接单阶段比扫描更容易遇到学校切换后的延迟刷新，这里再做一次稳定等待与重试。
         await self._wait_school_switch_settled(page, school_name=school_name)
         await page.wait_for_timeout(250)
+        emit("INFO", "grab.school", "table settled after school switch")
 
-        for _ in range(3):
-            grabbed = await self._grab_task_from_current_table(page, topic_title)
+        for attempt in range(3):
+            emit("INFO", "grab.match", f"match attempt {attempt + 1}/3")
+            grabbed = await self._grab_task_from_current_table(
+                page,
+                topic_title,
+                on_log=on_log,
+                school_name=school_name,
+                task_id=task_id,
+            )
             if grabbed:
+                emit("INFO", "grab.match", "grab success")
                 return True
             await self._wait_school_switch_settled(page, school_name=school_name)
             await page.wait_for_timeout(250)
+            emit("INFO", "grab.match", "retry after settle")
 
         await asyncio.sleep(0.05)
+        emit("WARN", "grab.match", "all attempts failed")
         return False
 
     async def write_solution(

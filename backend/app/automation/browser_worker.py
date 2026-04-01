@@ -52,6 +52,20 @@ class BrowserWorker:
         self._editor_selector = (
             "div[id^='w-e-textarea-'][contenteditable='true'][role='textarea']"
         )
+        self._single_research_candidates = [
+            "text=单题研发",
+            "a:has-text('单题研发')",
+            "span:has-text('单题研发')",
+            "div:has-text('单题研发')",
+        ]
+        self._school_dropdown_candidates = [
+            "input[placeholder*='学校']",
+            "input[placeholder*='请选择']",
+            "div.el-select:has(input[placeholder*='学校'])",
+            "div.el-select:has(input[placeholder*='请选择'])",
+            "div.el-select",
+        ]
+        self._school_option_selector = "li.el-select-dropdown__item, .el-select-dropdown__item, [role='option']"
 
     async def start(self) -> None:
         self._running = True
@@ -169,6 +183,39 @@ class BrowserWorker:
             }
         ]
 
+    async def _click_first_available(self, page: Any, selectors: list[str]) -> bool:
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).first
+                if await locator.count() == 0:
+                    continue
+                await locator.click(timeout=1500)
+                await page.wait_for_timeout(300)
+                return True
+            except Exception:
+                continue
+        return False
+
+    async def _extract_table_tasks(self, page: Any, run_id: str, school_name: str) -> list[dict]:
+        tasks: list[dict] = []
+        rows = page.locator("tr")
+        count = min(await rows.count(), 50)
+        for idx in range(count):
+            row = rows.nth(idx)
+            row_text = (await row.inner_text()).strip()
+            if not row_text or len(row_text) < 3:
+                continue
+            tasks.append(
+                {
+                    "task_id": f"auto_{uuid.uuid4().hex[:10]}",
+                    "run_id": run_id,
+                    "school_name": school_name or "默认学校",
+                    "topic_title": row_text[:120],
+                    "topic_image_url": "",
+                }
+            )
+        return tasks
+
     async def scan_discovered_tasks(self, run_id: str) -> list[dict]:
         if self._use_mock:
             return await self._mock_scan(run_id)
@@ -180,28 +227,56 @@ class BrowserWorker:
 
         # 当前版本先做可执行抓取骨架：如果页面结构不匹配，仍返回空列表，由上层容错。
         page = session.page
-        await page.wait_for_timeout(300)
+        await page.wait_for_timeout(800)
+
+        # 登录后优先尝试进入“单题研发”页面
+        await self._click_first_available(page, self._single_research_candidates)
 
         tasks: list[dict] = []
-        rows = page.locator("tr")
-        count = min(await rows.count(), 30)
-        for idx in range(count):
-            row = rows.nth(idx)
-            row_text = (await row.inner_text()).strip()
-            if not row_text:
-                continue
-            tasks.append(
-                {
-                    "task_id": f"auto_{uuid.uuid4().hex[:10]}",
-                    "run_id": run_id,
-                    "school_name": "默认学校",
-                    "topic_title": row_text[:120],
-                    "topic_image_url": "",
-                }
-            )
+        seen_titles: set[str] = set()
 
-        if not tasks:
-            return await self._mock_scan(run_id)
+        # 先抓一次当前页，确保即使下拉交互失败也能拿到可见列表
+        initial_tasks = await self._extract_table_tasks(page, run_id, "默认学校")
+        for item in initial_tasks:
+            if item["topic_title"] in seen_titles:
+                continue
+            seen_titles.add(item["topic_title"])
+            tasks.append(item)
+
+        # 再尝试学校下拉遍历抓取
+        opened = await self._click_first_available(page, self._school_dropdown_candidates)
+        if opened:
+            options = page.locator(self._school_option_selector)
+            option_count = min(await options.count(), 50)
+            school_names: list[str] = []
+            for idx in range(option_count):
+                name = (await options.nth(idx).inner_text()).strip()
+                if not name or name in {"全部", "请选择"}:
+                    continue
+                if name not in school_names:
+                    school_names.append(name)
+
+            for school_name in school_names:
+                # 每次选择前重新打开下拉，避免元素失效
+                await self._click_first_available(page, self._school_dropdown_candidates)
+                option = page.locator(self._school_option_selector).filter(
+                    has_text=school_name
+                ).first
+                if await option.count() == 0:
+                    continue
+                try:
+                    await option.click(timeout=1500)
+                except Exception:
+                    continue
+                await page.wait_for_timeout(600)
+
+                school_tasks = await self._extract_table_tasks(page, run_id, school_name)
+                for item in school_tasks:
+                    if item["topic_title"] in seen_titles:
+                        continue
+                    seen_titles.add(item["topic_title"])
+                    tasks.append(item)
+
         return tasks
 
     async def grab_task(self, run_id: str, task_id: str) -> bool:

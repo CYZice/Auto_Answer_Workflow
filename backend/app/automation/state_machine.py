@@ -26,7 +26,7 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     "selected": {"grabbed", "paused", "stopped", "skipped"},
     "grabbed": {"solving", "paused", "stopped"},
     "solving": {"solve_failed", "filled", "paused", "stopped"},
-    "solve_failed": {"selected", "paused", "stopped"},
+    "solve_failed": {"selected", "solving", "paused", "stopped"},
     "filled": {"review_pending", "paused", "stopped"},
     "review_pending": {"ready_to_submit", "skipped", "paused", "stopped"},
     "ready_to_submit": {"submitting", "paused", "stopped"},

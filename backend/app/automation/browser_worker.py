@@ -3,16 +3,8 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from typing import Any
 from dataclasses import dataclass
-
-from playwright.async_api import (
-    Browser,
-    BrowserContext,
-    Page,
-    Playwright,
-    TimeoutError as PlaywrightTimeoutError,
-    async_playwright,
-)
 
 
 @dataclass
@@ -21,16 +13,16 @@ class BrowserRunSession:
     mode: str
     username: str
     password: str
-    browser: Browser
-    context: BrowserContext
-    page: Page
+    browser: Any
+    context: Any
+    page: Any
     logged_in: bool = False
 
 
 class BrowserWorker:
     def __init__(self):
         self._running = False
-        self._playwright: Playwright | None = None
+        self._playwright: Any | None = None
         self._sessions: dict[str, BrowserRunSession] = {}
         self._use_mock = os.getenv("AUTOMATION_USE_MOCK", "1") == "1"
         self._target_url = os.getenv("AUTOMATION_TARGET_URL", "").strip()
@@ -45,11 +37,26 @@ class BrowserWorker:
         self._login_button_selector = (
             "button.el-button.el-button--primary.el-button--default"
         )
+        self._status_bar_selector = "div.status_bar"
+        self._solving_status_selector = "div.status_item"
+        self._ocr_button_selector = "button.el-button.el-button--text.el-button--mini"
+        self._paste_input_selector = (
+            "input[type='text'][placeholder='粘贴答案图片'][readonly='readonly']"
+        )
+        self._editor_selector = (
+            "div[id^='w-e-textarea-'][contenteditable='true'][role='textarea']"
+        )
 
     async def start(self) -> None:
         self._running = True
         if self._use_mock:
             return
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as exc:
+            raise RuntimeError(
+                "playwright is required for real mode; install dependencies first"
+            ) from exc
         if self._playwright is None:
             self._playwright = await async_playwright().start()
 
@@ -119,6 +126,10 @@ class BrowserWorker:
 
         page = session.page
         try:
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        except Exception as exc:
+            raise RuntimeError("playwright runtime unavailable") from exc
+        try:
             await page.locator(self._login_user_selector).fill(session.username)
             await page.locator(self._login_password_selector).fill(session.password)
             await page.locator(self._login_button_selector).click()
@@ -185,7 +196,15 @@ class BrowserWorker:
         if session is None:
             raise ValueError(f"session not found: {run_id}")
         await self._ensure_login(run_id)
-        await asyncio.sleep(0.05)
+        page = session.page
+
+        # 按文案优先点击“我会做，抢单答题”，失败则返回 False 由上层记录异常。
+        button = page.locator("text=我会做，抢单答题").first
+        if await button.count() == 0:
+            await asyncio.sleep(0.05)
+            return False
+        await button.click()
+        await page.wait_for_timeout(200)
         return True
 
     async def write_solution(
@@ -203,7 +222,40 @@ class BrowserWorker:
         if session is None:
             raise ValueError(f"session not found: {run_id}")
         await self._ensure_login(run_id)
-        await asyncio.sleep(0.05)
+        page = session.page
+
+        # 进入“解题中”列表（若存在）
+        solving_items = page.locator(self._solving_status_selector).filter(
+            has_text="解题中"
+        )
+        if await solving_items.count() > 0:
+            await solving_items.first.click()
+            await page.wait_for_timeout(200)
+
+        # OCR 识别录入入口
+        ocr_button = page.locator(self._ocr_button_selector).filter(has_text="识别录入")
+        if await ocr_button.count() > 0:
+            await ocr_button.first.click()
+            await page.wait_for_timeout(200)
+
+        # 尝试将图片路径写入粘贴框（目标站可能为 readonly，失败时继续回填编辑器）
+        if image_path:
+            paste_input = page.locator(self._paste_input_selector)
+            if await paste_input.count() > 0:
+                try:
+                    await paste_input.first.fill(image_path)
+                except Exception:
+                    pass
+
+        editors = page.locator(self._editor_selector)
+        if await editors.count() > 0:
+            # 第一个编辑器写入解析
+            await editors.nth(0).fill(f"已自动录入，来源任务: {task_id}")
+            if await editors.count() > 1 and extension_text:
+                # 若页面存在第二个可编辑区，优先写入考点衍生
+                await editors.nth(1).fill(extension_text)
+
+        await page.wait_for_timeout(150)
         return True
 
     async def submit_task(self, run_id: str, task_id: str) -> bool:
@@ -215,5 +267,11 @@ class BrowserWorker:
         if session is None:
             raise ValueError(f"session not found: {run_id}")
         await self._ensure_login(run_id)
-        await asyncio.sleep(0.05)
+        page = session.page
+        submit_button = page.locator("button:has-text('提交')")
+        if await submit_button.count() == 0:
+            await asyncio.sleep(0.05)
+            return False
+        await submit_button.first.click()
+        await page.wait_for_timeout(300)
         return True

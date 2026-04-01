@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -37,6 +38,10 @@ class AutomationService:
         self._review_deadlines: dict[str, float] = {}
         self._review_timeout_seconds = 600
         self._run_lock = asyncio.Lock()
+        self._submit_lock = asyncio.Lock()
+        self._workflow_api_base = os.getenv(
+            "AUTOMATION_WORKFLOW_API_BASE", "http://127.0.0.1:8080"
+        ).rstrip("/")
 
     async def start_session(self, req: StartSessionReq) -> RunRuntime:
         run = RunRuntime(
@@ -245,14 +250,14 @@ class AutomationService:
         payload = {"image_url": image_url}
         async with httpx.AsyncClient(timeout=180) as client:
             create_resp = await client.post(
-                "http://127.0.0.1:8000/api/tasks", json=payload
+                f"{self._workflow_api_base}/api/tasks", json=payload
             )
             create_resp.raise_for_status()
             task_id = create_resp.json()["task_id"]
 
             for _ in range(180):
                 detail_resp = await client.get(
-                    f"http://127.0.0.1:8000/api/tasks/{task_id}"
+                    f"{self._workflow_api_base}/api/tasks/{task_id}"
                 )
                 detail_resp.raise_for_status()
                 detail = detail_resp.json()
@@ -411,44 +416,45 @@ class AutomationService:
             return task
 
     async def confirm_submit(self, task_id: str):
-        with SessionLocal() as db:
-            repo = AutomationRepository(db)
-            task = repo.get_task(task_id)
-            if not task:
-                raise ValueError("task not found")
-            if task.status != "ready_to_submit":
-                raise ValueError("task is not in ready_to_submit")
-            repo.update_status(task, "submitting")
+        async with self._submit_lock:
+            with SessionLocal() as db:
+                repo = AutomationRepository(db)
+                task = repo.get_task(task_id)
+                if not task:
+                    raise ValueError("task not found")
+                if task.status != "ready_to_submit":
+                    raise ValueError("task is not in ready_to_submit")
+                repo.update_status(task, "submitting")
 
-        ok = await self._browser.submit_task(task.run_id, task_id)
+            ok = await self._browser.submit_task(task.run_id, task_id)
 
-        with SessionLocal() as db:
-            repo = AutomationRepository(db)
-            task = repo.get_task(task_id)
-            if not task:
-                raise ValueError("task not found")
-            if ok:
-                repo.update_status(task, "submitted")
-                self._log(
-                    db,
-                    task.run_id,
-                    "submit",
-                    "submitted",
-                    task_id=task.task_id,
-                    school_name=task.school_name,
-                )
-            else:
-                repo.update_status(task, "failed_submit")
-                self._log(
-                    db,
-                    task.run_id,
-                    "submit",
-                    "failed submit",
-                    task_id=task.task_id,
-                    school_name=task.school_name,
-                    level="ERROR",
-                )
-            return task
+            with SessionLocal() as db:
+                repo = AutomationRepository(db)
+                task = repo.get_task(task_id)
+                if not task:
+                    raise ValueError("task not found")
+                if ok:
+                    repo.update_status(task, "submitted")
+                    self._log(
+                        db,
+                        task.run_id,
+                        "submit",
+                        "submitted",
+                        task_id=task.task_id,
+                        school_name=task.school_name,
+                    )
+                else:
+                    repo.update_status(task, "failed_submit")
+                    self._log(
+                        db,
+                        task.run_id,
+                        "submit",
+                        "failed submit",
+                        task_id=task.task_id,
+                        school_name=task.school_name,
+                        level="ERROR",
+                    )
+                return task
 
     async def pause(self, run_id: str) -> None:
         run = self.get_run(run_id)

@@ -666,6 +666,105 @@ class BrowserWorker:
         await self._click_first_available(page, self._pending_tab_candidates)
         await page.wait_for_timeout(300)
 
+    @staticmethod
+    def _compact_text(value: str) -> str:
+        return "".join((value or "").split())
+
+    async def _switch_school(self, page: Any, school_name: str) -> bool:
+        if not school_name:
+            return True
+        opened = await self._open_school_dropdown(page)
+        if not opened:
+            return False
+
+        option = (
+            page.locator(self._school_option_selector)
+            .filter(has_text=school_name)
+            .first
+        )
+        if await option.count() == 0:
+            return False
+
+        try:
+            await option.click(timeout=2000)
+        except Exception:
+            return False
+
+        await self._wait_school_switch_settled(page, school_name=school_name)
+        await self._switch_to_pending(page)
+        await self._wait_school_switch_settled(page, school_name=school_name)
+        return True
+
+    async def _find_task_row_index(self, page: Any, topic_title: str) -> int:
+        rows = page.locator(self._task_rows_selector)
+        row_count = min(await rows.count(), 120)
+        if row_count == 0:
+            return -1
+
+        normalized_target = self._compact_text(topic_title)
+        shortlist: list[tuple[int, str]] = []
+
+        for idx in range(row_count):
+            row = rows.nth(idx)
+            try:
+                if not await row.is_visible():
+                    continue
+            except Exception:
+                continue
+
+            row_text = (await row.inner_text()).strip()
+            if not row_text:
+                continue
+
+            row_compact = self._compact_text(row_text)
+            title_cell = row.locator(
+                "td:nth-child(2) .topic, td:nth-child(2) .cell"
+            ).first
+            title_text = ""
+            if await title_cell.count() > 0:
+                title_text = (await title_cell.inner_text()).strip()
+            title_compact = self._compact_text(title_text)
+
+            candidates = [x for x in [title_compact, row_compact] if x]
+            if not candidates:
+                continue
+
+            if normalized_target:
+                for candidate in candidates:
+                    if normalized_target in candidate or candidate in normalized_target:
+                        return idx
+
+            shortlist.append((idx, title_compact or row_compact))
+
+        if not normalized_target:
+            return shortlist[0][0] if shortlist else -1
+
+        # 兜底：按前缀相似度选最接近的行，减少页面文案截断导致的漏匹配。
+        target_prefix = normalized_target[:18]
+        best_idx = -1
+        best_score = -1
+        for idx, text in shortlist:
+            if not text:
+                continue
+            score = 0
+            if target_prefix and target_prefix in text:
+                score += 2
+            if text[:18] == target_prefix:
+                score += 2
+            overlap = min(len(text), len(normalized_target))
+            if overlap > 0:
+                same = sum(
+                    1
+                    for i in range(min(overlap, 18))
+                    if text[i] == normalized_target[i]
+                )
+                score += same
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+
+        return best_idx
+
     async def scan_discovered_tasks(
         self,
         run_id: str,
@@ -804,7 +903,13 @@ class BrowserWorker:
         emit("INFO", "scan.complete", f"scan completed with tasks: {len(tasks)}")
         return tasks
 
-    async def grab_task(self, run_id: str, task_id: str) -> bool:
+    async def grab_task(
+        self,
+        run_id: str,
+        task_id: str,
+        school_name: str = "",
+        topic_title: str = "",
+    ) -> bool:
         if self._use_mock:
             await asyncio.sleep(0.05)
             return True
@@ -815,13 +920,69 @@ class BrowserWorker:
         await self._ensure_login(run_id)
         page = session.page
 
-        # 按文案优先点击“我会做，抢单答题”，失败则返回 False 由上层记录异常。
-        button = page.locator("text=我会做，抢单答题").first
-        if await button.count() == 0:
-            await asyncio.sleep(0.05)
+        if not await self._ensure_single_research_ready(page):
             return False
-        await button.click()
-        await page.wait_for_timeout(200)
+
+        await self._switch_to_pending(page)
+        if school_name:
+            switched = await self._switch_school(page, school_name)
+            if not switched:
+                return False
+
+        row_index = await self._find_task_row_index(page, topic_title)
+        if row_index < 0:
+            return False
+
+        rows = page.locator(self._task_rows_selector)
+        if row_index >= await rows.count():
+            return False
+
+        row = rows.nth(row_index)
+        view_trigger = row.locator(self._view_button_selector).first
+        if await view_trigger.count() == 0:
+            view_trigger = row.locator(
+                "button:has(span:has-text('查看')), button:has-text('查看'), span:has-text('查看')"
+            ).first
+        if await view_trigger.count() == 0:
+            return False
+
+        try:
+            await view_trigger.click(timeout=2500)
+        except Exception:
+            return False
+
+        dialog = None
+        for _ in range(20):
+            dialog = await self._get_visible_dialog_wrapper(page)
+            if dialog is not None:
+                break
+            await page.wait_for_timeout(150)
+        if dialog is None:
+            return False
+
+        clicked = await self._click_first_available(
+            dialog,
+            [
+                "button:has-text('我会做')",
+                "button:has-text('抢单答题')",
+                "button.el-button--warning",
+                self._task_action_button_selector,
+            ],
+        )
+        if not clicked:
+            clicked = await self._click_first_available(
+                page,
+                [
+                    ".el-dialog__footer button:has-text('我会做')",
+                    ".el-dialog__footer button:has-text('抢单答题')",
+                    ".el-dialog__footer button.el-button--warning",
+                    self._task_action_button_selector,
+                ],
+            )
+        if not clicked:
+            return False
+
+        await page.wait_for_timeout(300)
         return True
 
     async def write_solution(

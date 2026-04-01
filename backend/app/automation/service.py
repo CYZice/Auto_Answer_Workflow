@@ -259,7 +259,12 @@ class AutomationService:
                         if task is None:
                             continue
                         self._check_stopped(run)
-                        ok = await self._browser.grab_task(run_id, task.task_id)
+                        ok = await self._browser.grab_task(
+                            run_id,
+                            task.task_id,
+                            task.school_name or "",
+                            task.topic_title or "",
+                        )
                         if not ok:
                             repo.update_task_content(
                                 task,

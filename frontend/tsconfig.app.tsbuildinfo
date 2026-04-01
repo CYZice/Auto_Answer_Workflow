@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/main.tsx","./src/vite-env.d.ts"],"version":"5.9.3"}
+{"root":["./src/app.tsx","./src/main.tsx","./src/vite-env.d.ts","./src/automation-console/app.tsx","./src/automation-console/api.ts","./src/automation-console/main.tsx","./src/automation-console/types.ts","./src/automation-console/components/logpanel.tsx","./src/automation-console/components/reviewpanel.tsx","./src/automation-console/components/runcontrols.tsx","./src/automation-console/components/tasktable.tsx"],"version":"5.9.3"}

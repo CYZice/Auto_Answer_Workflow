@@ -87,6 +87,33 @@ npm run dev
 5. **获取结果**:
    - 当状态变为 `completed` 时，右侧将呈现包含漂亮数学公式的最终排版结果。
 
+## 自动化接题控制台（新增）
+
+后端新增独立命名空间 `automation`，并提供一套可串行执行的 API：
+
+- `POST /api/automation/session/start`
+- `POST /api/automation/scan/start`
+- `GET /api/automation/tasks`
+- `POST /api/automation/tasks/select`
+- `POST /api/automation/grab/start`
+- `POST /api/automation/solve/start`
+- `POST /api/automation/task/{task_id}/review/save`
+- `POST /api/automation/task/{task_id}/confirm-submit`
+- `POST /api/automation/run/pause`
+- `POST /api/automation/run/resume`
+- `POST /api/automation/run/stop`（硬中断）
+- `GET /api/automation/logs`
+
+前端新增独立入口页面：
+
+- `http://localhost:5173/automation-console.html`
+
+注意事项：
+
+1. 新增浏览器自动化依赖后，首次需要执行 `python -m playwright install chromium`。
+2. `stop` 为硬中断，会取消当前运行中的后台任务并阻止后续步骤。
+3. `review_pending` 默认超时 10 分钟自动流转到 `skipped`。
+
 ## 核心目录结构
 ```text
 .

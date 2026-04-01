@@ -200,17 +200,13 @@ class AutomationService:
             repo = AutomationRepository(db)
             for task_id in expired_task_ids:
                 task = repo.get_task(task_id)
-                if (
-                    task is None
-                    or task.run_id != run_id
-                    or task.status != "review_pending"
-                ):
+                if task is None or task.status != "review_pending":
                     self._review_deadlines.pop(task_id, None)
                     continue
                 repo.update_status(task, "skipped")
                 self._log(
                     db,
-                    run_id,
+                    task.run_id,
                     "review_timeout",
                     "review timeout, auto skipped",
                     task_id=task.task_id,
@@ -259,6 +255,8 @@ class AutomationService:
                         if task is None:
                             continue
                         self._check_stopped(run)
+                        task.run_id = run_id
+                        db.commit()
                         ok = await self._browser.grab_task(
                             run_id,
                             task.task_id,
@@ -354,6 +352,7 @@ class AutomationService:
                             continue
                         self._check_stopped(run)
                         run.current_task_id = task.task_id
+                        task.run_id = run_id
                         repo.update_status(task, "solving")
 
                     try:

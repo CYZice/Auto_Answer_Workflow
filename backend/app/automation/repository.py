@@ -26,6 +26,15 @@ class AutomationRepository:
             .first()
         )
         if item is None:
+            item = (
+                self.db.query(AutomationTask)
+                .filter(
+                    AutomationTask.school_name == school_name,
+                    AutomationTask.topic_title == topic_title,
+                )
+                .first()
+            )
+        if item is None:
             item = AutomationTask(
                 task_id=task_id,
                 run_id=run_id,
@@ -40,7 +49,6 @@ class AutomationRepository:
             item.school_name = school_name
             item.topic_title = topic_title
             item.topic_image_url = topic_image_url
-            item.status = status
         self.db.commit()
         self.db.refresh(item)
         return item
@@ -61,7 +69,7 @@ class AutomationRepository:
         page: int,
         page_size: int,
     ) -> tuple[int, list[AutomationTask]]:
-        query = self.db.query(AutomationTask).filter(AutomationTask.run_id == run_id)
+        query = self.db.query(AutomationTask)
         if status:
             query = query.filter(AutomationTask.status == status)
         if school:
@@ -117,9 +125,7 @@ class AutomationRepository:
             return 0
         items = (
             self.db.query(AutomationTask)
-            .filter(
-                AutomationTask.run_id == run_id, AutomationTask.task_id.in_(task_ids)
-            )
+            .filter(AutomationTask.task_id.in_(task_ids))
             .all()
         )
         updated = 0
@@ -138,10 +144,7 @@ class AutomationRepository:
             return 0
         deleted = (
             self.db.query(AutomationTask)
-            .filter(
-                AutomationTask.run_id == run_id,
-                AutomationTask.task_id.in_(task_ids),
-            )
+            .filter(AutomationTask.task_id.in_(task_ids))
             .delete(synchronize_session=False)
         )
         self.db.commit()
@@ -150,9 +153,7 @@ class AutomationRepository:
     def list_by_status(self, run_id: str, statuses: list[str]) -> list[AutomationTask]:
         return (
             self.db.query(AutomationTask)
-            .filter(
-                AutomationTask.run_id == run_id, AutomationTask.status.in_(statuses)
-            )
+            .filter(AutomationTask.status.in_(statuses))
             .order_by(AutomationTask.school_name.asc(), AutomationTask.id.asc())
             .all()
         )

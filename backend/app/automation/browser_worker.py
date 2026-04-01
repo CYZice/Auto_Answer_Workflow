@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
+import re
 import uuid
 from typing import Any
 from collections.abc import Callable
@@ -546,9 +548,13 @@ class BrowserWorker:
                 topic_title = topic_title[:280]
 
             display_school = school_name or school_cell or "默认学校"
+            stable_key = f"{display_school}|{topic_title}|{topic_image_url}".encode(
+                "utf-8", errors="ignore"
+            )
+            stable_id = f"auto_{hashlib.sha1(stable_key).hexdigest()[:16]}"
             tasks.append(
                 {
-                    "task_id": f"auto_{uuid.uuid4().hex[:10]}",
+                    "task_id": stable_id,
                     "run_id": run_id,
                     "school_name": display_school,
                     "topic_title": topic_title,
@@ -670,8 +676,36 @@ class BrowserWorker:
     def _normalize_text(text: str) -> str:
         return "".join((text or "").split()).lower()
 
+    @staticmethod
+    def _normalize_preview_text(text: str) -> str:
+        raw = (text or "").lower()
+        if not raw:
+            return ""
+
+        # 去掉 HTML 标签、公式片段与常见模板噪声，提升跨页面匹配稳定性。
+        raw = re.sub(r"<[^>]+>", " ", raw)
+        raw = re.sub(r"\{[^{}]*\}", " ", raw)
+        raw = re.sub(r"[\r\n\t]+", " ", raw)
+        raw = raw.replace("&nbsp;", " ")
+        noise_tokens = [
+            "试题原始图片",
+            "ai识别内容",
+            "插入公式",
+            "image.png",
+            "katex",
+            "mathml",
+            "annotation",
+            "application/x-tex",
+            "data-w-e-type",
+            "is_latex",
+        ]
+        for token in noise_tokens:
+            raw = raw.replace(token, " ")
+        raw = re.sub(r"\s+", "", raw)
+        return raw
+
     def _build_title_keywords(self, topic_title: str) -> list[str]:
-        normalized = self._normalize_text(topic_title)
+        normalized = self._normalize_preview_text(topic_title)
         if not normalized:
             return []
         candidates = [
@@ -688,6 +722,46 @@ class BrowserWorker:
             if item not in unique:
                 unique.append(item)
         return unique
+
+    @staticmethod
+    def _extract_match_tokens(text: str) -> set[str]:
+        normalized = BrowserWorker._normalize_preview_text(text)
+        if not normalized:
+            return set()
+        tokens = set(re.findall(r"[\u4e00-\u9fff]{2,}|[a-z0-9]{3,}", normalized))
+        if len(normalized) >= 12:
+            tokens.add(normalized[:12])
+        if len(normalized) >= 20:
+            tokens.add(normalized[:20])
+        return tokens
+
+    def _is_row_text_match(self, row_text: str, topic_title: str) -> bool:
+        normalized_row = self._normalize_preview_text(row_text)
+        normalized_title = self._normalize_preview_text(topic_title)
+        if not normalized_row or not normalized_title:
+            return False
+
+        if normalized_title in normalized_row or normalized_row in normalized_title:
+            return True
+
+        keywords = self._build_title_keywords(topic_title)
+        if any(key in normalized_row for key in keywords):
+            return True
+
+        row_tokens = self._extract_match_tokens(row_text)
+        title_tokens = self._extract_match_tokens(topic_title)
+        if not row_tokens or not title_tokens:
+            return False
+        overlap = row_tokens.intersection(title_tokens)
+        if len(overlap) >= 2:
+            return True
+        long_overlap = [token for token in overlap if len(token) >= 6]
+        if len(long_overlap) >= 1:
+            return True
+
+        # OCR/公式场景下文本噪声大，允许较低阈值的 token 重合率。
+        ratio = len(overlap) / max(1, min(len(row_tokens), len(title_tokens)))
+        return ratio >= 0.3
 
     async def _select_school(self, page: Any, school_name: str) -> bool:
         if not school_name:
@@ -724,9 +798,6 @@ class BrowserWorker:
         if row_count == 0:
             return False
 
-        normalized_title = self._normalize_text(topic_title)
-        keywords = self._build_title_keywords(topic_title)
-
         for idx in range(row_count):
             row = rows.nth(idx)
             try:
@@ -738,18 +809,8 @@ class BrowserWorker:
             row_text = (await row.inner_text()).strip()
             if not row_text:
                 continue
-            normalized_row = self._normalize_text(row_text)
-            if not normalized_row:
-                continue
 
-            matched = False
-            if normalized_title:
-                if normalized_title in normalized_row:
-                    matched = True
-                elif any(key in normalized_row for key in keywords):
-                    matched = True
-
-            if not matched:
+            if not self._is_row_text_match(row_text, topic_title):
                 continue
 
             if await self._click_grab_button_in_row(row):
@@ -921,11 +982,19 @@ class BrowserWorker:
         if not selected:
             return False
 
-        grabbed = await self._grab_task_from_current_table(page, topic_title)
-        if not grabbed:
-            await asyncio.sleep(0.05)
-            return False
-        return True
+        # 接单阶段比扫描更容易遇到学校切换后的延迟刷新，这里再做一次稳定等待与重试。
+        await self._wait_school_switch_settled(page, school_name=school_name)
+        await page.wait_for_timeout(250)
+
+        for _ in range(3):
+            grabbed = await self._grab_task_from_current_table(page, topic_title)
+            if grabbed:
+                return True
+            await self._wait_school_switch_settled(page, school_name=school_name)
+            await page.wait_for_timeout(250)
+
+        await asyncio.sleep(0.05)
+        return False
 
     async def write_solution(
         self,

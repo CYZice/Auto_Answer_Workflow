@@ -97,6 +97,34 @@ function App() {
 
     const selectedIds = useMemo(() => Array.from(selected), [selected])
 
+    const getErrorMessage = (error: unknown): string => {
+        if (typeof error === 'object' && error !== null) {
+            const maybeAxiosError = error as {
+                response?: { data?: { detail?: string; message?: string } }
+                message?: string
+            }
+            const detail = maybeAxiosError.response?.data?.detail || maybeAxiosError.response?.data?.message
+            if (detail) return String(detail)
+            if (maybeAxiosError.message) return String(maybeAxiosError.message)
+        }
+        return '未知错误'
+    }
+
+    const runAction = async (
+        name: string,
+        action: () => Promise<void | boolean>,
+        successMessage?: string,
+    ) => {
+        try {
+            const shouldShowSuccess = await action()
+            if (successMessage && shouldShowSuccess !== false) {
+                window.alert(successMessage)
+            }
+        } catch (error) {
+            window.alert(`${name}失败: ${getErrorMessage(error)}`)
+        }
+    }
+
     return (
         <div className="min-h-screen bg-gradient-to-br from-sky-50 via-cyan-50 to-emerald-50 p-6">
             <div className="mx-auto max-w-7xl space-y-4">
@@ -112,37 +140,62 @@ function App() {
                     onPasswordChange={setPassword}
                     onModeChange={setMode}
                     onStart={async () => {
-                        const session = await startSession(username, password, mode)
-                        setRunId(session.run_id)
-                        setRunState(session.state)
-                        await refresh()
+                        await runAction('启动会话', async () => {
+                            const session = await startSession(username, password, mode)
+                            setRunId(session.run_id)
+                            setRunState(session.state)
+                            await refresh()
+                        }, '启动会话成功')
                     }}
                     onScan={async () => {
-                        await startScan(runId)
+                        await runAction('扫描', async () => {
+                            await startScan(runId)
+                            await refresh()
+                        }, '扫描已启动，请留意运行日志')
                     }}
                     onSelect={async () => {
-                        await selectTasks(runId, selectedIds)
-                        await refresh()
+                        await runAction('确认勾选', async () => {
+                            if (selectedIds.length === 0) {
+                                window.alert('请先勾选至少一条任务')
+                                return false
+                            }
+                            await selectTasks(runId, selectedIds)
+                            await refresh()
+                            return true
+                        }, '确认勾选成功')
                     }}
                     onGrab={async () => {
-                        await startGrab(runId)
-                        await refresh()
+                        await runAction('接单', async () => {
+                            if (selectedIds.length > 0) {
+                                await selectTasks(runId, selectedIds)
+                            }
+                            await startGrab(runId)
+                            await refresh()
+                        }, '接单已启动，请留意运行日志')
                     }}
                     onSolve={async () => {
-                        await startSolve(runId)
-                        await refresh()
+                        await runAction('解题', async () => {
+                            await startSolve(runId)
+                            await refresh()
+                        }, '解题已启动，请留意运行日志')
                     }}
                     onPause={async () => {
-                        await pauseRun(runId)
-                        await refresh()
+                        await runAction('暂停', async () => {
+                            await pauseRun(runId)
+                            await refresh()
+                        }, '已暂停')
                     }}
                     onResume={async () => {
-                        await resumeRun(runId)
-                        await refresh()
+                        await runAction('继续', async () => {
+                            await resumeRun(runId)
+                            await refresh()
+                        }, '已恢复运行')
                     }}
                     onStop={async () => {
-                        await stopRun(runId)
-                        await refresh()
+                        await runAction('硬停止', async () => {
+                            await stopRun(runId)
+                            await refresh()
+                        }, '已发送硬停止指令')
                     }}
                 />
 

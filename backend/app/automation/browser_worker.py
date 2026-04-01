@@ -91,7 +91,7 @@ class BrowserWorker:
             "div:has-text('待开始')",
             "div:has-text('待解题')",
         ]
-        self._task_action_button_selector = "button:has-text('我会做，抢单答题')"
+        self._task_action_button_selector = "button:has-text('我会做，抢单答题'), button:has-text('我会做'), button:has-text('抢单答题')"
         self._task_rows_selector = ".d2-container-full__body .el-table__body-wrapper .el-table__body tbody tr.el-table__row"
         self._view_button_selector = (
             "td:nth-child(4) .cell button.el-button.el-button--text.el-button--default:has(span:has-text('查看')), "
@@ -666,6 +666,98 @@ class BrowserWorker:
         await self._click_first_available(page, self._pending_tab_candidates)
         await page.wait_for_timeout(300)
 
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        return "".join((text or "").split()).lower()
+
+    def _build_title_keywords(self, topic_title: str) -> list[str]:
+        normalized = self._normalize_text(topic_title)
+        if not normalized:
+            return []
+        candidates = [
+            normalized,
+            normalized[:48],
+            normalized[:32],
+            normalized[:24],
+            normalized[:16],
+        ]
+        unique: list[str] = []
+        for item in candidates:
+            if len(item) < 6:
+                continue
+            if item not in unique:
+                unique.append(item)
+        return unique
+
+    async def _select_school(self, page: Any, school_name: str) -> bool:
+        if not school_name:
+            return True
+
+        await self._open_school_dropdown(page)
+        options = page.locator(self._school_option_selector)
+        option = options.filter(has_text=school_name).first
+        if await option.count() == 0:
+            return False
+
+        try:
+            await option.click(timeout=1500)
+            await self._wait_school_switch_settled(page, school_name=school_name)
+            await self._switch_to_pending(page)
+            await self._wait_school_switch_settled(page, school_name=school_name)
+            return True
+        except Exception:
+            return False
+
+    async def _click_grab_button_in_row(self, row: Any) -> bool:
+        button = row.locator(self._task_action_button_selector).first
+        if await button.count() == 0:
+            return False
+        try:
+            await button.click(timeout=2000)
+            return True
+        except Exception:
+            return False
+
+    async def _grab_task_from_current_table(self, page: Any, topic_title: str) -> bool:
+        rows = page.locator(self._task_rows_selector)
+        row_count = min(await rows.count(), 120)
+        if row_count == 0:
+            return False
+
+        normalized_title = self._normalize_text(topic_title)
+        keywords = self._build_title_keywords(topic_title)
+
+        for idx in range(row_count):
+            row = rows.nth(idx)
+            try:
+                if not await row.is_visible():
+                    continue
+            except Exception:
+                continue
+
+            row_text = (await row.inner_text()).strip()
+            if not row_text:
+                continue
+            normalized_row = self._normalize_text(row_text)
+            if not normalized_row:
+                continue
+
+            matched = False
+            if normalized_title:
+                if normalized_title in normalized_row:
+                    matched = True
+                elif any(key in normalized_row for key in keywords):
+                    matched = True
+
+            if not matched:
+                continue
+
+            if await self._click_grab_button_in_row(row):
+                await page.wait_for_timeout(250)
+                return True
+
+        return False
+
     async def scan_discovered_tasks(
         self,
         run_id: str,
@@ -804,7 +896,13 @@ class BrowserWorker:
         emit("INFO", "scan.complete", f"scan completed with tasks: {len(tasks)}")
         return tasks
 
-    async def grab_task(self, run_id: str, task_id: str) -> bool:
+    async def grab_task(
+        self,
+        run_id: str,
+        task_id: str,
+        school_name: str,
+        topic_title: str,
+    ) -> bool:
         if self._use_mock:
             await asyncio.sleep(0.05)
             return True
@@ -815,13 +913,18 @@ class BrowserWorker:
         await self._ensure_login(run_id)
         page = session.page
 
-        # 按文案优先点击“我会做，抢单答题”，失败则返回 False 由上层记录异常。
-        button = page.locator("text=我会做，抢单答题").first
-        if await button.count() == 0:
+        if not await self._ensure_single_research_ready(page):
+            return False
+        await self._switch_to_pending(page)
+
+        selected = await self._select_school(page, school_name)
+        if not selected:
+            return False
+
+        grabbed = await self._grab_task_from_current_table(page, topic_title)
+        if not grabbed:
             await asyncio.sleep(0.05)
             return False
-        await button.click()
-        await page.wait_for_timeout(200)
         return True
 
     async def write_solution(

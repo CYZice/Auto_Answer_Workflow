@@ -259,12 +259,28 @@ class AutomationService:
                         if task is None:
                             continue
                         self._check_stopped(run)
-                        ok = await self._browser.grab_task(run_id, task.task_id)
+                        ok = await self._browser.grab_task(
+                            run_id,
+                            task.task_id,
+                            task.school_name or "",
+                            task.topic_title or "",
+                        )
                         if not ok:
                             repo.update_task_content(
                                 task,
                                 error_code="grab_failed",
-                                error_message="grab failed",
+                                error_message=(
+                                    "grab failed: school or topic not matched on page"
+                                ),
+                            )
+                            self._log(
+                                db,
+                                run_id,
+                                "grab",
+                                "task grab failed: school/topic locate failed",
+                                task_id=task.task_id,
+                                school_name=school_name,
+                                level="WARN",
                             )
                             continue
                         repo.update_status(task, "grabbed")

@@ -36,6 +36,7 @@ class AutomationService:
         self._logs = AutomationLoggingStore()
         self._review_deadlines: dict[str, float] = {}
         self._review_timeout_seconds = 600
+        self._run_lock = asyncio.Lock()
 
     async def start_session(self, req: StartSessionReq) -> RunRuntime:
         run = RunRuntime(
@@ -46,6 +47,13 @@ class AutomationService:
         )
         async with self._lock:
             self._runs[run.run_id] = run
+        # 账号密码仅会话内存持有，不落盘
+        await self._browser.start_session(
+            run_id=run.run_id,
+            username=req.username,
+            password=req.password,
+            mode=req.mode,
+        )
         return run
 
     def get_run(self, run_id: str) -> RunRuntime:
@@ -80,25 +88,25 @@ class AutomationService:
         )
 
     async def start_scan(self, run_id: str) -> None:
-        run = self.get_run(run_id)
-        run.state = "running"
-        run.stop_event = run.stop_event or asyncio.Event()
-        await self._browser.start()
-        rows = await self._browser.scan_discovered_tasks(run_id)
-        with SessionLocal() as db:
-            repo = AutomationRepository(db)
-            for row in rows:
-                self._check_stopped(run)
-                repo.upsert_task(
-                    task_id=row["task_id"],
-                    run_id=run_id,
-                    school_name=row["school_name"],
-                    topic_title=row["topic_title"],
-                    topic_image_url=row.get("topic_image_url"),
-                    status="discovered",
-                )
-            self._log(db, run_id, "scan", f"discovered tasks: {len(rows)}")
-        run.state = "idle"
+        async with self._run_lock:
+            run = self.get_run(run_id)
+            run.state = "running"
+            run.stop_event = run.stop_event or asyncio.Event()
+            rows = await self._browser.scan_discovered_tasks(run_id)
+            with SessionLocal() as db:
+                repo = AutomationRepository(db)
+                for row in rows:
+                    self._check_stopped(run)
+                    repo.upsert_task(
+                        task_id=row["task_id"],
+                        run_id=run_id,
+                        school_name=row["school_name"],
+                        topic_title=row["topic_title"],
+                        topic_image_url=row.get("topic_image_url"),
+                        status="discovered",
+                    )
+                self._log(db, run_id, "scan", f"discovered tasks: {len(rows)}")
+            run.state = "idle"
 
     async def _run_job(self, run_id: str, name: str, coro):
         run = self.get_run(run_id)
@@ -186,28 +194,52 @@ class AutomationService:
             return count
 
     async def start_grab(self, run_id: str, limit: int = 0) -> int:
-        run = self.get_run(run_id)
-        self._expire_review_timeouts(run_id)
-        run.state = "running"
-        done = 0
-        with SessionLocal() as db:
-            repo = AutomationRepository(db)
-            rows = repo.list_by_status(run_id, ["selected"])
-            if limit > 0:
-                rows = rows[:limit]
+        async with self._run_lock:
+            run = self.get_run(run_id)
+            self._expire_review_timeouts(run_id)
+            run.state = "running"
+            done = 0
+            with SessionLocal() as db:
+                repo = AutomationRepository(db)
+                rows = repo.list_by_status(run_id, ["selected"])
+                if limit > 0:
+                    rows = rows[:limit]
+
+            grouped: dict[str, list[str]] = {}
             for row in rows:
-                self._check_stopped(run)
-                ok = await self._browser.grab_task(row.task_id)
-                if not ok:
-                    repo.update_task_content(
-                        row, error_code="grab_failed", error_message="grab failed"
-                    )
-                    continue
-                repo.update_status(row, "grabbed")
-                done += 1
-            self._log(db, run_id, "grab", f"grabbed tasks: {done}")
-        run.state = "idle"
-        return done
+                grouped.setdefault(row.school_name or "", []).append(row.task_id)
+
+            for school_name, task_ids in grouped.items():
+                for task_id in task_ids:
+                    with SessionLocal() as db:
+                        repo = AutomationRepository(db)
+                        task = repo.get_task(task_id)
+                        if task is None:
+                            continue
+                        self._check_stopped(run)
+                        ok = await self._browser.grab_task(run_id, task.task_id)
+                        if not ok:
+                            repo.update_task_content(
+                                task,
+                                error_code="grab_failed",
+                                error_message="grab failed",
+                            )
+                            continue
+                        repo.update_status(task, "grabbed")
+                        done += 1
+                        self._log(
+                            db,
+                            run_id,
+                            "grab",
+                            "task grabbed",
+                            task_id=task.task_id,
+                            school_name=school_name,
+                        )
+
+            with SessionLocal() as db:
+                self._log(db, run_id, "grab", f"grabbed tasks: {done}")
+            run.state = "idle"
+            return done
 
     async def _invoke_existing_workflow(self, image_url: str) -> str:
         payload = {"image_url": image_url}
@@ -240,99 +272,118 @@ class AutomationService:
         raise TimeoutError("workflow timeout")
 
     async def start_solve(self, run_id: str, limit: int = 0) -> int:
-        run = self.get_run(run_id)
-        self._expire_review_timeouts(run_id)
-        run.state = "running"
-        done = 0
-        with SessionLocal() as db:
-            repo = AutomationRepository(db)
-            rows = repo.list_by_status(run_id, ["grabbed"])
-            if limit > 0:
-                rows = rows[:limit]
-
-        for row in rows:
+        async with self._run_lock:
+            run = self.get_run(run_id)
+            self._expire_review_timeouts(run_id)
+            run.state = "running"
+            done = 0
             with SessionLocal() as db:
                 repo = AutomationRepository(db)
-                task = repo.get_task(row.task_id)
-                if task is None:
-                    continue
-                self._check_stopped(run)
-                run.current_task_id = task.task_id
-                repo.update_status(task, "solving")
+                rows = repo.list_by_status(run_id, ["grabbed"])
+                if limit > 0:
+                    rows = rows[:limit]
 
-            try:
-                final_markdown = await self._invoke_existing_workflow(
-                    row.topic_image_url or ""
-                )
-                analysis_md, extension = self._renderer.split_answer(final_markdown)
-                image_path = self._renderer.save_analysis_snapshot(analysis_md)
+            grouped: dict[str, list[str]] = {}
+            for row in rows:
+                grouped.setdefault(row.school_name or "", []).append(row.task_id)
 
-                with SessionLocal() as db:
-                    repo = AutomationRepository(db)
-                    task = repo.get_task(row.task_id)
-                    if task is None:
-                        continue
-                    self._check_stopped(run)
-                    repo.update_task_content(
-                        task,
-                        final_markdown=final_markdown,
-                        analysis_markdown=analysis_md,
-                        extension_text=extension,
-                    )
-                    repo.update_status(task, "filled")
-                    repo.update_status(task, "review_pending")
-                    self._review_deadlines[task.task_id] = (
-                        time.monotonic() + self._review_timeout_seconds
-                    )
-                    self._log(
-                        db,
-                        run_id,
-                        "solve",
-                        "task solved and waiting review",
-                        task_id=task.task_id,
-                        school_name=task.school_name,
-                    )
+            for _, task_ids in grouped.items():
+                for task_id in task_ids:
+                    with SessionLocal() as db:
+                        repo = AutomationRepository(db)
+                        task = repo.get_task(task_id)
+                        if task is None:
+                            continue
+                        self._check_stopped(run)
+                        run.current_task_id = task.task_id
+                        repo.update_status(task, "solving")
 
-                await self._browser.write_solution(row.task_id, image_path, extension)
-                done += 1
-            except asyncio.CancelledError:
-                with SessionLocal() as db:
-                    repo = AutomationRepository(db)
-                    task = repo.get_task(row.task_id)
-                    if task and task.status != "submitted":
-                        validate_transition(task.status, "stopped")
-                        task.status = "stopped"
-                        db.commit()
-                raise
-            except Exception as exc:
-                with SessionLocal() as db:
-                    repo = AutomationRepository(db)
-                    task = repo.get_task(row.task_id)
-                    if task:
-                        try:
-                            repo.update_status(task, "solve_failed")
-                        except Exception:
-                            task.status = "solve_failed"
-                            db.commit()
-                        repo.update_task_content(
-                            task,
-                            error_code="solve_failed",
-                            error_message=str(exc),
+                    try:
+                        final_markdown = await self._invoke_existing_workflow(
+                            task.topic_image_url or ""
                         )
-                        self._log(
-                            db,
+                        analysis_md, extension = self._renderer.split_answer(
+                            final_markdown
+                        )
+                        image_path = self._renderer.save_analysis_snapshot(analysis_md)
+
+                        with SessionLocal() as db:
+                            repo = AutomationRepository(db)
+                            task = repo.get_task(task_id)
+                            if task is None:
+                                continue
+                            self._check_stopped(run)
+                            repo.update_task_content(
+                                task,
+                                final_markdown=final_markdown,
+                                analysis_markdown=analysis_md,
+                                extension_text=extension,
+                            )
+
+                        await self._browser.write_solution(
                             run_id,
-                            "solve",
-                            f"task solve failed: {exc}",
-                            task_id=task.task_id,
-                            school_name=task.school_name,
-                            level="ERROR",
+                            task_id,
+                            image_path,
+                            extension,
                         )
-            finally:
-                run.current_task_id = None
 
-        run.state = "idle"
-        return done
+                        with SessionLocal() as db:
+                            repo = AutomationRepository(db)
+                            task = repo.get_task(task_id)
+                            if task is None:
+                                continue
+                            repo.update_status(task, "filled")
+                            repo.update_status(task, "review_pending")
+                            self._review_deadlines[task.task_id] = (
+                                time.monotonic() + self._review_timeout_seconds
+                            )
+                            self._log(
+                                db,
+                                run_id,
+                                "solve",
+                                "task solved and waiting review",
+                                task_id=task.task_id,
+                                school_name=task.school_name,
+                            )
+                        done += 1
+                    except asyncio.CancelledError:
+                        with SessionLocal() as db:
+                            repo = AutomationRepository(db)
+                            task = repo.get_task(task_id)
+                            if task and task.status != "submitted":
+                                validate_transition(task.status, "stopped")
+                                task.status = "stopped"
+                                db.commit()
+                        raise
+                    except Exception as exc:
+                        with SessionLocal() as db:
+                            repo = AutomationRepository(db)
+                            task = repo.get_task(task_id)
+                            if task:
+                                try:
+                                    repo.update_status(task, "solve_failed")
+                                except Exception:
+                                    task.status = "solve_failed"
+                                    db.commit()
+                                repo.update_task_content(
+                                    task,
+                                    error_code="solve_failed",
+                                    error_message=str(exc),
+                                )
+                                self._log(
+                                    db,
+                                    run_id,
+                                    "solve",
+                                    f"task solve failed: {exc}",
+                                    task_id=task.task_id,
+                                    school_name=task.school_name,
+                                    level="ERROR",
+                                )
+                    finally:
+                        run.current_task_id = None
+
+            run.state = "idle"
+            return done
 
     async def save_review(self, task_id: str, analysis_text: str, extension_text: str):
         with SessionLocal() as db:
@@ -369,7 +420,7 @@ class AutomationService:
                 raise ValueError("task is not in ready_to_submit")
             repo.update_status(task, "submitting")
 
-        ok = await self._browser.submit_task(task_id)
+        ok = await self._browser.submit_task(task.run_id, task_id)
 
         with SessionLocal() as db:
             repo = AutomationRepository(db)
@@ -420,6 +471,7 @@ class AutomationService:
                 pass
             except Exception:
                 pass
+        await self._browser.stop_session(run_id)
 
     def list_tasks(
         self,

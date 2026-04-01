@@ -30,6 +30,17 @@ echo ^>^>^> 准备启动后端 (FastAPI)...
 :: 进入后端目录
 cd "%PROJECT_ROOT%\backend"
 
+:: 安装 Playwright Chromium（AUTOMATION_SKIP_BROWSER_INSTALL=1 可跳过）
+if "%AUTOMATION_SKIP_BROWSER_INSTALL%"=="1" (
+    echo 已设置 AUTOMATION_SKIP_BROWSER_INSTALL=1，跳过浏览器安装。
+) else (
+    echo 检查 Playwright Chromium 安装状态...
+    if exist "%PROJECT_ROOT%\.venv\Scripts\activate.bat" (
+        call "%PROJECT_ROOT%\.venv\Scripts\activate.bat"
+    )
+    python -m playwright install chromium >nul 2>nul
+)
+
 echo 启动后端服务 (端口 8080)...
 :: 优先使用项目根目录下的 .venv 虚拟环境
 if exist "%PROJECT_ROOT%\.venv\Scripts\activate.bat" (

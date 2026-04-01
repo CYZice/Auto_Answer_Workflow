@@ -113,6 +113,8 @@ npm run dev
 1. 新增浏览器自动化依赖后，首次需要执行 `python -m playwright install chromium`。
 2. `stop` 为硬中断，会取消当前运行中的后台任务并阻止后续步骤。
 3. `review_pending` 默认超时 10 分钟自动流转到 `skipped`。
+4. 默认启用 mock 浏览器模式：`AUTOMATION_USE_MOCK=1`。
+5. 切换真实浏览器模式需配置：`AUTOMATION_USE_MOCK=0` 与 `AUTOMATION_TARGET_URL=<目标平台地址>`。
 
 ## 核心目录结构
 ```text

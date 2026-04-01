@@ -45,6 +45,14 @@ cd "${PROJECT_ROOT}/backend" || exit
 echo -e "${YELLOW}正在检查后端依赖...${NC}"
 pip install -r requirements.txt -q
 
+# 安装 Playwright Chromium（AUTOMATION_SKIP_BROWSER_INSTALL=1 可跳过）
+if [ "${AUTOMATION_SKIP_BROWSER_INSTALL}" = "1" ]; then
+    echo -e "${YELLOW}已设置 AUTOMATION_SKIP_BROWSER_INSTALL=1，跳过浏览器安装${NC}"
+else
+    echo -e "${YELLOW}检查 Playwright Chromium 安装状态...${NC}"
+    python3 -m playwright install chromium >/dev/null 2>&1 || true
+fi
+
 # 启动后端服务 (后台运行)
 echo -e "${GREEN}启动后端服务 (端口 8080)...${NC}"
 # uvicorn 会继承当前 shell 的 stdout，把它放在后台运行

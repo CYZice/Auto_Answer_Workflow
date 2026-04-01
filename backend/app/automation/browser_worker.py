@@ -92,6 +92,11 @@ class BrowserWorker:
             "div:has-text('待解题')",
         ]
         self._task_action_button_selector = "button:has-text('我会做，抢单答题')"
+        self._task_rows_selector = ".d2-container-full__body .el-table__body-wrapper .el-table__body tbody tr.el-table__row"
+        self._view_button_selector = (
+            "td:nth-child(4) .cell button.el-button.el-button--text.el-button--default:has(span:has-text('查看')), "
+            "td:last-child .cell button.el-button.el-button--text.el-button--default:has(span:has-text('查看'))"
+        )
         self._scan_noise_keywords = {
             "薪酬统计",
             "提现统计",
@@ -306,57 +311,252 @@ class BrowserWorker:
             return False
         return False
 
+    async def _get_visible_dialog_wrapper(self, page: Any) -> Any | None:
+        wrappers = page.locator(".el-dialog__wrapper")
+        count = min(await wrappers.count(), 12)
+        for idx in range(count):
+            wrapper = wrappers.nth(idx)
+            try:
+                if not await wrapper.is_visible():
+                    continue
+                style = (await wrapper.get_attribute("style") or "").replace(" ", "")
+                if "display:none" in style:
+                    continue
+                return wrapper
+            except Exception:
+                continue
+        return None
+
+    async def _extract_full_title_from_view(
+        self,
+        page: Any,
+        row_index: int,
+        fallback_title: str,
+        on_log: Callable[[str, str, str], None] | None = None,
+    ) -> tuple[str, str]:
+        topic_title = fallback_title
+        topic_image_url = ""
+
+        def emit(level: str, message: str) -> None:
+            if on_log is None:
+                return
+            prefix = f"row {row_index}: "
+            on_log(level, "scan.view", f"{prefix}{message}")
+
+        try:
+            rows = page.locator(self._task_rows_selector)
+            row_count = await rows.count()
+            if row_index >= row_count:
+                emit("WARN", "行索引越界，无法点击查看")
+                return topic_title, topic_image_url
+
+            row = rows.nth(row_index)
+            view_trigger = row.locator(self._view_button_selector).first
+            if await view_trigger.count() == 0:
+                # 兜底：若列结构变化，回退到行内全文匹配。
+                view_trigger = row.locator(
+                    "button:has(span:has-text('查看')), button:has-text('查看'), span:has-text('查看')"
+                ).first
+            if await view_trigger.count() == 0:
+                emit("WARN", "查看按钮不存在")
+                return topic_title, topic_image_url
+
+            before_url = page.url
+            emit("INFO", "点击查看进入详情")
+            await view_trigger.click(timeout=2000)
+            await page.wait_for_timeout(300)
+
+            dialog = None
+            for _ in range(20):
+                dialog = await self._get_visible_dialog_wrapper(page)
+                if dialog is not None:
+                    break
+                await page.wait_for_timeout(150)
+
+            if dialog is None:
+                emit("WARN", "未检测到可见详情弹窗，回退读取当前行内容")
+                row_topic = row.locator("td:nth-child(2) .topic").first
+                if await row_topic.count() > 0:
+                    text = (await row_topic.inner_text()).strip()
+                    if len(text) > len(topic_title):
+                        topic_title = text
+                return topic_title, topic_image_url
+
+            detail_candidates = [
+                ".topic",
+                ".el-dialog__body",
+                "p",
+            ]
+            best_text = topic_title
+            for selector in detail_candidates:
+                locator = dialog.locator(selector)
+                count = min(await locator.count(), 3)
+                for idx in range(count):
+                    text = (await locator.nth(idx).inner_text()).strip()
+                    if len(text) > len(best_text):
+                        best_text = text
+            if best_text:
+                topic_title = best_text
+            emit("INFO", f"详情抓取文本长度: {len(topic_title)}")
+
+            image_candidates = [
+                ".el-dialog__body img",
+                ".topic img",
+            ]
+            for selector in image_candidates:
+                img = dialog.locator(selector).first
+                if await img.count() == 0:
+                    continue
+                src = await img.get_attribute("src")
+                if src:
+                    topic_image_url = src.strip()
+                    emit("INFO", "详情中检测到题图")
+                    break
+
+            closed = await self._click_first_available(
+                dialog,
+                [
+                    "button:has-text('返回')",
+                    "button:has-text('关闭')",
+                    "span:has-text('返回')",
+                    ".el-dialog__headerbtn",
+                ],
+            )
+            if not closed:
+                closed = await self._click_first_available(
+                    page,
+                    [
+                        ".el-dialog__wrapper .el-dialog__headerbtn",
+                        ".el-dialog__headerbtn",
+                    ],
+                )
+            if not closed and page.url != before_url:
+                try:
+                    await page.go_back(wait_until="domcontentloaded")
+                except Exception:
+                    pass
+            await page.wait_for_timeout(400)
+        except Exception as exc:
+            emit("WARN", f"查看详情失败: {exc}")
+            return fallback_title, ""
+
+        return topic_title, topic_image_url
+
     async def _extract_table_tasks(
-        self, page: Any, run_id: str, school_name: str
+        self,
+        page: Any,
+        run_id: str,
+        school_name: str,
+        on_log: Callable[[str, str, str], None] | None = None,
     ) -> list[dict]:
         tasks: list[dict] = []
-        # 优先从可执行操作按钮反向定位任务容器，避免误扫首页统计区域。
-        action_buttons = page.locator(self._task_action_button_selector)
-        action_count = min(await action_buttons.count(), 50)
-        for idx in range(action_count):
-            button = action_buttons.nth(idx)
-            row = button.locator("xpath=ancestor::tr[1]")
-            if await row.count() == 0:
-                row = button.locator("xpath=ancestor::li[1]")
-            if await row.count() == 0:
-                row = button.locator("xpath=ancestor::div[contains(@class,'item')][1]")
-            if await row.count() == 0:
+
+        def emit(level: str, message: str) -> None:
+            if on_log is None:
+                return
+            on_log(level, "scan.extract", f"[{school_name or '默认学校'}] {message}")
+
+        rows = page.locator(self._task_rows_selector)
+        row_count = min(await rows.count(), 80)
+        if row_count == 0:
+            emit("WARN", "未找到任务表格行")
+            return tasks
+
+        emit("INFO", f"候选行数量: {row_count}")
+
+        for idx in range(row_count):
+            # 每次按索引重新取行，避免点击查看后 DOM 刷新导致句柄失效。
+            rows = page.locator(self._task_rows_selector)
+            if idx >= await rows.count():
+                emit("WARN", f"row {idx}: 行不存在，停止本校遍历")
+                break
+            row = rows.nth(idx)
+            try:
+                if not await row.is_visible():
+                    continue
+            except Exception:
                 continue
-            row_text = (await row.first.inner_text()).strip()
-            if not row_text or len(row_text) < 3:
+
+            row_text = (await row.inner_text()).strip()
+            if not row_text or len(row_text) < 6:
                 continue
             if any(keyword in row_text for keyword in self._scan_noise_keywords):
                 continue
+
+            # 跳过表头/说明行
+            if (
+                "学校科目/试卷名称" in row_text
+                and "题目" in row_text
+                and "状态" in row_text
+            ):
+                continue
+
+            cells = row.locator("td")
+            cell_count = min(await cells.count(), 8)
+            if cell_count < 2:
+                continue
+
+            school_cell = (
+                (await cells.nth(0).inner_text()).strip() if cell_count >= 1 else ""
+            )
+            title_cell = (
+                (await cells.nth(1).inner_text()).strip() if cell_count >= 2 else ""
+            )
+            op_cell = (await cells.nth(cell_count - 1).inner_text()).strip()
+            status_cell = (
+                (await cells.nth(2).inner_text()).strip() if cell_count >= 3 else ""
+            )
+
+            view_buttons = row.locator(self._view_button_selector)
+            view_count = await view_buttons.count()
+            has_view = "查看" in op_cell or view_count > 0
+            if not has_view:
+                in_row_view = row.locator(
+                    "button:has(span:has-text('查看')), button:has-text('查看'), span:has-text('查看')"
+                )
+                has_view = await in_row_view.count() > 0
+
+            emit(
+                "INFO",
+                f"row {idx}: status={status_cell or '-'} op={op_cell or '-'} view_count={view_count}",
+            )
+            if not has_view:
+                emit("INFO", f"row {idx}: 无查看按钮，跳过")
+                continue
+            is_pending = any(
+                flag in status_cell for flag in ["待解", "待答", "待开始", "待解答"]
+            )
+            if not is_pending and status_cell:
+                emit("INFO", f"row {idx}: 状态非待处理({status_cell})，跳过")
+                continue
+
+            topic_title = title_cell or row_text
+            if len(topic_title) < 4:
+                emit("INFO", f"row {idx}: 标题过短，跳过")
+                continue
+
+            full_title, topic_image_url = await self._extract_full_title_from_view(
+                page,
+                idx,
+                topic_title,
+                on_log=on_log,
+            )
+            topic_title = (full_title or topic_title).replace("\n", " ").strip()
+            if len(topic_title) > 280:
+                topic_title = topic_title[:280]
+
+            display_school = school_name or school_cell or "默认学校"
             tasks.append(
                 {
                     "task_id": f"auto_{uuid.uuid4().hex[:10]}",
                     "run_id": run_id,
-                    "school_name": school_name or "默认学校",
-                    "topic_title": row_text[:120],
-                    "topic_image_url": "",
+                    "school_name": display_school,
+                    "topic_title": topic_title,
+                    "topic_image_url": topic_image_url,
                 }
             )
+            emit("INFO", f"row {idx}: 已收录任务，标题长度 {len(topic_title)}")
 
-        # 若页面无接单按钮，使用窄范围回退，仍尽量避免全页 tr 扫描。
-        if not tasks:
-            scoped_rows = page.locator(".d2-container-full__body tr")
-            scoped_count = min(await scoped_rows.count(), 30)
-            for idx in range(scoped_count):
-                row = scoped_rows.nth(idx)
-                row_text = (await row.inner_text()).strip()
-                if not row_text or len(row_text) < 6:
-                    continue
-                if any(keyword in row_text for keyword in self._scan_noise_keywords):
-                    continue
-                tasks.append(
-                    {
-                        "task_id": f"auto_{uuid.uuid4().hex[:10]}",
-                        "run_id": run_id,
-                        "school_name": school_name or "默认学校",
-                        "topic_title": row_text[:120],
-                        "topic_image_url": "",
-                    }
-                )
         return tasks
 
     async def _ensure_single_research_ready(self, page: Any) -> bool:
@@ -390,6 +590,77 @@ class BrowserWorker:
             except Exception:
                 pass
         return await self._click_first_available(page, self._school_dropdown_candidates)
+
+    async def _wait_school_switch_settled(
+        self,
+        page: Any,
+        on_log: Callable[[str, str, str], None] | None = None,
+        school_name: str | None = None,
+    ) -> None:
+        def emit(level: str, message: str) -> None:
+            if on_log is None:
+                return
+            prefix = f"[{school_name}] " if school_name else ""
+            on_log(level, "scan.school", f"{prefix}{message}")
+
+        # 1) 先等待常见 loading 遮罩消失。
+        loading_selectors = [
+            ".el-loading-mask",
+            ".el-loading-spinner",
+            ".el-icon-loading",
+            ".v-modal",
+        ]
+        for selector in loading_selectors:
+            try:
+                for _ in range(15):
+                    mask = page.locator(selector)
+                    count = await mask.count()
+                    if count == 0:
+                        break
+                    visible = False
+                    for i in range(min(count, 5)):
+                        try:
+                            style = (
+                                await mask.nth(i).get_attribute("style") or ""
+                            ).replace(" ", "")
+                            if "display:none" in style:
+                                continue
+                            if await mask.nth(i).is_visible():
+                                visible = True
+                                break
+                        except Exception:
+                            continue
+                    if not visible:
+                        break
+                    await page.wait_for_timeout(180)
+            except Exception:
+                continue
+
+        # 2) 再等待表格行数与前两行文本稳定，覆盖二次刷新。
+        stable_rounds = 0
+        last_signature = ""
+        for _ in range(30):
+            rows = page.locator(self._task_rows_selector)
+            row_count = await rows.count()
+            snippets: list[str] = []
+            for i in range(min(row_count, 2)):
+                try:
+                    snippets.append((await rows.nth(i).inner_text()).strip()[:80])
+                except Exception:
+                    snippets.append("")
+            signature = f"{row_count}|{'|'.join(snippets)}"
+            if signature == last_signature and signature:
+                stable_rounds += 1
+            else:
+                stable_rounds = 0
+                last_signature = signature
+
+            if stable_rounds >= 2:
+                emit("INFO", f"table settled: rows={row_count}")
+                return
+            await page.wait_for_timeout(180)
+
+        emit("WARN", "table settle timeout, continue with current snapshot")
 
     async def _switch_to_pending(self, page: Any) -> None:
         await self._click_first_available(page, self._pending_tab_candidates)
@@ -483,12 +754,24 @@ class BrowserWorker:
                         f"school option click failed: {school_name}",
                     )
                     continue
-                await page.wait_for_timeout(600)
+                await self._wait_school_switch_settled(
+                    page,
+                    on_log=emit,
+                    school_name=school_name,
+                )
                 await self._switch_to_pending(page)
+                await self._wait_school_switch_settled(
+                    page,
+                    on_log=emit,
+                    school_name=school_name,
+                )
                 emit("INFO", "scan.school", f"switched school: {school_name}")
 
                 school_tasks = await self._extract_table_tasks(
-                    page, run_id, school_name
+                    page,
+                    run_id,
+                    school_name,
+                    on_log=emit,
                 )
                 emit(
                     "INFO",
@@ -503,7 +786,12 @@ class BrowserWorker:
 
         # 学校遍历失败时，至少返回当前学校下待解题列表。
         if not tasks:
-            fallback_tasks = await self._extract_table_tasks(page, run_id, "默认学校")
+            fallback_tasks = await self._extract_table_tasks(
+                page,
+                run_id,
+                "默认学校",
+                on_log=emit,
+            )
             emit(
                 "INFO", "scan.extract", f"fallback extract tasks: {len(fallback_tasks)}"
             )

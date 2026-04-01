@@ -227,6 +227,14 @@ class AutomationService:
             self._log(db, run_id, "select", f"selected tasks: {count}")
             return count
 
+    async def delete_tasks(self, run_id: str, task_ids: list[str]) -> int:
+        self._expire_review_timeouts(run_id)
+        with SessionLocal() as db:
+            repo = AutomationRepository(db)
+            count = repo.delete_tasks(run_id, task_ids)
+            self._log(db, run_id, "delete", f"deleted tasks: {count}")
+            return count
+
     async def start_grab(self, run_id: str, limit: int = 0) -> int:
         async with self._run_lock:
             run = self.get_run(run_id)

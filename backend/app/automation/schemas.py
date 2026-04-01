@@ -58,6 +58,11 @@ class SelectTasksReq(BaseModel):
     task_ids: list[str] = Field(default_factory=list)
 
 
+class DeleteTasksReq(BaseModel):
+    run_id: str
+    task_ids: list[str] = Field(default_factory=list)
+
+
 class SaveReviewReq(BaseModel):
     analysis_text: str = ""
     extension_text: str = ""

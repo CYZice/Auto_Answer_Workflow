@@ -5,12 +5,25 @@ type Props = {
     selected: Set<string>
     onToggle: (taskId: string) => void
     onPickReview: (task: TaskItem) => void
+    onViewOriginal: (task: TaskItem) => void
+    onBatchDelete: (taskIds: string[]) => void
 }
 
-export function TaskTable({ tasks, selected, onToggle, onPickReview }: Props) {
+export function TaskTable({ tasks, selected, onToggle, onPickReview, onViewOriginal, onBatchDelete }: Props) {
+    const selectedIds = Array.from(selected)
+
     return (
         <div className="rounded-xl border border-slate-200 bg-white p-4">
-            <h3 className="mb-3 text-lg font-semibold text-slate-800">任务列表</h3>
+            <div className="mb-3 flex items-center justify-between gap-2">
+                <h3 className="text-lg font-semibold text-slate-800">任务列表</h3>
+                <button
+                    className="rounded bg-rose-600 px-3 py-1.5 text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-40"
+                    disabled={selectedIds.length === 0}
+                    onClick={() => onBatchDelete(selectedIds)}
+                >
+                    批量删除（{selectedIds.length}）
+                </button>
+            </div>
             <div className="max-h-80 overflow-auto">
                 <table className="w-full text-left text-sm">
                     <thead className="sticky top-0 bg-slate-50">
@@ -30,20 +43,27 @@ export function TaskTable({ tasks, selected, onToggle, onPickReview }: Props) {
                                         type="checkbox"
                                         checked={selected.has(task.task_id)}
                                         onChange={() => onToggle(task.task_id)}
-                                        disabled={task.status !== 'discovered' && task.status !== 'selected'}
                                     />
                                 </td>
                                 <td className="p-2">{task.school_name}</td>
                                 <td className="p-2">{task.topic_title}</td>
                                 <td className="p-2">{task.status}</td>
                                 <td className="p-2">
-                                    <button
-                                        className="rounded bg-slate-800 px-2 py-1 text-xs text-white disabled:opacity-40"
-                                        onClick={() => onPickReview(task)}
-                                        disabled={task.status !== 'review_pending' && task.status !== 'ready_to_submit'}
-                                    >
-                                        复核
-                                    </button>
+                                    <div className="flex flex-wrap gap-2">
+                                        <button
+                                            className="rounded bg-slate-800 px-2 py-1 text-xs text-white"
+                                            onClick={() => onViewOriginal(task)}
+                                        >
+                                            查看原题
+                                        </button>
+                                        <button
+                                            className="rounded bg-indigo-700 px-2 py-1 text-xs text-white disabled:opacity-40"
+                                            onClick={() => onPickReview(task)}
+                                            disabled={task.status !== 'review_pending' && task.status !== 'ready_to_submit'}
+                                        >
+                                            复核
+                                        </button>
+                                    </div>
                                 </td>
                             </tr>
                         ))}

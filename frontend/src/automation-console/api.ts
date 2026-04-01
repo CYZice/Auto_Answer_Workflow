@@ -29,6 +29,10 @@ export async function selectTasks(run_id: string, task_ids: string[]) {
     await client.post('/tasks/select', { run_id, task_ids })
 }
 
+export async function deleteTasks(run_id: string, task_ids: string[]) {
+    await client.post('/tasks/delete', { run_id, task_ids })
+}
+
 export async function startGrab(run_id: string) {
     await client.post('/grab/start', { run_id })
 }

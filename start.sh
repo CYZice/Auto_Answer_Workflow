@@ -7,6 +7,33 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
+kill_port_process() {
+    local port="$1"
+    local pids
+    pids=$(ss -ltnp 2>/dev/null | grep -E ":${port}\\b" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+    if [ -z "$pids" ]; then
+        return 0
+    fi
+
+    echo -e "${YELLOW}检测到端口 ${port} 已被占用，准备清理旧进程: ${pids}${NC}"
+    for pid in $pids; do
+        kill "$pid" 2>/dev/null || true
+    done
+
+    # 等待进程优雅退出；若仍占用端口则升级为 SIGKILL
+    sleep 1
+    if ss -ltnp 2>/dev/null | grep -E ":${port}\\b" >/dev/null; then
+        pids=$(ss -ltnp 2>/dev/null | grep -E ":${port}\\b" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+        if [ -n "$pids" ]; then
+            echo -e "${YELLOW}端口 ${port} 仍被占用，强制结束进程: ${pids}${NC}"
+            for pid in $pids; do
+                kill -9 "$pid" 2>/dev/null || true
+            done
+            sleep 1
+        fi
+    fi
+}
+
 echo -e "${BLUE}===========================================${NC}"
 echo -e "${BLUE}   Zyb-Agent 一键启动脚本 (前端 + 后端)    ${NC}"
 echo -e "${BLUE}===========================================${NC}"
@@ -28,6 +55,9 @@ fi
 # 1. 启动后端
 echo -e "\n${YELLOW}>>> 准备启动后端 (FastAPI)...${NC}"
 cd "${PROJECT_ROOT}" || exit
+
+# 清理端口占用，避免重复启动导致 Address already in use
+kill_port_process 8080
 
 # 默认启用真实模式（可由外部环境变量覆盖）
 export AUTOMATION_USE_MOCK=${AUTOMATION_USE_MOCK:-0}
@@ -77,6 +107,9 @@ sleep 1
 # 2. 启动前端
 echo -e "\n${YELLOW}>>> 准备启动前端 (Vite/React)...${NC}"
 cd "${PROJECT_ROOT}/frontend" || exit
+
+# 清理前端端口占用
+kill_port_process 5173
 
 # 检查 node_modules
 if [ ! -d "node_modules" ]; then

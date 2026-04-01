@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 
 import {
     confirmSubmit,
+    deleteTasks,
     getRunStatus,
     listLogs,
     listTasks,
@@ -31,6 +32,7 @@ function App() {
     const [runState, setRunState] = useState<RunStatus['state']>('idle')
     const [selected, setSelected] = useState<Set<string>>(new Set())
     const [activeReview, setActiveReview] = useState<TaskItem | null>(null)
+    const [sourcePreview, setSourcePreview] = useState<TaskItem | null>(null)
 
     const hasRun = runId.length > 0
 
@@ -128,6 +130,25 @@ function App() {
                                 })
                             }}
                             onPickReview={setActiveReview}
+                            onViewOriginal={setSourcePreview}
+                            onBatchDelete={async (taskIds) => {
+                                if (!runId || taskIds.length === 0) return
+                                const ok = window.confirm(`确认删除 ${taskIds.length} 条任务吗？`)
+                                if (!ok) return
+                                await deleteTasks(runId, taskIds)
+                                setSelected((prev) => {
+                                    const next = new Set(prev)
+                                    taskIds.forEach((id) => next.delete(id))
+                                    return next
+                                })
+                                if (activeReview && taskIds.includes(activeReview.task_id)) {
+                                    setActiveReview(null)
+                                }
+                                if (sourcePreview && taskIds.includes(sourcePreview.task_id)) {
+                                    setSourcePreview(null)
+                                }
+                                await refresh()
+                            }}
                         />
                         <LogPanel logs={logs} />
                     </div>
@@ -153,6 +174,52 @@ function App() {
                     >
                         刷新
                     </button>
+                )}
+
+                {sourcePreview && (
+                    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/55 p-4">
+                        <div className="max-h-[90vh] w-full max-w-3xl overflow-auto rounded-xl bg-white p-4 shadow-2xl">
+                            <div className="mb-3 flex items-center justify-between gap-2">
+                                <h3 className="text-lg font-semibold text-slate-900">原题与原图</h3>
+                                <button
+                                    className="rounded bg-slate-800 px-2 py-1 text-xs text-white"
+                                    onClick={() => setSourcePreview(null)}
+                                >
+                                    关闭
+                                </button>
+                            </div>
+
+                            <div className="space-y-3 text-sm text-slate-700">
+                                <div>
+                                    <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500">题目文本</div>
+                                    <div className="rounded border border-slate-200 bg-slate-50 p-3 leading-7">{sourcePreview.topic_title || '暂无题目文本'}</div>
+                                </div>
+
+                                <div>
+                                    <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500">原图链接</div>
+                                    {sourcePreview.topic_image_url ? (
+                                        <div className="space-y-2">
+                                            <a
+                                                href={sourcePreview.topic_image_url}
+                                                target="_blank"
+                                                rel="noreferrer"
+                                                className="inline-block rounded bg-sky-600 px-3 py-1.5 text-xs font-medium text-white"
+                                            >
+                                                新窗口打开原图
+                                            </a>
+                                            <img
+                                                src={sourcePreview.topic_image_url}
+                                                alt="原题图片"
+                                                className="max-h-[55vh] w-full rounded border border-slate-200 object-contain"
+                                            />
+                                        </div>
+                                    ) : (
+                                        <div className="rounded border border-amber-200 bg-amber-50 p-2 text-amber-700">当前任务未抓取到题图链接</div>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                 )}
             </div>
         </div>

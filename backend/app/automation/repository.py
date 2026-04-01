@@ -133,6 +133,20 @@ class AutomationRepository:
         self.db.commit()
         return updated
 
+    def delete_tasks(self, run_id: str, task_ids: list[str]) -> int:
+        if not task_ids:
+            return 0
+        deleted = (
+            self.db.query(AutomationTask)
+            .filter(
+                AutomationTask.run_id == run_id,
+                AutomationTask.task_id.in_(task_ids),
+            )
+            .delete(synchronize_session=False)
+        )
+        self.db.commit()
+        return int(deleted)
+
     def list_by_status(self, run_id: str, statuses: list[str]) -> list[AutomationTask]:
         return (
             self.db.query(AutomationTask)

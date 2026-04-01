@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Query
 from app.automation.schemas import (
     AckResp,
     BatchReq,
+    DeleteTasksReq,
     LogListResp,
     RunReq,
     RunStatusResp,
@@ -71,6 +72,12 @@ def list_tasks(
 async def select_tasks(req: SelectTasksReq):
     count = await automation_service.select_tasks(req.run_id, req.task_ids)
     return AckResp(message=f"selected: {count}")
+
+
+@router.post("/tasks/delete", response_model=AckResp)
+async def delete_tasks(req: DeleteTasksReq):
+    count = await automation_service.delete_tasks(req.run_id, req.task_ids)
+    return AckResp(message=f"deleted: {count}")
 
 
 @router.post("/grab/start", response_model=AckResp)

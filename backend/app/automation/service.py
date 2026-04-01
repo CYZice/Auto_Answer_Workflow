@@ -92,12 +92,40 @@ class AutomationService:
             message=message,
         )
 
+    def _log_runtime(
+        self,
+        run_id: str,
+        step: str,
+        message: str,
+        *,
+        level: str = "INFO",
+        task_id: str | None = None,
+        school_name: str | None = None,
+    ) -> None:
+        with SessionLocal() as db:
+            self._log(
+                db,
+                run_id,
+                step,
+                message,
+                task_id=task_id,
+                school_name=school_name,
+                level=level,
+            )
+
     async def start_scan(self, run_id: str) -> None:
         async with self._run_lock:
             run = self.get_run(run_id)
             run.state = "running"
             run.stop_event = run.stop_event or asyncio.Event()
-            rows = await self._browser.scan_discovered_tasks(run_id)
+            self._log_runtime(run_id, "scan", "scan job started")
+
+            def _scan_logger(level: str, step: str, message: str) -> None:
+                self._log_runtime(run_id, step, message, level=level)
+
+            rows = await self._browser.scan_discovered_tasks(
+                run_id, on_log=_scan_logger
+            )
             with SessionLocal() as db:
                 repo = AutomationRepository(db)
                 for row in rows:
@@ -111,6 +139,7 @@ class AutomationService:
                         status="discovered",
                     )
                 self._log(db, run_id, "scan", f"discovered tasks: {len(rows)}")
+            self._log_runtime(run_id, "scan", "scan job finished")
             run.state = "idle"
 
     async def _run_job(self, run_id: str, name: str, coro):

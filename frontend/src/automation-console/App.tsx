@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 import {
     confirmSubmit,
@@ -19,7 +19,7 @@ import { LogPanel } from './components/LogPanel'
 import { ReviewPanel } from './components/ReviewPanel'
 import { RunControls } from './components/RunControls'
 import { TaskTable } from './components/TaskTable'
-import type { LogItem, TaskItem } from './types'
+import type { LogItem, RunStatus, TaskItem } from './types'
 
 function App() {
     const [username, setUsername] = useState('13320115908')
@@ -28,6 +28,7 @@ function App() {
     const [runId, setRunId] = useState('')
     const [tasks, setTasks] = useState<TaskItem[]>([])
     const [logs, setLogs] = useState<LogItem[]>([])
+    const [runState, setRunState] = useState<RunStatus['state']>('idle')
     const [selected, setSelected] = useState<Set<string>>(new Set())
     const [activeReview, setActiveReview] = useState<TaskItem | null>(null)
 
@@ -35,7 +36,12 @@ function App() {
 
     const refresh = async () => {
         if (!runId) return
-        const [taskResp, logResp] = await Promise.all([listTasks(runId), listLogs(runId)])
+        const [statusResp, taskResp, logResp] = await Promise.all([
+            getRunStatus(runId),
+            listTasks(runId),
+            listLogs(runId),
+        ])
+        setRunState(statusResp.state)
         setTasks(taskResp.items)
         setLogs(logResp)
         if (activeReview) {
@@ -43,6 +49,16 @@ function App() {
             setActiveReview(latest)
         }
     }
+
+    useEffect(() => {
+        if (!runId) return
+        const timer = window.setInterval(() => {
+            refresh().catch(() => {
+                // polling errors are ignored; next tick will retry.
+            })
+        }, 1500)
+        return () => window.clearInterval(timer)
+    }, [runId, activeReview])
 
     const selectedIds = useMemo(() => Array.from(selected), [selected])
 
@@ -53,6 +69,7 @@ function App() {
                 <RunControls
                     hasRun={hasRun}
                     runId={runId}
+                    runState={runState}
                     username={username}
                     password={password}
                     mode={mode}
@@ -62,10 +79,11 @@ function App() {
                     onStart={async () => {
                         const session = await startSession(username, password, mode)
                         setRunId(session.run_id)
+                        setRunState(session.state)
+                        await refresh()
                     }}
                     onScan={async () => {
                         await startScan(runId)
-                        await refresh()
                     }}
                     onSelect={async () => {
                         await selectTasks(runId, selectedIds)
@@ -130,7 +148,6 @@ function App() {
                     <button
                         className="rounded bg-slate-900 px-3 py-2 text-sm text-white"
                         onClick={async () => {
-                            await getRunStatus(runId)
                             await refresh()
                         }}
                     >

@@ -1,6 +1,7 @@
 type Props = {
     hasRun: boolean
     runId: string
+    runState?: 'idle' | 'running' | 'paused' | 'stopped'
     username: string
     password: string
     mode: 'headed' | 'headless'
@@ -17,11 +18,12 @@ type Props = {
     onStop: () => Promise<void>
 }
 
-export function RunControls({ hasRun, runId, username, password, mode, onUsernameChange, onPasswordChange, onModeChange, onStart, onScan, onSelect, onGrab, onSolve, onPause, onResume, onStop }: Props) {
+export function RunControls({ hasRun, runId, runState, username, password, mode, onUsernameChange, onPasswordChange, onModeChange, onStart, onScan, onSelect, onGrab, onSolve, onPause, onResume, onStop }: Props) {
     return (
         <div className="rounded-xl border border-slate-200 bg-white p-4">
             <h3 className="mb-2 text-lg font-semibold text-slate-800">运行控制</h3>
             <p className="mb-3 text-xs text-slate-500">run_id: {runId || '未启动'}</p>
+            <p className="mb-3 text-xs text-slate-500">state: {runState || 'idle'}</p>
             <div className="mb-3 grid grid-cols-1 gap-2 md:grid-cols-3">
                 <input
                     className="rounded border border-slate-300 px-2 py-2 text-sm"

@@ -27,6 +27,17 @@ if %errorlevel% neq 0 (
 echo.
 echo ^>^>^> 准备启动后端 (FastAPI)...
 
+:: 默认启用真实模式（可由外部环境变量覆盖）
+if "%AUTOMATION_USE_MOCK%"=="" set AUTOMATION_USE_MOCK=0
+if "%AUTOMATION_SKIP_BROWSER_INSTALL%"=="" set AUTOMATION_SKIP_BROWSER_INSTALL=1
+if "%AUTOMATION_BROWSER_CHANNEL%"=="" set AUTOMATION_BROWSER_CHANNEL=chrome
+if "%AUTOMATION_TARGET_URL%"=="" set AUTOMATION_TARGET_URL=https://yy.xuejie.cn/#/login
+
+echo 自动化模式: AUTOMATION_USE_MOCK=%AUTOMATION_USE_MOCK%
+if not "%AUTOMATION_TARGET_URL%"=="" echo 目标地址: %AUTOMATION_TARGET_URL%
+echo 浏览器通道: %AUTOMATION_BROWSER_CHANNEL%
+echo 跳过浏览器下载: AUTOMATION_SKIP_BROWSER_INSTALL=%AUTOMATION_SKIP_BROWSER_INSTALL%
+
 :: 进入后端目录
 cd "%PROJECT_ROOT%\backend"
 

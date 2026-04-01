@@ -24,8 +24,14 @@ class BrowserWorker:
         self._running = False
         self._playwright: Any | None = None
         self._sessions: dict[str, BrowserRunSession] = {}
-        self._use_mock = os.getenv("AUTOMATION_USE_MOCK", "1") == "1"
-        self._target_url = os.getenv("AUTOMATION_TARGET_URL", "").strip()
+        self._use_mock = os.getenv("AUTOMATION_USE_MOCK", "0") == "1"
+        self._target_url = os.getenv(
+            "AUTOMATION_TARGET_URL", "https://yy.xuejie.cn/#/login"
+        ).strip()
+        self._browser_channel = os.getenv("AUTOMATION_BROWSER_CHANNEL", "chrome").strip()
+        self._browser_executable_path = os.getenv(
+            "AUTOMATION_BROWSER_EXECUTABLE_PATH", ""
+        ).strip()
 
         # DOM 线索来源于 PRD
         self._login_user_selector = (
@@ -88,7 +94,18 @@ class BrowserWorker:
         if run_id in self._sessions:
             await self.stop_session(run_id)
 
-        browser = await self._playwright.chromium.launch(headless=(mode == "headless"))
+        launch_kwargs: dict[str, Any] = {"headless": (mode == "headless")}
+        if self._browser_executable_path:
+            launch_kwargs["executable_path"] = self._browser_executable_path
+        elif self._browser_channel:
+            launch_kwargs["channel"] = self._browser_channel
+
+        try:
+            browser = await self._playwright.chromium.launch(**launch_kwargs)
+        except Exception as exc:
+            raise RuntimeError(
+                "browser launch failed; set AUTOMATION_BROWSER_CHANNEL=chrome or provide AUTOMATION_BROWSER_EXECUTABLE_PATH"
+            ) from exc
         context = await browser.new_context()
         page = await context.new_page()
         await page.goto(self._target_url, wait_until="domcontentloaded")

@@ -29,6 +29,19 @@ fi
 echo -e "\n${YELLOW}>>> 准备启动后端 (FastAPI)...${NC}"
 cd "${PROJECT_ROOT}" || exit
 
+# 默认启用真实模式（可由外部环境变量覆盖）
+export AUTOMATION_USE_MOCK=${AUTOMATION_USE_MOCK:-0}
+export AUTOMATION_SKIP_BROWSER_INSTALL=${AUTOMATION_SKIP_BROWSER_INSTALL:-1}
+export AUTOMATION_BROWSER_CHANNEL=${AUTOMATION_BROWSER_CHANNEL:-chrome}
+export AUTOMATION_TARGET_URL=${AUTOMATION_TARGET_URL:-https://yy.xuejie.cn/#/login}
+
+echo -e "${GREEN}自动化模式: AUTOMATION_USE_MOCK=${AUTOMATION_USE_MOCK}${NC}"
+if [ -n "${AUTOMATION_TARGET_URL}" ]; then
+    echo -e "${GREEN}目标地址: ${AUTOMATION_TARGET_URL}${NC}"
+fi
+echo -e "${GREEN}浏览器通道: ${AUTOMATION_BROWSER_CHANNEL}${NC}"
+echo -e "${GREEN}跳过浏览器下载: AUTOMATION_SKIP_BROWSER_INSTALL=${AUTOMATION_SKIP_BROWSER_INSTALL}${NC}"
+
 # 检查并创建虚拟环境 (虚拟环境在项目根目录 .venv)
 if [ ! -d ".venv" ]; then
     echo -e "${YELLOW}未找到虚拟环境，正在创建 .venv...${NC}"

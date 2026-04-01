@@ -1,8 +1,10 @@
 import axios from 'axios';
 import type { LogItem, RunStatus, TaskListResp } from './types';
 
+const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined) || 'http://127.0.0.1:8080/api/automation';
+
 const client = axios.create({
-    baseURL: 'http://127.0.0.1:8000/api/automation',
+    baseURL: apiBaseUrl,
 })
 
 export async function startSession(username: string, password: string, mode: 'headed' | 'headless') {

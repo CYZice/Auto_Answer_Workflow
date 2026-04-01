@@ -22,8 +22,8 @@ import { TaskTable } from './components/TaskTable'
 import type { LogItem, TaskItem } from './types'
 
 function App() {
-    const [username, setUsername] = useState('')
-    const [password, setPassword] = useState('')
+    const [username, setUsername] = useState('13320115908')
+    const [password, setPassword] = useState('2011590xue')
     const [mode, setMode] = useState<'headed' | 'headless'>('headed')
     const [runId, setRunId] = useState('')
     const [tasks, setTasks] = useState<TaskItem[]>([])

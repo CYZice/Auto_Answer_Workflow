@@ -27,6 +27,8 @@ export function RunControls({ hasRun, runId, username, password, mode, onUsernam
                     className="rounded border border-slate-300 px-2 py-2 text-sm"
                     placeholder="账号"
                     value={username}
+                    readOnly
+                    disabled
                     onChange={(e) => onUsernameChange(e.target.value)}
                 />
                 <input
@@ -34,6 +36,8 @@ export function RunControls({ hasRun, runId, username, password, mode, onUsernam
                     placeholder="密码"
                     type="password"
                     value={password}
+                    readOnly
+                    disabled
                     onChange={(e) => onPasswordChange(e.target.value)}
                 />
                 <select

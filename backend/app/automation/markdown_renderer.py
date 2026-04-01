@@ -9,26 +9,41 @@ from markdown_it import MarkdownIt
 
 
 class MarkdownRenderer:
-        def __init__(self, output_dir: str = "./automation_renders"):
-                self.output_dir = output_dir
-                os.makedirs(self.output_dir, exist_ok=True)
-                self._md = MarkdownIt("commonmark")
+    def __init__(self, output_dir: str = "./automation_renders"):
+        self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
+        self._md = MarkdownIt("commonmark")
 
-        def split_answer(self, final_markdown: str) -> tuple[str, str]:
-                text = (final_markdown or "").strip()
-                anchor = "【考点延伸】"
-                idx = text.find(anchor)
-                if idx < 0:
-                        return text, ""
-                analysis = text[:idx].strip()
-                extension = text[idx + len(anchor) :].strip()
-                if analysis.startswith("【正解】"):
-                        analysis = analysis[len("【正解】") :].strip()
-                return analysis, extension
+    def split_answer(self, final_markdown: str) -> tuple[str, str]:
+        text = (final_markdown or "").strip()
+        anchor = "【考点延伸】"
+        idx = text.find(anchor)
+        if idx < 0:
+            core_text = text
+            extension = ""
+        else:
+            core_text = text[:idx].strip()
+            extension = text[idx + len(anchor) :].strip()
 
-        def render_analysis_to_html(self, analysis_markdown: str) -> str:
-                body = self._md.render(analysis_markdown or "")
-                return f"""
+        # 业务规则：优先识别“正解”，没有“正解”则识别“解析”。
+        answer_marker = "【正解】"
+        analysis_marker = "【解析】"
+
+        answer_idx = core_text.find(answer_marker)
+        analysis_idx = core_text.find(analysis_marker)
+
+        if answer_idx >= 0:
+            analysis = core_text[answer_idx + len(answer_marker) :].strip()
+        elif analysis_idx >= 0:
+            analysis = core_text[analysis_idx + len(analysis_marker) :].strip()
+        else:
+            analysis = core_text
+
+        return analysis, extension
+
+    def render_analysis_to_html(self, analysis_markdown: str) -> str:
+        body = self._md.render(analysis_markdown or "")
+        return f"""
 <!doctype html>
 <html>
     <head>
@@ -72,34 +87,34 @@ class MarkdownRenderer:
 </html>
 """.strip()
 
-        def save_analysis_snapshot(self, analysis_markdown: str) -> str:
-                markdown_name = f"analysis_{uuid.uuid4().hex[:12]}.md"
-                markdown_path = Path(self.output_dir) / markdown_name
-                markdown_path.write_text(analysis_markdown or "", encoding="utf-8")
+    def save_analysis_snapshot(self, analysis_markdown: str) -> str:
+        markdown_name = f"analysis_{uuid.uuid4().hex[:12]}.md"
+        markdown_path = Path(self.output_dir) / markdown_name
+        markdown_path.write_text(analysis_markdown or "", encoding="utf-8")
 
-                png_name = f"analysis_{uuid.uuid4().hex[:12]}.png"
-                png_path = Path(self.output_dir) / png_name
+        png_name = f"analysis_{uuid.uuid4().hex[:12]}.png"
+        png_path = Path(self.output_dir) / png_name
 
-                try:
-                        html = self.render_analysis_to_html(analysis_markdown)
-                        asyncio.run(self._render_html_to_png(html, str(png_path)))
-                        return str(png_path)
-                except Exception:
-                        # 渲染失败时回退为 markdown 文件，保障流程可继续。
-                        return str(markdown_path)
+        try:
+            html = self.render_analysis_to_html(analysis_markdown)
+            asyncio.run(self._render_html_to_png(html, str(png_path)))
+            return str(png_path)
+        except Exception:
+            # 渲染失败时回退为 markdown 文件，保障流程可继续。
+            return str(markdown_path)
 
-        async def _render_html_to_png(self, html: str, output_path: str) -> None:
-                from playwright.async_api import async_playwright
+    async def _render_html_to_png(self, html: str, output_path: str) -> None:
+        from playwright.async_api import async_playwright
 
-                async with async_playwright() as playwright:
-                        browser = await playwright.chromium.launch(headless=True)
-                        try:
-                                page = await browser.new_page(viewport={"width": 1280, "height": 720})
-                                await page.set_content(html, wait_until="networkidle")
-                                height = await page.evaluate("Math.ceil(document.body.scrollHeight)")
-                                await page.set_viewport_size(
-                                        {"width": 1280, "height": max(720, int(height) + 24)}
-                                )
-                                await page.screenshot(path=output_path, full_page=True)
-                        finally:
-                                await browser.close()
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page(viewport={"width": 1280, "height": 720})
+                await page.set_content(html, wait_until="networkidle")
+                height = await page.evaluate("Math.ceil(document.body.scrollHeight)")
+                await page.set_viewport_size(
+                    {"width": 1280, "height": max(720, int(height) + 24)}
+                )
+                await page.screenshot(path=output_path, full_page=True)
+            finally:
+                await browser.close()

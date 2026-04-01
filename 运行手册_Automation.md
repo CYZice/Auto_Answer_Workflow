@@ -4,7 +4,8 @@
 - `AUTOMATION_USE_MOCK=1`：默认，使用 mock 浏览器流程。
 - `AUTOMATION_USE_MOCK=0`：启用真实 Playwright 页面自动化。
 - `AUTOMATION_TARGET_URL`：真实模式下目标平台登录页。
-- `AUTOMATION_WORKFLOW_API_BASE`：自动化服务回调旧工作流 API 地址，默认 `http://127.0.0.1:8080`。
+- `AUTOMATION_WORKFLOW
+_API_BASE`：自动化服务回调旧工作流 API 地址，默认 `http://127.0.0.1:8080`。
 - `AUTOMATION_SKIP_BROWSER_INSTALL=1`：启动脚本跳过 `playwright install chromium`。
 
 ## 2. 启动
@@ -17,6 +18,7 @@
 ## 4. 标准操作流程
 1. 启动会话（输入账号、密码、运行模式）
 2. 点击扫描
+
 3. 勾选候选任务并确认勾选
 4. 点击接单
 5. 点击解题

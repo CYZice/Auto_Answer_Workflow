@@ -4,33 +4,8 @@
       "name": "默认排版草稿",
       "paper_subject": "《电路分析》",
       "paper_title": "2025-2026年度第二学期期中试卷",
-      "groups": [
-        {
-          "group_id": "1774433526641-0.29962381170201424",
-          "group_name": "课堂教学目标1",
-          "task_ids": [
-            "task_4955d190",
-            "task_842b475f",
-            "task_6fea6092",
-            "task_d8e2ad24",
-            "task_7edc8819",
-            "task_7ef063bf",
-            "task_e1f6f1c3",
-            "task_798d4f32"
-          ]
-        },
-        {
-          "group_id": "1774433529534-0.8127127603663159",
-          "group_name": "课堂教学目标2",
-          "task_ids": [
-            "task_f16c82e7",
-            "task_0381b829",
-            "task_31b038ea",
-            "task_0138b7f4"
-          ]
-        }
-      ],
-      "updated_at": "2026-03-27T10:53:43.351768+00:00"
+      "groups": [],
+      "updated_at": "2026-03-28T04:38:51.967803+00:00"
     }
   }
 }

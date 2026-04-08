@@ -577,11 +577,8 @@ async def create_task(
         else:
             target_nodes = None
 
-        if resume_node in {"reviewer", "formatter"} and not req.draft_solution:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="draft_solution is required when entry_point is reviewer or formatter.",
-            )
+        if not req.draft_solution:
+            req.draft_solution = "见图片"
 
         effective_draft_solution = req.draft_solution
         if effective_draft_solution is None:

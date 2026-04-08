@@ -906,7 +906,10 @@ class BrowserWorker:
         except Exception:
             pass
 
-        for attempt in ({"timeout": 1800, "force": False}, {"timeout": 1800, "force": True}):
+        for attempt in (
+            {"timeout": 1800, "force": False},
+            {"timeout": 1800, "force": True},
+        ):
             try:
                 await view_trigger.click(**attempt)
                 emit("INFO", f"view clicked force={attempt['force']}")
@@ -1048,14 +1051,20 @@ class BrowserWorker:
         except Exception:
             pass
 
-        for attempt in ({"timeout": 2500, "force": False}, {"timeout": 2500, "force": True}):
+        for attempt in (
+            {"timeout": 2500, "force": False},
+            {"timeout": 2500, "force": True},
+        ):
             try:
                 await button.click(**attempt)
                 emit("INFO", f"solve confirm clicked force={attempt['force']}")
                 await page.wait_for_timeout(250)
                 return True, f"solve_confirm_clicked(force={attempt['force']})"
             except Exception as exc:
-                emit("WARN", f"solve confirm click failed force={attempt['force']}: {exc}")
+                emit(
+                    "WARN",
+                    f"solve confirm click failed force={attempt['force']}: {exc}",
+                )
 
         try:
             handle = await button.element_handle()
@@ -1308,11 +1317,16 @@ class BrowserWorker:
             if clicked:
                 await page.wait_for_timeout(250)
                 await self._close_dialog_best_effort(page, dialog)
-                emit("INFO", f"row {idx}: matched and clicked ({reason}, {click_reason})")
+                emit(
+                    "INFO", f"row {idx}: matched and clicked ({reason}, {click_reason})"
+                )
                 return True
 
             await self._close_dialog_best_effort(page, dialog)
-            emit("WARN", f"row {idx}: matched but grab button click failed ({click_reason})")
+            emit(
+                "WARN",
+                f"row {idx}: matched but grab button click failed ({click_reason})",
+            )
 
         emit(
             "WARN",
@@ -1679,12 +1693,18 @@ class BrowserWorker:
         except Exception:
             return False
 
-    async def _wait_recognition_settled(self, page: Any, timeout_ms: int = 15000) -> None:
+    async def _wait_recognition_settled(
+        self, page: Any, timeout_ms: int = 15000
+    ) -> None:
         loops = max(1, timeout_ms // 250)
         stable_rounds = 0
         for _ in range(loops):
             busy = False
-            for selector in [".el-loading-mask", ".el-loading-spinner", ".el-icon-loading"]:
+            for selector in [
+                ".el-loading-mask",
+                ".el-loading-spinner",
+                ".el-icon-loading",
+            ]:
                 try:
                     nodes = page.locator(selector)
                     count = min(await nodes.count(), 6)

@@ -23,6 +23,7 @@ const FORMATTER_CONFIG_STORAGE_KEY = 'formatter_config'
 const SHARED_BASE_URL_STORAGE_KEY = 'shared_base_url'
 const SHARED_API_KEY_STORAGE_KEY = 'shared_api_key'
 const WORKFLOW_TEMPLATE_ID_STORAGE_KEY = 'workflow_template_id'
+const INPUT_SELECTED_NODES_STORAGE_KEY = 'input_selected_nodes'
 const WORKFLOW_NODE_ORDER = ['solver', 'reviewer', 'formatter'] as const
 const PAPER_BUILDER_LOCAL_DRAFT_KEY = 'paper_builder_local_draft_v1'
 const PAPER_BUILDER_REMOTE_DRAFT_ID = 'default'
@@ -253,7 +254,12 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const [pendingInputImages, setPendingInputImages] = useState<string[]>([])
   const [inputDraft, setInputDraft] = useState('')
-  const [inputSelectedNodes, setInputSelectedNodes] = useState<WorkflowNode[]>([...WORKFLOW_NODE_ORDER])
+  const [inputSelectedNodes, setInputSelectedNodes] = useState<WorkflowNode[]>(() => {
+    const saved = readStoredJson<WorkflowNode[]>(INPUT_SELECTED_NODES_STORAGE_KEY, [...WORKFLOW_NODE_ORDER])
+    if (!Array.isArray(saved)) return [...WORKFLOW_NODE_ORDER]
+    const normalized = WORKFLOW_NODE_ORDER.filter((node) => saved.includes(node))
+    return normalized.length > 0 ? normalized : [...WORKFLOW_NODE_ORDER]
+  })
   const [submittedTasks, setSubmittedTasks] = useState<SubmittedTask[]>(() => {
     const saved = readStoredJson<SubmittedTask[]>(SUBMITTED_TASKS_STORAGE_KEY, [])
     if (!Array.isArray(saved)) return []
@@ -610,12 +616,11 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   const inputNodeIndices = orderedInputNodes.map((node) => WORKFLOW_NODE_ORDER.indexOf(node))
   const inputHasContiguousSelection = inputNodeIndices.every((idx, i) => i === 0 || idx - inputNodeIndices[i - 1] === 1)
   const inputEntryPoint = orderedInputNodes.length > 0 ? orderedInputNodes[0] : undefined
-  const inputNeedsDraft = inputEntryPoint === 'reviewer' || inputEntryPoint === 'formatter'
+  const inputNeedsDraft = false  // 不再强制要求
   const inputDraftValue = inputDraft.trim()
   const canSubmitInputTask = pendingInputImages.length > 0
     && orderedInputNodes.length > 0
     && inputHasContiguousSelection
-    && (!inputNeedsDraft || inputDraftValue.length > 0)
     && !createMutation.isPending
   const inputBlockedReason = pendingInputImages.length === 0
     ? '请先添加至少一张题目图片。'
@@ -623,9 +628,7 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       ? '请至少选择一个工作流节点。'
       : (!inputHasContiguousSelection
         ? '工作流节点必须连续，不能跳选。'
-        : (inputNeedsDraft && inputDraftValue.length === 0
-          ? '从 Reviewer 或 Formatter 开始时，草稿文本为必填。'
-          : '')))
+        : ''))
 
   const { data: activeTasksFromDb } = useQuery({
     queryKey: ['dashboard-active-tasks'],
@@ -720,6 +723,14 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   }, [submittedTasks])
 
   useEffect(() => {
+    try {
+      localStorage.setItem(INPUT_SELECTED_NODES_STORAGE_KEY, JSON.stringify(inputSelectedNodes))
+    } catch {
+      // 忽略持久化失败，避免影响主流程交互
+    }
+  }, [inputSelectedNodes])
+
+  useEffect(() => {
     if (activeTaskId) {
       localStorage.setItem(ACTIVE_TASK_ID_STORAGE_KEY, activeTaskId)
       return
@@ -750,7 +761,7 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         imageUrls: pendingInputImages,
         entryPoint: inputEntryPoint,
         targetNodes: orderedInputNodes,
-        draftSolution: inputNeedsDraft ? inputDraftValue : undefined,
+        draftSolution: inputDraftValue.length > 0 ? inputDraftValue : '见图片',
       });
       setSubmittedTasks((prev) => (
         prev.some((item) => item.taskId === result.task_id)
@@ -760,7 +771,6 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       setActiveTaskId(result.task_id);
       setPendingInputImages([]);
       setInputDraft('');
-      setInputSelectedNodes([...WORKFLOW_NODE_ORDER]);
     } catch (error: unknown) {
       const errorMsg = getErrorMessage(error, "未知错误");
       setErrorMessage(`提交失败: ${errorMsg}`);
@@ -888,7 +898,6 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
                 onClick={() => {
                   setPendingInputImages([])
                   setInputDraft('')
-                  setInputSelectedNodes([...WORKFLOW_NODE_ORDER])
                 }}
                 className="text-red-600 hover:text-red-700"
               >
@@ -916,46 +925,6 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
               ))}
             </div>
 
-            <div className="flex flex-wrap items-center gap-2">
-              {WORKFLOW_NODE_ORDER.map((node, idx) => (
-                <div key={node} className="flex items-center gap-2">
-                  <label className="inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded border bg-white border-gray-200">
-                    <input
-                      type="checkbox"
-                      checked={inputSelectedNodes.includes(node)}
-                      onChange={() => toggleInputNodeSelection(node)}
-                    />
-                    <span className="font-medium">
-                      {node === 'solver' ? 'Solver 解题' : node === 'reviewer' ? 'Reviewer 审查' : 'Formatter 排版'}
-                    </span>
-                  </label>
-                  {idx < WORKFLOW_NODE_ORDER.length - 1 && <span className="text-gray-400">-&gt;</span>}
-                </div>
-              ))}
-            </div>
-
-            <div className="text-xs text-gray-600 bg-white rounded border px-3 py-2">
-              <div>入口节点: <span className="font-mono">{inputEntryPoint || '-'}</span></div>
-              <div>目标节点: <span className="font-mono">{orderedInputNodes.join(', ') || '-'}</span></div>
-            </div>
-
-            {inputNeedsDraft && (
-              <div className="space-y-2">
-                <label className="text-sm font-medium text-gray-700">草稿文本（必填）</label>
-                <textarea
-                  className="w-full h-28 p-3 border rounded text-sm font-mono bg-white focus:ring-2 focus:ring-blue-500 outline-none resize-none"
-                  value={inputDraft}
-                  onChange={(e) => setInputDraft(e.target.value)}
-                  placeholder="从 Reviewer/Formatter 开始执行时，请输入可用草稿文本"
-                />
-              </div>
-            )}
-
-            {inputBlockedReason && !canSubmitInputTask && (
-              <div className="text-xs text-red-600 bg-red-50 border border-red-100 px-3 py-2 rounded">
-                {inputBlockedReason}
-              </div>
-            )}
           </div>
         ) : (
           <div className="h-36 border-2 border-dashed border-gray-300 rounded-lg flex flex-col items-center justify-center text-gray-400 bg-gray-50">
@@ -964,6 +933,49 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
             <span className="text-xs mt-1">一次只录入一题，可包含多张图片，提交后再开始下一题</span>
           </div>
         )}
+
+        <div className="sticky bottom-0 z-10 -mx-6 px-6 py-4 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] bg-white/95 backdrop-blur border-t border-gray-200 space-y-3">
+          <div className="flex flex-wrap items-center gap-2">
+            {WORKFLOW_NODE_ORDER.map((node, idx) => (
+              <div key={node} className="flex items-center gap-2">
+                <label className="inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded border bg-white border-gray-200">
+                  <input
+                    type="checkbox"
+                    checked={inputSelectedNodes.includes(node)}
+                    onChange={() => toggleInputNodeSelection(node)}
+                  />
+                  <span className="font-medium">
+                    {node === 'solver' ? 'Solver 解题' : node === 'reviewer' ? 'Reviewer 审查' : 'Formatter 排版'}
+                  </span>
+                </label>
+                {idx < WORKFLOW_NODE_ORDER.length - 1 && <span className="text-gray-400">-&gt;</span>}
+              </div>
+            ))}
+          </div>
+
+          <div className="text-xs text-gray-600 bg-white rounded border px-3 py-2">
+            <div>入口节点: <span className="font-mono">{inputEntryPoint || '-'}</span></div>
+            <div>目标节点: <span className="font-mono">{orderedInputNodes.join(', ') || '-'}</span></div>
+          </div>
+
+          {inputNeedsDraft && (
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-gray-700">草稿文本（可选）</label>
+              <textarea
+                className="w-full h-28 p-3 border rounded text-sm font-mono bg-white focus:ring-2 focus:ring-blue-500 outline-none resize-none"
+                value={inputDraft}
+                onChange={(e) => setInputDraft(e.target.value)}
+                placeholder="从 Reviewer/Formatter 开始执行时可输入草稿，留空将默认使用“见图片”"
+              />
+            </div>
+          )}
+
+          {inputBlockedReason && !canSubmitInputTask && (
+            <div className="text-xs text-red-600 bg-red-50 border border-red-100 px-3 py-2 rounded">
+              {inputBlockedReason}
+            </div>
+          )}
+        </div>
       </div>
 
       {submittedTaskItems.length > 0 && (
@@ -1335,7 +1347,6 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
   useEffect(() => {
     setStreamedContent('');
     setCurrentNode('');
-    setSelectedNodes([...WORKFLOW_NODE_ORDER]);
     setCustomDraftInput('');
     setModelRequest(null);
     setElapsedTime(0);
@@ -1777,7 +1788,6 @@ function AdminPanel({
     setEditFinalResult(selectedTask.final_result || '')
     setEditErrorCode(selectedTask.error_code || '')
     setEditManualOperator(selectedTask.manual_operator || '')
-    setCustomRunNodes([...WORKFLOW_NODE_ORDER])
     setCustomRunDraft('')
 
     try {
@@ -1924,10 +1934,8 @@ function AdminPanel({
       }
 
       const historyDraft = typeof parsedHistory.draft_solution === 'string' ? parsedHistory.draft_solution : ''
-      const draftSolution = customRunDraft.trim().length > 0 ? customRunDraft.trim() : historyDraft
-      if ((entryPoint === 'reviewer' || entryPoint === 'formatter') && draftSolution.trim().length === 0) {
-        throw new Error('从 reviewer/formatter 开始时，draft_solution 为必填')
-      }
+      const rawDraft = customRunDraft.trim().length > 0 ? customRunDraft.trim() : historyDraft
+      const draftSolution = rawDraft.trim().length > 0 ? rawDraft : '见图片'
 
       await api.post(`/api/tasks/${selectedTaskId}/manual`, {
         action: 'custom_run',

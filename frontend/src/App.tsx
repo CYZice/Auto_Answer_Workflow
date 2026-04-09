@@ -3656,7 +3656,7 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
           <div className="border-2 border-dashed border-gray-200 rounded-xl p-6 text-center">
             <input
               type="file"
-              accept="image/*,.pdf"
+              accept="image/*,.pdf,.doc,.docx,.ppt,.pptx,.html,.htm,.epub,.txt,.md"
               onChange={handleFileSelect}
               className="hidden"
               id="paper-upload"

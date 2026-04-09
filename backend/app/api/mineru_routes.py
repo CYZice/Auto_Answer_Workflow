@@ -454,11 +454,18 @@ async def export_paper_docx(
         history_data = json.loads(t.history or "{}")
         question_num = history_data.get("question_number", 0)
         question_type = history_data.get("question_type", "未分类")
+        question_text = history_data.get("question_content", "") or ""
+
+        # 嵌入原卷题图
+        image_urls = history_data.get("image_urls") or []
+        for img_url in image_urls:
+            if img_url.startswith("data:") or img_url.startswith("http"):
+                question_text += f"\n\n![题{question_num}]({img_url})"
 
         task_results.append({
             "number": question_num,
             "type": question_type,
-            "question": history_data.get("question_content", ""),
+            "question": question_text,
             "answer": t.final_result or "",
         })
 

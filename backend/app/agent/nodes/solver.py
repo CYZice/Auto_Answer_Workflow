@@ -44,6 +44,7 @@ async def solve_node(state: AgentState) -> AgentState:
     agent_configs = state.get("agent_configs") or {}
     solver_config = agent_configs.get("solver") or {}
     workflow_template_id = state.get("workflow_template_id")
+    question_text = state.get("question_text")  # MinerU 解析的题目文字
 
     # 防御性编程：如果没有图片地址，直接失败
     if not image_urls:
@@ -63,6 +64,7 @@ async def solve_node(state: AgentState) -> AgentState:
             solver_config,
             workflow_template_id,
             state["task_id"],
+            question_text,
         )
         safe_total_tokens = coerce_token_count(
             state.get("total_tokens"), 0

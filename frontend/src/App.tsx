@@ -3312,7 +3312,7 @@ function PaperBuilder({
 }
 
 function App() {
-  const [currentView, setCurrentView] = useState<'dashboard' | 'admin' | 'builder'>('dashboard')
+  const [currentView, setCurrentView] = useState<'dashboard' | 'admin' | 'builder' | 'smart-parser'>('dashboard')
   const [adminFocusTaskId, setAdminFocusTaskId] = useState<string | null>(null)
 
   return (
@@ -3338,6 +3338,12 @@ function App() {
             >
               排版台
             </button>
+            <button
+              onClick={() => setCurrentView('smart-parser')}
+              className={`px-3 py-1.5 text-sm rounded-lg ${currentView === 'smart-parser' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}
+            >
+              智能解析
+            </button>
           </div>
         </div>
 
@@ -3358,8 +3364,379 @@ function App() {
             }}
           />
         )}
+        {currentView === 'smart-parser' && (
+          <SmartPaperParser onBack={() => setCurrentView('dashboard')} />
+        )}
       </div>
     </QueryClientProvider>
+  )
+}
+
+// === 智能解析试卷组件 ===
+interface MineruUploadUrlResponse {
+  batch_id: string;
+  upload_url: string;
+}
+
+interface MineruParseResultResponse {
+  mineru_task_id: string;
+  status: string;
+  markdown_url?: string;
+  markdown_content?: string;
+  error_message?: string;
+  extract_progress?: {
+    extracted_pages: number;
+    total_pages: number;
+  };
+}
+
+interface ParsedQuestion {
+  number: number;
+  type: string;
+  content: string;
+  images: string[];
+}
+
+interface ParsedQuestionsResponse {
+  total: number;
+  questions: ParsedQuestion[];
+  grouped: Record<string, Array<{ number: number; content: string }>>;
+}
+
+type ParseStage = 'idle' | 'uploading' | 'waiting' | 'parsing' | 'done' | 'error';
+
+function SmartPaperParser({ onBack }: { onBack: () => void }) {
+  const [selectedFile, setSelectedFile] = useState<File | null>(null)
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [parseStage, setParseStage] = useState<ParseStage>('idle')
+  const [batchId, setBatchId] = useState<string | null>(null)
+  const [parseProgress, setParseProgress] = useState<{ extracted: number; total: number } | null>(null)
+  const [markdownContent, setMarkdownContent] = useState<string | null>(null)
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const [questions, setQuestions] = useState<ParsedQuestion[]>([])
+  const [groupedQuestions, setGroupedQuestions] = useState<Record<string, Array<{ number: number; content: string }>>>({})
+  const [solveStatus, setSolveStatus] = useState<'idle' | 'solving' | 'done' | 'error'>('idle')
+  const [solveResult, setSolveResult] = useState<{ task_id: string; question_count: number } | null>(null)
+
+  const handleFileSelect = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (file) {
+      setSelectedFile(file)
+      const url = URL.createObjectURL(file)
+      setPreviewUrl(url)
+      setParseStage('idle')
+      setMarkdownContent(null)
+      setErrorMessage(null)
+      setQuestions([])
+      setGroupedQuestions({})
+      setSolveResult(null)
+    }
+  }
+
+  const handleParse = async () => {
+    if (!selectedFile) return
+
+    setParseStage('uploading')
+    setErrorMessage(null)
+    setParseProgress(null)
+
+    try {
+      // 1. 获取上传 URL
+      const uploadUrlRes = await api.get<MineruUploadUrlResponse>('/api/mineru/parse/file')
+      const { batch_id, upload_url } = uploadUrlRes.data
+      setBatchId(batch_id)
+
+      // 2. 上传文件
+      const formData = new FormData()
+      formData.append('file', selectedFile)
+
+      setParseStage('waiting')
+
+      // 上传到 MinerU
+      await fetch(upload_url, {
+        method: 'PUT',
+        body: await selectedFile.arrayBuffer(),
+      })
+
+      // 3. 等待解析完成
+      setParseStage('parsing')
+
+      const maxWait = 600000 // 10分钟
+      const startTime = Date.now()
+
+      while (Date.now() - startTime < maxWait) {
+        await new Promise(resolve => setTimeout(resolve, 3000))
+
+        try {
+          const resultRes = await api.get<MineruParseResultResponse>(`/api/mineru/parse/${batch_id}`)
+          const result = resultRes.data
+
+          // 更新进度
+          if (result.extract_progress) {
+            setParseProgress({
+              extracted: result.extract_progress.extracted_pages,
+              total: result.extract_progress.total_pages,
+            })
+          }
+
+          if (result.status === 'done') {
+            setMarkdownContent(result.markdown_content || '')
+            setParseStage('done')
+
+            // 获取题目列表
+            try {
+              const questionsRes = await api.get<ParsedQuestionsResponse>(`/api/mineru/paper/${batch_id}/questions`)
+              setQuestions(questionsRes.data.questions)
+              setGroupedQuestions(questionsRes.data.grouped)
+            } catch {
+              // 题目列表获取失败不影响主流程
+            }
+
+            return
+          }
+
+          if (result.status === 'failed') {
+            throw new Error(result.error_message || '解析失败')
+          }
+        } catch {
+          // 继续等待
+        }
+      }
+
+      throw new Error('解析超时')
+    } catch (err) {
+      setErrorMessage(getErrorMessage(err, '解析失败'))
+      setParseStage('error')
+    }
+  }
+
+  const handleStartSolve = async () => {
+    if (!batchId) return
+
+    setSolveStatus('solving')
+    try {
+      const res = await api.post<{ paper_task_id: string; question_count: number }>(
+        `/api/mineru/paper/${batchId}/solve`,
+        {}
+      )
+      setSolveResult({
+        task_id: res.data.paper_task_id,
+        question_count: res.data.question_count,
+      })
+      setSolveStatus('done')
+    } catch (err) {
+      setErrorMessage(getErrorMessage(err, '启动解题失败'))
+      setSolveStatus('error')
+    }
+  }
+
+  const handleExportDocx = async () => {
+    if (!batchId) return
+
+    try {
+      const res = await fetch(`/api/mineru/paper/${batchId}/export/docx`)
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = '试卷解析结果.docx'
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      setErrorMessage(getErrorMessage(err, '导出失败'))
+    }
+  }
+
+  const renderParseStatus = () => {
+    switch (parseStage) {
+      case 'idle':
+        return <span className="text-gray-500">等待上传</span>
+      case 'uploading':
+        return <span className="text-blue-600">获取上传链接中...</span>
+      case 'waiting':
+        return <span className="text-blue-600">文件上传中...</span>
+      case 'parsing':
+        if (parseProgress) {
+          return (
+            <span className="text-blue-600">
+              解析中 ({parseProgress.extracted}/{parseProgress.total} 页)
+            </span>
+          )
+        }
+        return <span className="text-blue-600">解析中...</span>
+      case 'done':
+        return <span className="text-green-600">解析完成</span>
+      case 'error':
+        return <span className="text-red-600">解析失败</span>
+    }
+  }
+
+  return (
+    <div className="max-w-7xl mx-auto px-8 pb-4">
+      <div className="mb-6 flex items-center justify-between">
+        <h2 className="text-2xl font-bold">智能解析试卷</h2>
+        <button
+          onClick={onBack}
+          className="px-4 py-2 text-sm text-gray-600 hover:text-gray-800"
+        >
+          返回工作台
+        </button>
+      </div>
+
+      <div className="grid grid-cols-3 gap-6">
+        {/* 左侧：上传区域 */}
+        <div className="bg-white rounded-xl shadow-sm p-6">
+          <h3 className="text-lg font-semibold mb-4">上传试卷</h3>
+
+          <div className="border-2 border-dashed border-gray-200 rounded-xl p-6 text-center">
+            <input
+              type="file"
+              accept="image/*,.pdf"
+              onChange={handleFileSelect}
+              className="hidden"
+              id="paper-upload"
+            />
+            <label
+              htmlFor="paper-upload"
+              className="cursor-pointer flex flex-col items-center gap-2"
+            >
+              <ImageIcon className="w-10 h-10 text-gray-400" />
+              <span className="text-gray-600 text-sm">
+                {selectedFile ? selectedFile.name : '点击选择试卷'}
+              </span>
+              <span className="text-xs text-gray-400">
+                JPG、PNG、PDF
+              </span>
+            </label>
+          </div>
+
+          {previewUrl && parseStage === 'idle' && (
+            <div className="mt-4">
+              <img
+                src={previewUrl}
+                alt="试卷预览"
+                className="max-w-full rounded-lg shadow-sm"
+              />
+            </div>
+          )}
+
+          <div className="mt-4 flex items-center gap-2">
+            <div className={`w-3 h-3 rounded-full ${
+              parseStage === 'idle' ? 'bg-gray-300' :
+              parseStage === 'done' ? 'bg-green-500' :
+              parseStage === 'error' ? 'bg-red-500' :
+              'bg-blue-500 animate-pulse'
+            }`} />
+            {renderParseStatus()}
+          </div>
+
+          <div className="mt-4 flex gap-2">
+            <button
+              onClick={handleParse}
+              disabled={!selectedFile || !['idle', 'done', 'error'].includes(parseStage)}
+              className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
+            >
+              {['uploading', 'waiting', 'parsing'].includes(parseStage) ? (
+                <>解析中...</>
+              ) : (
+                <>开始解析</>
+              )}
+            </button>
+          </div>
+
+          {batchId && (
+            <div className="mt-3 text-xs text-gray-400 break-all">
+              任务ID: {batchId}
+            </div>
+          )}
+
+          {errorMessage && (
+            <div className="mt-4 p-3 bg-red-50 rounded-lg">
+              <p className="text-sm text-red-800">{errorMessage}</p>
+            </div>
+          )}
+        </div>
+
+        {/* 中间：题目列表 */}
+        <div className="bg-white rounded-xl shadow-sm p-6">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-lg font-semibold">题目列表</h3>
+            {questions.length > 0 && (
+              <span className="text-sm text-gray-500">{questions.length} 题</span>
+            )}
+          </div>
+
+          {questions.length === 0 && (
+            <div className="h-80 flex items-center justify-center text-gray-400 text-sm">
+              解析完成后显示题目
+            </div>
+          )}
+
+          {questions.length > 0 && (
+            <div className="space-y-4 max-h-[500px] overflow-y-auto">
+              {Object.entries(groupedQuestions).map(([type, qs]) => (
+                <div key={type}>
+                  <h4 className="text-sm font-medium text-indigo-600 mb-2">{type}</h4>
+                  <div className="space-y-1">
+                    {qs.map((q) => (
+                      <div key={q.number} className="text-sm p-2 bg-gray-50 rounded">
+                        <span className="font-medium">第{q.number}题</span>
+                        <p className="text-gray-600 truncate">{q.content}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {questions.length > 0 && (
+            <div className="mt-4 pt-4 border-t flex gap-2">
+              <button
+                onClick={handleStartSolve}
+                disabled={solveStatus === 'solving'}
+                className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 text-sm"
+              >
+                {solveStatus === 'solving' ? '启动中...' : '开始解题'}
+              </button>
+              <button
+                onClick={handleExportDocx}
+                className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 text-sm"
+              >
+                导出DOCX
+              </button>
+            </div>
+          )}
+
+          {solveStatus === 'done' && solveResult && (
+            <div className="mt-4 p-3 bg-green-50 rounded-lg">
+              <p className="text-sm text-green-800">
+                解题流程已启动 ({solveResult.question_count} 题)
+              </p>
+            </div>
+          )}
+        </div>
+
+        {/* 右侧：预览 */}
+        <div className="bg-white rounded-xl shadow-sm p-6">
+          <h3 className="text-lg font-semibold mb-4">Markdown 预览</h3>
+
+          {parseStage !== 'done' && (
+            <div className="h-96 flex items-center justify-center text-gray-400 text-sm">
+              解析完成后显示预览
+            </div>
+          )}
+
+          {markdownContent && (
+            <div className="prose prose-sm max-w-none max-h-[600px] overflow-y-auto">
+              <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
+                {markdownContent}
+              </ReactMarkdown>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
   )
 }
 

@@ -61,6 +61,7 @@ from app.services.runtime_config import (
     upsert_template,
 )
 from app.api.automation_routes import router as automation_router
+from app.api.mineru_routes import router as mineru_router
 from app.automation import models as automation_models  # noqa: F401
 
 # 全局并发信号量，控制同时进行的大模型推理任务数（根据 PRD 要求默认为 5）
@@ -444,6 +445,7 @@ app = FastAPI(
     title="智能题目解析 Agent 自动化流水线 API", version="1.0.0", lifespan=lifespan
 )
 app.include_router(automation_router)
+app.include_router(mineru_router)
 
 # 配置 CORS，增加对大请求体（Base64图片）的支持
 app.add_middleware(

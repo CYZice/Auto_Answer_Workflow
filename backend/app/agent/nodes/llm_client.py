@@ -302,9 +302,18 @@ async def solve_image(
     model_config: Optional[dict] = None,
     workflow_template_id: Optional[str] = None,
     task_id: str = None,
+    question_text: Optional[str] = None,
 ) -> dict:
     """
     封装调用模型进行解题的逻辑
+
+    Args:
+        image_urls: 题目图片列表
+        review_feedback: 审查反馈（重试时使用）
+        model_config: 模型配置
+        workflow_template_id: 工作流模板 ID
+        task_id: 任务 ID
+        question_text: MinerU 解析的题目文字（可选）
     """
 
     prompt_bundle = get_prompt_bundle("solver", workflow_template_id)
@@ -322,6 +331,10 @@ async def solve_image(
         text_prompt += (
             f"\n\n【注意】之前的解答有以下问题，请在此次解答中修复：\n{review_feedback}"
         )
+
+    # 如果有题目文字，附加到提示词中
+    if question_text:
+        text_prompt = f"题目内容（来自 OCR 识别）：\n{question_text}\n\n{text_prompt}"
 
     human_content = [{"type": "text", "text": text_prompt}]
     for image_url in image_urls:

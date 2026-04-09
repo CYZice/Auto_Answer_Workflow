@@ -3403,7 +3403,23 @@ interface ParsedQuestionsResponse {
   grouped: Record<string, Array<{ number: number; content: string }>>;
 }
 
+interface QuestionSolveStatus {
+  task_id: string;
+  number: number;
+  type: string;
+  status: string;
+  final_result?: string;
+}
+
+interface PaperSolveStatusResponse {
+  paper_task_id: string;
+  total: number;
+  completed: number;
+  results: QuestionSolveStatus[];
+}
+
 type ParseStage = 'idle' | 'uploading' | 'waiting' | 'parsing' | 'done' | 'error';
+type SolveProgress = 'idle' | 'solving' | 'completed' | 'error';
 
 function SmartPaperParser({ onBack }: { onBack: () => void }) {
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
@@ -3415,9 +3431,9 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [questions, setQuestions] = useState<ParsedQuestion[]>([])
   const [groupedQuestions, setGroupedQuestions] = useState<Record<string, Array<{ number: number; content: string }>>>({})
-  const [solveStatus, setSolveStatus] = useState<'idle' | 'solving' | 'done' | 'error'>('idle')
-  const [solveResult, setSolveResult] = useState<{ task_id: string; question_count: number } | null>(null)
-
+  const [solveProgress, setSolveProgress] = useState<SolveProgress>('idle')
+  const [solveResult, setSolveResult] = useState<{ paper_task_id: string; question_count: number; thread_id: string; task_ids: string[] } | null>(null)
+  const [questionStatuses, setQuestionStatuses] = useState<Record<string, QuestionSolveStatus>>({})
   const handleFileSelect = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (file) {
@@ -3430,6 +3446,8 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
       setQuestions([])
       setGroupedQuestions({})
       setSolveResult(null)
+      setSolveProgress('idle')
+      setQuestionStatuses({})
     }
   }
 
@@ -3513,21 +3531,68 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
   const handleStartSolve = async () => {
     if (!batchId) return
 
-    setSolveStatus('solving')
+    setSolveProgress('solving')
+    setQuestionStatuses({})
     try {
-      const res = await api.post<{ paper_task_id: string; question_count: number }>(
+      const res = await api.post<{
+        paper_task_id: string;
+        question_count: number;
+        task_ids: string[];
+        thread_id: string;
+      }>(
         `/api/mineru/paper/${batchId}/solve`,
         {}
       )
       setSolveResult({
-        task_id: res.data.paper_task_id,
+        paper_task_id: res.data.paper_task_id,
         question_count: res.data.question_count,
+        thread_id: res.data.thread_id,
+        task_ids: res.data.task_ids,
       })
-      setSolveStatus('done')
+
+      // 轮询解题状态
+      pollSolveStatus(res.data.thread_id)
     } catch (err) {
       setErrorMessage(getErrorMessage(err, '启动解题失败'))
-      setSolveStatus('error')
+      setSolveProgress('error')
     }
+  }
+
+  const pollSolveStatus = async (threadId: string) => {
+    const maxWait = 600000 // 10分钟
+    const startTime = Date.now()
+
+    while (Date.now() - startTime < maxWait) {
+      try {
+        const res = await api.get<PaperSolveStatusResponse>(
+          `/api/mineru/paper/${threadId}/status`
+        )
+        const data = res.data
+
+        // 更新每道题的状态
+        const newStatuses: Record<string, QuestionSolveStatus> = {}
+        let completedCount = 0
+        for (const result of data.results) {
+          newStatuses[result.task_id] = result
+          if (result.status === 'completed') {
+            completedCount++
+          }
+        }
+        setQuestionStatuses(newStatuses)
+
+        // 检查是否全部完成
+        if (completedCount === data.total && data.total > 0) {
+          setSolveProgress('completed')
+          return
+        }
+      } catch {
+        // 继续轮询
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 3000))
+    }
+
+    setSolveProgress('error')
   }
 
   const handleExportDocx = async () => {
@@ -3678,27 +3743,68 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
                 <div key={type}>
                   <h4 className="text-sm font-medium text-indigo-600 mb-2">{type}</h4>
                   <div className="space-y-1">
-                    {qs.map((q) => (
-                      <div key={q.number} className="text-sm p-2 bg-gray-50 rounded">
-                        <span className="font-medium">第{q.number}题</span>
-                        <p className="text-gray-600 truncate">{q.content}</p>
-                      </div>
-                    ))}
+                    {qs.map((q) => {
+                      // 查找对应的解题状态
+                      const taskId = Object.keys(questionStatuses).find(
+                        k => questionStatuses[k].number === q.number
+                      )
+                      const status = taskId ? questionStatuses[taskId] : null
+                      const statusColor = !status ? 'bg-gray-300' :
+                        status.status === 'completed' ? 'bg-green-500' :
+                        status.status === 'failed' ? 'bg-red-500' :
+                        'bg-blue-500 animate-pulse'
+
+                      return (
+                        <div key={q.number} className="text-sm p-2 bg-gray-50 rounded flex items-center gap-2">
+                          <div className={`w-2 h-2 rounded-full ${statusColor}`} />
+                          <div className="flex-1">
+                            <span className="font-medium">第{q.number}题</span>
+                            <p className="text-gray-600 truncate text-xs">{q.content}</p>
+                          </div>
+                          {status && (
+                            <span className="text-xs text-gray-500">
+                              {status.status === 'completed' ? '完成' :
+                               status.status === 'failed' ? '失败' :
+                               status.status === 'solving' ? '解题中' :
+                               status.status === 'reviewing' ? '审查中' :
+                               status.status === 'formatting' ? '排版中' :
+                               status.status}
+                            </span>
+                          )}
+                        </div>
+                      )
+                    })}
                   </div>
                 </div>
               ))}
             </div>
           )}
 
-          {questions.length > 0 && (
+          {questions.length > 0 && solveProgress === 'idle' && (
             <div className="mt-4 pt-4 border-t flex gap-2">
               <button
                 onClick={handleStartSolve}
-                disabled={solveStatus === 'solving'}
-                className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 text-sm"
+                className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 text-sm"
               >
-                {solveStatus === 'solving' ? '启动中...' : '开始解题'}
+                开始解题
               </button>
+            </div>
+          )}
+
+          {solveProgress === 'solving' && (
+            <div className="mt-4 pt-4 border-t">
+              <div className="flex items-center gap-2 text-sm text-blue-600">
+                <div className="w-3 h-3 rounded-full bg-blue-500 animate-pulse" />
+                解题中...
+              </div>
+              <p className="text-xs text-gray-500 mt-1">
+                {Object.values(questionStatuses).filter(s => s.status === 'completed').length} / {questions.length} 题完成
+              </p>
+            </div>
+          )}
+
+          {solveProgress === 'completed' && (
+            <div className="mt-4 pt-4 border-t flex gap-2">
               <button
                 onClick={handleExportDocx}
                 className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 text-sm"
@@ -3708,7 +3814,13 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
             </div>
           )}
 
-          {solveStatus === 'done' && solveResult && (
+          {solveProgress === 'error' && (
+            <div className="mt-4 pt-4 border-t">
+              <p className="text-sm text-red-600">部分题目解题失败</p>
+            </div>
+          )}
+
+          {solveProgress === 'solving' && solveResult && (
             <div className="mt-4 p-3 bg-green-50 rounded-lg">
               <p className="text-sm text-green-800">
                 解题流程已启动 ({solveResult.question_count} 题)

@@ -3418,17 +3418,73 @@ type SolveProgress = 'idle' | 'solving' | 'completed' | 'error';
 
 function SmartPaperParser({ onBack }: { onBack: () => void }) {
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
-  const [parseStage, setParseStage] = useState<ParseStage>('idle')
-  const [batchId, setBatchId] = useState<string | null>(null)
-  const [parseProgress, setParseProgress] = useState<{ extracted: number; total: number } | null>(null)
-  const [markdownContent, setMarkdownContent] = useState<string | null>(null)
-  const [errorMessage, setErrorMessage] = useState<string | null>(null)
-  const [questions, setQuestions] = useState<ParsedQuestion[]>([])
-  const [groupedQuestions, setGroupedQuestions] = useState<Record<string, Array<{ number: number; content: string }>>>({})
-  const [solveProgress, setSolveProgress] = useState<SolveProgress>('idle')
-  const [solveResult, setSolveResult] = useState<{ paper_task_id: string; question_count: number; thread_id: string; task_ids: string[] } | null>(null)
-  const [questionStatuses, setQuestionStatuses] = useState<Record<string, QuestionSolveStatus>>({})
+  const [previewUrl, setPreviewUrl] = useState<string | null>(
+    sessionStorage.getItem('smartParser_preview')
+  )
+  const [parseStage, setParseStage] = useState<ParseStage>(
+    (sessionStorage.getItem('smartParser_stage') as ParseStage) || 'idle'
+  )
+  const [batchId, setBatchId] = useState<string | null>(sessionStorage.getItem('smartParser_batchId'))
+  const [parseProgress, setParseProgress] = useState<{ extracted: number; total: number } | null>(
+    JSON.parse(sessionStorage.getItem('smartParser_parseProgress') || 'null')
+  )
+  const [markdownContent, setMarkdownContent] = useState<string | null>(
+    sessionStorage.getItem('smartParser_markdown')
+  )
+  const [errorMessage, setErrorMessage] = useState<string | null>(
+    sessionStorage.getItem('smartParser_error')
+  )
+  const [questions, setQuestions] = useState<ParsedQuestion[]>(
+    JSON.parse(sessionStorage.getItem('smartParser_questions') || '[]')
+  )
+  const [groupedQuestions, setGroupedQuestions] = useState<Record<string, Array<{ number: number; content: string }>>>(
+    JSON.parse(sessionStorage.getItem('smartParser_grouped') || '{}')
+  )
+  const [solveProgress, setSolveProgress] = useState<SolveProgress>(
+    (sessionStorage.getItem('smartParser_solveProgress') as SolveProgress) || 'idle'
+  )
+  const [solveResult, setSolveResult] = useState<{ paper_task_id: string; question_count: number; thread_id: string; task_ids: string[] } | null>(
+    JSON.parse(sessionStorage.getItem('smartParser_result') || 'null')
+  )
+  const [questionStatuses, setQuestionStatuses] = useState<Record<string, QuestionSolveStatus>>(
+    JSON.parse(sessionStorage.getItem('smartParser_statuses') || '{}')
+  )
+
+  // 状态变化时持久化到 sessionStorage
+  useEffect(() => {
+    sessionStorage.setItem('smartParser_stage', parseStage)
+  }, [parseStage])
+  useEffect(() => {
+    sessionStorage.setItem('smartParser_batchId', batchId || '')
+  }, [batchId])
+  useEffect(() => {
+    sessionStorage.setItem('smartParser_markdown', markdownContent || '')
+  }, [markdownContent])
+  useEffect(() => {
+    sessionStorage.setItem('smartParser_error', errorMessage || '')
+  }, [errorMessage])
+  useEffect(() => {
+    sessionStorage.setItem('smartParser_questions', JSON.stringify(questions))
+  }, [questions])
+  useEffect(() => {
+    sessionStorage.setItem('smartParser_grouped', JSON.stringify(groupedQuestions))
+  }, [groupedQuestions])
+  useEffect(() => {
+    sessionStorage.setItem('smartParser_solveProgress', solveProgress)
+  }, [solveProgress])
+  useEffect(() => {
+    sessionStorage.setItem('smartParser_result', JSON.stringify(solveResult))
+  }, [solveResult])
+  useEffect(() => {
+    sessionStorage.setItem('smartParser_statuses', JSON.stringify(questionStatuses))
+  }, [questionStatuses])
+  useEffect(() => {
+    sessionStorage.setItem('smartParser_preview', previewUrl || '')
+  }, [previewUrl])
+  useEffect(() => {
+    sessionStorage.setItem('smartParser_parseProgress', JSON.stringify(parseProgress))
+  }, [parseProgress])
+
   const handleFileSelect = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (file) {

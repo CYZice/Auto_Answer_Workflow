@@ -86,30 +86,6 @@ def get_v4_service() -> MineruV4Service:
     return get_mineru_v4_service()
 
 
-async def download_and_extract_markdown(zip_url: str) -> str:
-    """下载 zip 文件并提取 markdown 内容"""
-    resp = requests.get(zip_url, timeout=120)
-    resp.raise_for_status()
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        zip_path = os.path.join(tmpdir, "result.zip")
-        with open(zip_path, "wb") as f:
-            f.write(resp.content)
-
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(tmpdir)
-
-        # 查找 markdown 文件
-        for root, _, files in os.walk(tmpdir):
-            for fname in files:
-                if fname.endswith(".md"):
-                    fpath = os.path.join(root, fname)
-                    with open(fpath, "r", encoding="utf-8") as f:
-                        return f.read()
-
-    raise ValueError("zip 中未找到 markdown 文件")
-
-
 def _create_question_task(
     question_num: int,
     question_content: str,
@@ -316,7 +292,7 @@ async def wait_parse_completion(
     markdown_content = None
     if result.status == "done" and result.full_zip_url:
         try:
-            markdown_content = await download_and_extract_markdown(result.full_zip_url)
+            markdown_content = await service.download_and_extract_markdown(result.full_zip_url)
         except Exception:
             pass
 
@@ -358,7 +334,7 @@ async def solve_paper(
     # 获取 markdown 内容
     markdown = result.markdown_content
     if not markdown and result.full_zip_url:
-        markdown = await download_and_extract_markdown(result.full_zip_url)
+        markdown = await service.download_and_extract_markdown(result.full_zip_url)
 
     if not markdown:
         raise HTTPException(status_code=500, detail="无法获取 Markdown 内容")
@@ -549,7 +525,7 @@ async def get_paper_questions(mineru_task_id: str):
 
     markdown = result.markdown_content
     if not markdown and result.full_zip_url:
-        markdown = await download_and_extract_markdown(result.full_zip_url)
+        markdown = await service.download_and_extract_markdown(result.full_zip_url)
 
     if not markdown:
         raise HTTPException(status_code=500, detail="无法获取 Markdown 内容")

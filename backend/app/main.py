@@ -271,6 +271,7 @@ async def run_agent_workflow_async(
                 "agent_configs": agent_configs,
                 "target_nodes": effective_target_nodes,
                 "workflow_template_id": workflow_template_id,
+                "question_text": history_data.get("question_content"),
             }
         graph_app = graph_apps[start_node]
 

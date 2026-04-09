@@ -3373,11 +3373,6 @@ function App() {
 }
 
 // === 智能解析试卷组件 ===
-interface MineruUploadUrlResponse {
-  batch_id: string;
-  upload_url: string;
-}
-
 interface MineruParseResultResponse {
   mineru_task_id: string;
   status: string;
@@ -3459,28 +3454,20 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
     setParseProgress(null)
 
     try {
-      // 1. 获取上传 URL（POST 文件到后端，后端调用 MinerU API 获取上传 URL）
+      // 1. 后端代理上传文件到 OSS，返回 batch_id
       const formData = new FormData()
       formData.append('file', selectedFile)
-      const uploadUrlRes = await api.post<MineruUploadUrlResponse>(
+      const parseRes = await api.post<MineruParseResultResponse>(
         '/api/mineru/parse/file',
         formData,
         { headers: { 'Content-Type': 'multipart/form-data' } }
       )
-      const { batch_id, upload_url } = uploadUrlRes.data
+      const batch_id = parseRes.data.mineru_task_id
       setBatchId(batch_id)
 
-      setParseStage('waiting')
-
-      // 2. 上传文件到 MinerU
-      await fetch(upload_url, {
-        method: 'PUT',
-        body: await selectedFile.arrayBuffer(),
-      })
-
-      // 3. 等待解析完成
       setParseStage('parsing')
 
+      // 2. 轮询等待解析完成
       const maxWait = 600000 // 10分钟
       const startTime = Date.now()
 

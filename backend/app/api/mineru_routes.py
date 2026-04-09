@@ -141,13 +141,18 @@ def _create_question_task(
 
 # === 路由实现 ===
 
-@router.post("/parse/file", response_model=MineruUploadUrlResponse)
-async def get_upload_url(
+@router.post("/parse/file", response_model=MineruParseResponse)
+async def parse_file(
     file: UploadFile = File(..., description="试卷图片或 PDF 文件"),
 ):
-    """获取文件上传 URL"""
+    """
+    后端代理上传文件到 OSS（解决浏览器跨域问题），返回 batch_id 供后续轮询
+    """
     service = get_v4_service()
 
+    file_content = await file.read()
+
+    # 1. 获取上传 URL
     batch_url = f"{MINERU_V4_API_BASE}/file-urls/batch"
     headers = {
         "Content-Type": "application/json",
@@ -167,7 +172,17 @@ async def get_upload_url(
     batch_id = result["data"]["batch_id"]
     upload_url = result["data"]["file_urls"][0]
 
-    return MineruUploadUrlResponse(batch_id=batch_id, upload_url=upload_url)
+    # 2. 后端代理上传到 OSS（避免浏览器跨域限制）
+    upload_resp = requests.put(upload_url, data=file_content, timeout=120)
+    if upload_resp.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=f"文件上传失败, HTTP {upload_resp.status_code}")
+
+    # 3. 返回 batch_id，前端轮询 /parse/{batch_id} 获取结果
+    return MineruParseResponse(
+        mineru_task_id=batch_id,
+        status="pending",
+        created_at=datetime.now(),
+    )
 
 
 @router.post("/parse/{batch_id}/upload", response_model=MineruParseResponse)

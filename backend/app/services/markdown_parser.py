@@ -178,8 +178,12 @@ class MarkdownParser:
                 if is_first_hash_line:
                     is_first_hash_line = False
                     continue
-                # 其他 # 标题行，触发新题目
+                # 其他 # 标题行，触发新题目，保留标题内容
                 flush_question()
+                # 去掉 # 标记，保留内容作为题目开头
+                content_without_hash = stripped.lstrip("#").strip()
+                if content_without_hash:
+                    current_content_lines.append(content_without_hash)
                 continue
 
             # 检测大写数字+顿号开头的行，触发新题目

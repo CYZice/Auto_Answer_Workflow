@@ -269,11 +269,11 @@ async def parse_url(request: MineruParseUrlRequest):
 
 @router.get("/parse/{task_id}", response_model=MineruParseResultResponse)
 async def get_parse_result(task_id: str):
-    """查询解析结果"""
+    """查询解析结果（批量文件方式）"""
     service = get_v4_service()
 
     try:
-        result = await service.get_result(task_id)
+        result = await service.get_batch_result(task_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -292,12 +292,12 @@ async def wait_parse_completion(
     poll_interval: Optional[float] = Query(default=3.0),
     max_wait: Optional[float] = Query(default=600.0),
 ):
-    """等待解析完成"""
+    """等待解析完成（批量文件方式）"""
     service = get_v4_service()
 
     try:
-        result = await service.wait_for_completion(
-            task_id=task_id,
+        result = await service.wait_for_batch_completion(
+            batch_id=task_id,
             poll_interval=poll_interval,
             max_wait=max_wait,
         )
@@ -341,7 +341,7 @@ async def solve_paper(
     service = get_v4_service()
 
     # 获取 MinerU 解析结果
-    result = await service.wait_for_completion(mineru_task_id, max_wait=600.0)
+    result = await service.wait_for_batch_completion(mineru_task_id, max_wait=600.0)
 
     if result.status != "done":
         raise HTTPException(status_code=400, detail=f"MinerU 解析未完成，当前状态: {result.status}")
@@ -540,7 +540,7 @@ async def get_paper_questions(mineru_task_id: str):
     """获取试卷题目列表"""
     service = get_v4_service()
 
-    result = await service.wait_for_completion(mineru_task_id, max_wait=600.0)
+    result = await service.wait_for_batch_completion(mineru_task_id, max_wait=600.0)
 
     if result.status != "done":
         raise HTTPException(status_code=400, detail=f"MinerU 解析未完成，当前状态: {result.status}")

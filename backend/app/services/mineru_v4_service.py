@@ -88,7 +88,7 @@ class MineruV4Service:
 
     async def get_result(self, task_id: str) -> MineruV4ParseResult:
         """
-        查询解析结果
+        查询 URL 解析任务结果（用于 parse_url 方式）
 
         Args:
             task_id: 任务 ID
@@ -108,6 +108,35 @@ class MineruV4Service:
         data = result["data"]
         return MineruV4ParseResult(
             task_id=data["task_id"],
+            status=data["state"],
+            state=data["state"],
+            full_zip_url=data.get("full_zip_url"),
+            error_msg=data.get("err_msg"),
+            extract_progress=data.get("extract_progress"),
+        )
+
+    async def get_batch_result(self, batch_id: str) -> MineruV4ParseResult:
+        """
+        查询批量文件解析结果（用于 file-upload 方式）
+
+        Args:
+            batch_id: 批量任务 ID
+
+        Returns:
+            MineruV4ParseResult
+        """
+        resp = requests.get(
+            f"{MINERU_V4_API_BASE}/extract-results/batch/{batch_id}",
+            headers=self._get_headers(),
+            timeout=30,
+        )
+        result = resp.json()
+        if result.get("code") != 0:
+            raise ValueError(f"MinerU v4 批量查询失败: {result.get('msg')}")
+
+        data = result["data"]["extract_result"][0]
+        return MineruV4ParseResult(
+            task_id=batch_id,
             status=data["state"],
             state=data["state"],
             full_zip_url=data.get("full_zip_url"),
@@ -165,6 +194,59 @@ class MineruV4Service:
             await asyncio.sleep(interval)
 
         final_result = await self.get_result(task_id)
+        print(f"轮询超时 ({timeout}s)，状态: {final_result.status}")
+        return final_result
+
+    async def wait_for_batch_completion(
+        self,
+        batch_id: str,
+        poll_interval: Optional[float] = None,
+        max_wait: Optional[float] = None,
+    ) -> MineruV4ParseResult:
+        """
+        阻塞等待批量文件解析完成
+
+        Args:
+            batch_id: 批量任务 ID
+            poll_interval: 轮询间隔
+            max_wait: 最大等待时间
+
+        Returns:
+            MineruV4ParseResult
+        """
+        interval = poll_interval or self.poll_interval
+        timeout = max_wait or self.max_wait
+
+        state_labels = {
+            "pending": "排队中",
+            "running": "解析中",
+            "done": "解析完成",
+            "failed": "解析失败",
+        }
+
+        start = time.time()
+        while time.time() - start < timeout:
+            result = await self.get_batch_result(batch_id)
+            elapsed = int(time.time() - start)
+
+            if result.status == "done":
+                print(f"[{elapsed}s] MinerU v4 批量解析完成")
+                return result
+
+            if result.status == "failed":
+                print(f"[{elapsed}s] MinerU v4 批量解析失败: {result.error_msg}")
+                return result
+
+            label = state_labels.get(result.status, result.status)
+            if result.extract_progress:
+                ep = result.extract_progress
+                print(f"[{elapsed}s] {label}... ({ep.get('extracted_pages', 0)}/{ep.get('total_pages', '?')})")
+            else:
+                print(f"[{elapsed}s] {label}...")
+
+            await asyncio.sleep(interval)
+
+        final_result = await self.get_batch_result(batch_id)
         print(f"轮询超时 ({timeout}s)，状态: {final_result.status}")
         return final_result
 

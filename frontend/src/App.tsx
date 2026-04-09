@@ -3459,18 +3459,20 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
     setParseProgress(null)
 
     try {
-      // 1. 获取上传 URL
-      const uploadUrlRes = await api.get<MineruUploadUrlResponse>('/api/mineru/parse/file')
+      // 1. 获取上传 URL（POST 文件到后端，后端调用 MinerU API 获取上传 URL）
+      const formData = new FormData()
+      formData.append('file', selectedFile)
+      const uploadUrlRes = await api.post<MineruUploadUrlResponse>(
+        '/api/mineru/parse/file',
+        formData,
+        { headers: { 'Content-Type': 'multipart/form-data' } }
+      )
       const { batch_id, upload_url } = uploadUrlRes.data
       setBatchId(batch_id)
 
-      // 2. 上传文件
-      const formData = new FormData()
-      formData.append('file', selectedFile)
-
       setParseStage('waiting')
 
-      // 上传到 MinerU
+      // 2. 上传文件到 MinerU
       await fetch(upload_url, {
         method: 'PUT',
         body: await selectedFile.arrayBuffer(),

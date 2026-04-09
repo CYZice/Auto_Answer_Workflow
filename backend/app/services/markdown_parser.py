@@ -109,6 +109,14 @@ def detect_question_type(line: str, current_type: str) -> tuple[str, bool]:
     # 检查是否匹配大写数字+顿号模式（如 一、选择题 或 一、直流电路）
     if re.match(CHINESE_NUMERAL_PATTERN, line_after_hash):
         new_type = extract_question_type_name(line_after_hash)
+
+        # 如果提取出的"题型名称"包含 LaTeX 或 "如图所示"/"求"/"计算" 等关键词，
+        # 说明这行实际上是题目内容（如"二、如图所示电路..."），
+        # 不是独立的题型标题，不触发新题型
+        type_content = line_after_hash[line_after_hash.index(re.match(CHINESE_NUMERAL_PATTERN, line_after_hash).group()) + 1:].strip()
+        if '$' in type_content or '如图' in type_content or '求' in type_content[:10]:
+            return current_type, False
+
         return new_type, True
 
     # 检查是否为 # 开头的纯题型名称（## 选择题、## 填空题 等）
@@ -128,6 +136,8 @@ class MarkdownParser:
         """
         解析 Markdown 试卷，返回题目列表
 
+        简化逻辑：按大写数字分段，题型统一设为"未分类"
+
         Args:
             markdown: MinerU 返回的 Markdown 内容
 
@@ -136,26 +146,25 @@ class MarkdownParser:
         """
         lines = markdown.split("\n")
         questions: list[Question] = []
-        current_type = "未分类"
         current_content_lines: list[str] = []
         current_images: list[str] = []
-        current_number: Optional[int] = None
+        question_count = 0
+        is_first_hash_line = True  # 跳过第一个 # 行（文档标题）
 
         def flush_question():
             """将当前累积的内容 flush 为一个题目"""
-            nonlocal questions, current_content_lines, current_images, current_number
-            if current_content_lines or current_number is not None:
-                content = "\n".join(current_content_lines).strip()
-                if content or current_number is not None:
-                    questions.append(Question(
-                        number=current_number or len(questions) + 1,
-                        question_type=current_type,
-                        content=content,
-                        images=current_images.copy(),
-                    ))
+            nonlocal questions, current_content_lines, current_images, question_count
+            content = "\n".join(current_content_lines).strip()
+            if content:
+                question_count += 1
+                questions.append(Question(
+                    number=question_count,
+                    question_type="未分类",
+                    content=content,
+                    images=current_images.copy(),
+                ))
                 current_content_lines = []
                 current_images = []
-                current_number = None
 
         for line in lines:
             stripped = line.strip()
@@ -164,42 +173,26 @@ class MarkdownParser:
             if not stripped:
                 continue
 
-            # 检测题型标题（# 开头的行）
+            # 跳过第一个 # 行（文档标题）
             if stripped.startswith("#"):
+                if is_first_hash_line:
+                    is_first_hash_line = False
+                    continue
+                # 其他 # 标题行，触发新题目
                 flush_question()
-                new_type, is_new_type = detect_question_type(stripped, current_type)
-                if is_new_type:
-                    current_type = new_type
                 continue
 
-            # 检测大写数字+顿号开头的行（无 # 号的章节标题）
-            new_type, is_new_type = detect_question_type(stripped, current_type)
-            if is_new_type:
+            # 检测大写数字+顿号开头的行，触发新题目
+            if re.match(CHINESE_NUMERAL_PATTERN, stripped):
                 flush_question()
-                current_type = new_type
+                current_content_lines.append(stripped)
                 continue
 
-            # 检测题号行
-            number, match_type, rest = parse_question_number(stripped)
-
-            if number is not None and match_type is not None:
-                # 如果有之前累积的内容，先 flush
-                if current_content_lines or current_number is not None:
-                    flush_question()
-
-                current_number = number
-                # 提取图片并清理内容中的图片 markdown
-                content_with_images = rest or ""
-                clean_content, imgs = extract_images(content_with_images)
-                if clean_content:
-                    current_content_lines.append(clean_content)
-                current_images.extend(imgs)
-            else:
-                # 普通内容行，提取图片并清理 markdown
-                clean_line, imgs = extract_images(stripped)
-                if clean_line:
-                    current_content_lines.append(clean_line)
-                current_images.extend(imgs)
+            # 普通内容行，追加到当前题目
+            clean_line, imgs = extract_images(stripped)
+            if clean_line:
+                current_content_lines.append(clean_line)
+            current_images.extend(imgs)
 
         # Flush 最后一个题目
         flush_question()

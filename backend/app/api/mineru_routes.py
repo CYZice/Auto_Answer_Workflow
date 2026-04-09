@@ -103,14 +103,20 @@ def _create_question_task(
     - 工作流执行相同
     """
     from app.main import run_agent_workflow_async
+    from app.services.runtime_config import read_runtime_settings
 
     task_id = f"q_{question_num}_{uuid.uuid4().hex[:8]}"
+
+    # 获取当前激活的模板 ID
+    runtime_settings = read_runtime_settings()
+    active_template_id = runtime_settings.get("active_template_id")
 
     history_data = {
         "image_urls": image_urls,
         "question_number": question_num,
         "question_type": question_type,
         "question_content": question_content,
+        "workflow_template_id": active_template_id,
         "solver_config": {},
         "reviewer_config": {},
         "formatter_config": {},

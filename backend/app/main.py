@@ -208,12 +208,14 @@ async def run_agent_workflow_async(
             try:
                 if task_record.history:
                     history_data = json.loads(task_record.history)
+                    print(f"[DEBUG main.py] task_id={task_id}, history_data keys={list(history_data.keys())}, question_content={history_data.get('question_content')}")
                     agent_configs = {
                         "solver": history_data.get("solver_config", {}),
                         "reviewer": history_data.get("reviewer_config", {}),
                         "formatter": history_data.get("formatter_config", {}),
                     }
-            except Exception:
+            except Exception as e:
+                print(f"[DEBUG main.py] Failed to parse history: {e}")
                 history_data = {}
 
             runtime_settings = read_runtime_settings()
@@ -273,6 +275,7 @@ async def run_agent_workflow_async(
                 "workflow_template_id": workflow_template_id,
                 "question_text": history_data.get("question_content"),
             }
+            print(f"[DEBUG main.py] task_id={task_id}, history_data keys={list(history_data.keys())}, question_content={history_data.get('question_content')}")
         graph_app = graph_apps[start_node]
 
         # 3. 运行图引擎

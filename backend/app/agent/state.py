@@ -43,3 +43,4 @@ class AgentState(TypedDict):
         dict
     ]  # 包含各个节点的模型配置，如 {"solver": {...}, "reviewer": {...}}
     workflow_template_id: Optional[str]  # 当前任务使用的提示词模板 ID
+    question_text: Optional[str]  # MinerU 解析的题目文字（可选）

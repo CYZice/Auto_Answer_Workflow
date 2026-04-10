@@ -333,6 +333,7 @@ async def solve_image(
         )
 
     # 如果有题目文字，附加到提示词中
+    print(f"[DEBUG solve_image] question_text={question_text}")
     if question_text:
         text_prompt = f"题目内容（来自 OCR 识别）：\n{question_text}\n\n{text_prompt}"
 
@@ -386,6 +387,7 @@ async def format_solution(
     model_config: Optional[dict] = None,
     workflow_template_id: Optional[str] = None,
     task_id: str = None,
+    question_text: Optional[str] = None,
 ) -> dict:
     """
     封装调用模型进行最终排版润色的逻辑
@@ -401,6 +403,10 @@ async def format_solution(
         or "请对以下解题草稿进行最终排版：\n\n{draft_solution}",
         {"draft_solution": draft_solution},
     )
+
+    # 如果有题目文字，附加到提示词中
+    if question_text:
+        user_prompt = f"题目内容（来自 OCR 识别）：\n{question_text}\n\n{user_prompt}"
 
     if image_urls:
         human_content = [{"type": "text", "text": user_prompt}]

@@ -52,6 +52,7 @@ async def format_node(state: AgentState) -> AgentState:
     if not image_urls and state.get("image_url"):
         image_urls = [state.get("image_url")]
     workflow_template_id = state.get("workflow_template_id")
+    question_text = state.get("question_text")
 
     try:
         # 调用大模型进行排版润色
@@ -62,6 +63,7 @@ async def format_node(state: AgentState) -> AgentState:
             model_config=formatter_config,
             workflow_template_id=workflow_template_id,
             task_id=state.get("task_id"),
+            question_text=question_text,
         )
         safe_total_tokens = coerce_token_count(
             state.get("total_tokens"), 0

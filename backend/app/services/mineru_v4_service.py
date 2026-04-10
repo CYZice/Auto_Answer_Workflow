@@ -135,6 +135,7 @@ class MineruV4Service:
             raise ValueError(f"MinerU v4 批量查询失败: {result.get('msg')}")
 
         data = result["data"]["extract_result"][0]
+        print(f"[DEBUG get_batch_result] batch_id={batch_id}, raw_data={data}")
         return MineruV4ParseResult(
             task_id=batch_id,
             status=data["state"],
@@ -282,6 +283,53 @@ class MineruV4Service:
                             return f.read()
 
         raise ValueError("zip 中未找到 markdown 文件")
+
+    async def download_and_extract_images(self, zip_url: str) -> dict[str, str]:
+        """
+        下载 zip 文件并提取所有图片，转换为 base64 data URL
+
+        Args:
+            zip_url: zip 文件 URL
+
+        Returns:
+            dict: {relative_path: base64_data_url}，例如 {"images/xxx.jpg": "data:image/jpeg;base64,..."}
+        """
+        import base64
+
+        resp = requests.get(zip_url, timeout=120)
+        resp.raise_for_status()
+
+        images_dict: dict[str, str] = {}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = os.path.join(tmpdir, "result.zip")
+            with open(zip_path, "wb") as f:
+                f.write(resp.content)
+
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(tmpdir)
+
+                # 遍历所有文件，找到 images 目录下的图片
+                for name in zf.namelist():
+                    if name.startswith("images/") and not name.endswith("/"):
+                        # 这是一个图片文件
+                        file_data = zf.read(name)
+                        # 根据扩展名确定 MIME 类型
+                        ext = name.lower().split(".")[-1]
+                        mime_types = {
+                            "jpg": "image/jpeg",
+                            "jpeg": "image/jpeg",
+                            "png": "image/png",
+                            "gif": "image/gif",
+                            "webp": "image/webp",
+                            "bmp": "image/bmp",
+                        }
+                        mime_type = mime_types.get(ext, "image/jpeg")
+                        # 转换为 base64
+                        b64_data = base64.b64encode(file_data).decode("utf-8")
+                        data_url = f"data:{mime_type};base64,{b64_data}"
+                        images_dict[name] = data_url
+
+        return images_dict
 
     async def parse_url_and_wait(
         self,

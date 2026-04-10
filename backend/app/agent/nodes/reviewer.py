@@ -189,6 +189,11 @@ async def review_node(state: AgentState) -> AgentState:
             {"draft_solution": draft},
         )
 
+        # 如果有题目文字，附加到提示词中
+        question_text = state.get("question_text")
+        if question_text:
+            text_prompt = f"题目内容（来自 OCR 识别）：\n{question_text}\n\n{text_prompt}"
+
         image_urls = state.get("image_urls") or []
         if not image_urls and state.get("image_url"):
             image_urls = [state.get("image_url")]

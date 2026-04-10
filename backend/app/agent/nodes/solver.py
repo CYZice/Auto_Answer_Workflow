@@ -45,8 +45,9 @@ async def solve_node(state: AgentState) -> AgentState:
     solver_config = agent_configs.get("solver") or {}
     workflow_template_id = state.get("workflow_template_id")
     question_text = state.get("question_text")  # MinerU 解析的题目文字
+    print(f"[DEBUG solver] question_text from state: {question_text}")
 
-    # 防御性编程：支持“仅题干文本”解题。
+    # 防御性编程：支持"仅题干文本"解题。
     # 只有图片与题干文本都缺失时才判定失败。
     if not image_urls and not (
         isinstance(question_text, str) and question_text.strip()

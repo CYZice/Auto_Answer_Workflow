@@ -3455,6 +3455,8 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
   const [selectedTaskIds, setSelectedTaskIds] = useState<string[]>([])
   const [batchActionLoading, setBatchActionLoading] = useState(false)
   const [originalImages, setOriginalImages] = useState<string[]>([])
+  const [paperSubject, setPaperSubject] = useState('')
+  const [paperTitle, setPaperTitle] = useState('')
 
   const readImageFileAsDataUrl = (file: File) => new Promise<string>((resolve, reject) => {
     const reader = new FileReader()
@@ -3559,6 +3561,15 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
   useEffect(() => {
     sessionStorage.setItem('smartParser_parseProgress', JSON.stringify(parseProgress))
   }, [parseProgress])
+
+  // 组件挂载时：如果 solveProgress 是 'solving' 且有 solveResult，说明页面刷新后轮询中断了，重新开始轮询
+  useEffect(() => {
+    if (solveProgress === 'solving' && solveResult?.thread_id) {
+      pollSolveStatus(solveResult.thread_id)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   const handleFileSelect = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (file) {
@@ -3611,6 +3622,8 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
           const resultRes = await api.get<MineruParseResultResponse>(`/api/mineru/parse/${batch_id}`)
           const result = resultRes.data
 
+          console.log('[DEBUG parse polling] batch_id:', batch_id, 'status:', result.status, 'extract_progress:', result.extract_progress)
+
           // 更新进度
           if (result.extract_progress) {
             setParseProgress({
@@ -3620,17 +3633,21 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
           }
 
           if (result.status === 'done') {
+            console.log('[DEBUG parse polling] status is DONE, fetching questions...')
             setMarkdownContent(result.markdown_content || '')
             setParseStage('done')
 
             // 获取题目列表
             try {
+              console.log('[DEBUG parse polling] fetching questions from:', `/api/mineru/paper/${batch_id}/questions`)
               const questionsRes = await api.get<ParsedQuestionsResponse>(`/api/mineru/paper/${batch_id}/questions`)
               const parsedQuestions = questionsRes.data.questions || []
+              console.log('[DEBUG parse polling] got questions:', parsedQuestions.length)
               setQuestions(parsedQuestions)
               setEditableQuestions(parsedQuestions)
               setGroupedQuestions(rebuildGroupedQuestions(parsedQuestions))
-            } catch {
+            } catch (e) {
+              console.error('[DEBUG parse polling] failed to fetch questions:', e)
               // 题目列表获取失败不影响主流程
             }
 
@@ -3638,9 +3655,13 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
           }
 
           if (result.status === 'failed') {
+            console.log('[DEBUG parse polling] status is FAILED:', result.error_message)
             throw new Error(result.error_message || '解析失败')
           }
-        } catch {
+
+          console.log('[DEBUG parse polling] current status is:', result.status, '- continuing to poll...')
+        } catch (e) {
+          console.error('[DEBUG parse polling] error during poll:', e)
           // 继续等待
         }
       }
@@ -3656,12 +3677,29 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
     if (!batchId) return
 
     const sourceQuestions = editableQuestions.length > 0 ? editableQuestions : questions
-    const normalizedQuestions = sourceQuestions.map((question) => ({
+
+    // 检查是否有使用题号勾选的题目（格式：number:X）
+    const selectedNumbers = selectedTaskIds
+      .filter((id) => id.startsWith('number:'))
+      .map((id) => parseInt(id.split(':')[1], 10))
+
+    // 如果有题号勾选，只提交被勾选的题目；否则提交所有题目
+    const questionsToSubmit = selectedNumbers.length > 0
+      ? sourceQuestions.filter((q) => selectedNumbers.includes(q.number))
+      : sourceQuestions
+
+    const normalizedQuestions = questionsToSubmit.map((question) => ({
       number: question.number,
       type: (question.type || '').trim(),
       content: (question.content || '').trim(),
       images: question.images || [],
     }))
+
+    if (normalizedQuestions.length === 0) {
+      setErrorMessage('请先勾选要提交的题目')
+      return
+    }
+
     const emptyTypeQuestion = normalizedQuestions.find((question) => question.type.length === 0)
     if (emptyTypeQuestion) {
       setErrorMessage(`第 ${emptyTypeQuestion.number} 题题型不能为空`)
@@ -3871,8 +3909,14 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
   const handleExportDocx = async () => {
     if (!batchId) return
 
+    const params = new URLSearchParams()
+    if (paperSubject.trim()) params.set('paper_subject', paperSubject.trim())
+    if (paperTitle.trim()) params.set('paper_title', paperTitle.trim())
+    const queryString = params.toString()
+    const exportUrl = `/api/mineru/paper/${batchId}/export/docx${queryString ? `?${queryString}` : ''}`
+
     try {
-      const res = await fetch(`/api/mineru/paper/${batchId}/export/docx`)
+      const res = await fetch(exportUrl)
       const blob = await res.blob()
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
@@ -4026,17 +4070,27 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
                               status.status === 'cancelled' ? 'bg-gray-500' :
                                 'bg-blue-500 animate-pulse'
                       const canEditBeforeSolve = solveProgress === 'idle'
+                      // 始终显示复选框：解题前使用题号作为标识，解题后使用task_id
+                      const questionId = `number:${q.number}`
+                      const isSelectedBeforeSolve = selectedTaskIds.includes(questionId)
+                      const isSelectedAfterSolve = status?.task_id ? selectedTaskIds.includes(status.task_id) : false
+                      const isSelected = isSelectedBeforeSolve || isSelectedAfterSolve
+                      const handleToggle = () => {
+                        if (status?.task_id) {
+                          toggleTaskSelection(status.task_id)
+                        } else {
+                          toggleTaskSelection(questionId)
+                        }
+                      }
 
                       return (
                         <div key={q.number} className="text-sm p-3 bg-gray-50 rounded border border-gray-200 space-y-2">
                           <div className="flex items-center gap-2">
-                            {status?.task_id && (
-                              <input
-                                type="checkbox"
-                                checked={selectedTaskIds.includes(status.task_id)}
-                                onChange={() => toggleTaskSelection(status.task_id)}
-                              />
-                            )}
+                            <input
+                              type="checkbox"
+                              checked={isSelected}
+                              onChange={handleToggle}
+                            />
                             <div className={`w-2 h-2 rounded-full ${statusColor}`} />
                             <span className="font-medium">第{q.number}题</span>
                             {status && (
@@ -4081,10 +4135,33 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
           {questions.length > 0 && solveProgress === 'idle' && (
             <div className="mt-4 pt-4 border-t flex gap-2">
               <button
+                onClick={() => {
+                  // 全选/取消全选：检查是否所有题目都被选中
+                  const allSelected = questions.every((q) => selectedTaskIds.includes(`number:${q.number}`))
+                  if (allSelected) {
+                    // 取消全选：移除所有 number:X 格式的勾选
+                    setSelectedTaskIds((prev) => prev.filter((id) => !id.startsWith('number:')))
+                  } else {
+                    // 全选：添加所有题号为勾选状态
+                    setSelectedTaskIds((prev) => {
+                      const withoutNumbers = prev.filter((id) => !id.startsWith('number:'))
+                      return [...withoutNumbers, ...questions.map((q) => `number:${q.number}`)]
+                    })
+                  }
+                }}
+                className="px-3 py-2 text-xs border border-gray-300 rounded hover:bg-gray-50"
+              >
+                {questions.every((q) => selectedTaskIds.includes(`number:${q.number}`))
+                  ? '取消全选'
+                  : '全选'}
+              </button>
+              <button
                 onClick={handleStartSolve}
                 className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 text-sm"
               >
-                开始解题
+                {selectedTaskIds.filter((id) => id.startsWith('number:')).length > 0
+                  ? `开始解题 (${selectedTaskIds.filter((id) => id.startsWith('number:')).length})`
+                  : '开始解题'}
               </button>
             </div>
           )}
@@ -4141,10 +4218,32 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
           )}
 
           {solveProgress === 'completed' && (
-            <div className="mt-4 pt-4 border-t flex gap-2">
+            <div className="mt-4 pt-4 border-t">
+              <div className="grid grid-cols-2 gap-3 mb-3">
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">试卷科目</label>
+                  <input
+                    type="text"
+                    value={paperSubject}
+                    onChange={(e) => setPaperSubject(e.target.value)}
+                    placeholder="如：电工基础"
+                    className="w-full px-3 py-2 border rounded text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">试卷名称/年份</label>
+                  <input
+                    type="text"
+                    value={paperTitle}
+                    onChange={(e) => setPaperTitle(e.target.value)}
+                    placeholder="如：2024-2025学年期末考试"
+                    className="w-full px-3 py-2 border rounded text-sm"
+                  />
+                </div>
+              </div>
               <button
                 onClick={handleExportDocx}
-                className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 text-sm"
+                className="w-full inline-flex items-center justify-center gap-2 px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 text-sm"
               >
                 导出DOCX
               </button>
@@ -4153,7 +4252,46 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
 
           {solveProgress === 'error' && (
             <div className="mt-4 pt-4 border-t">
-              <p className="text-sm text-red-600">部分题目解题失败</p>
+              <p className="text-sm text-red-600 mb-3">部分题目解题失败</p>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={selectAllRunning}
+                  className="px-2 py-1 text-xs border rounded hover:bg-gray-50"
+                >
+                  全选可暂停
+                </button>
+                <button
+                  onClick={selectAllRetryable}
+                  className="px-2 py-1 text-xs border rounded hover:bg-gray-50"
+                >
+                  全选可重试
+                </button>
+                <button
+                  onClick={clearSelectedTasks}
+                  className="px-2 py-1 text-xs border rounded hover:bg-gray-50"
+                >
+                  清空勾选
+                </button>
+                <div className="text-xs text-gray-500 flex items-center justify-end">
+                  已勾选 {selectedTaskIds.length} 题
+                </div>
+              </div>
+              <div className="mt-2 flex gap-2">
+                <button
+                  onClick={handleBatchPause}
+                  disabled={batchActionLoading || selectedTaskIds.length === 0}
+                  className="flex-1 px-3 py-2 text-xs rounded border border-amber-300 text-amber-700 hover:bg-amber-50 disabled:opacity-50"
+                >
+                  {batchActionLoading ? '处理中...' : '批量暂停'}
+                </button>
+                <button
+                  onClick={handleBatchRetry}
+                  disabled={batchActionLoading || selectedTaskIds.length === 0}
+                  className="flex-1 px-3 py-2 text-xs rounded border border-blue-300 text-blue-700 hover:bg-blue-50 disabled:opacity-50"
+                >
+                  {batchActionLoading ? '处理中...' : '批量重试'}
+                </button>
+              </div>
             </div>
           )}
 
@@ -4162,25 +4300,6 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
               <p className="text-sm text-green-800">
                 解题流程已启动 ({solveResult.question_count} 题)
               </p>
-            </div>
-          )}
-        </div>
-
-        {/* 右侧：预览 */}
-        <div className="bg-white rounded-xl shadow-sm p-6">
-          <h3 className="text-lg font-semibold mb-4">Markdown 预览</h3>
-
-          {parseStage !== 'done' && (
-            <div className="h-96 flex items-center justify-center text-gray-400 text-sm">
-              解析完成后显示预览
-            </div>
-          )}
-
-          {markdownContent && (
-            <div className="prose prose-sm max-w-none max-h-[600px] overflow-y-auto">
-              <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
-                {markdownContent}
-              </ReactMarkdown>
             </div>
           )}
         </div>

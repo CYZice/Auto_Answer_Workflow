@@ -56,6 +56,7 @@ from app.services.runtime_config import (
     create_template_from,
     get_template,
     list_templates,
+    read_model_defaults,
     read_runtime_settings,
     update_runtime_settings,
     upsert_template,
@@ -521,9 +522,29 @@ async def create_task(
     try:
         new_task_id = f"task_{uuid.uuid4().hex[:8]}"
         new_thread_id = f"thread_{uuid.uuid4().hex[:8]}"
+        model_defaults = read_model_defaults()
+
+        def resolve_model_config(config_model, default_key: str) -> dict:
+            if config_model is not None:
+                return config_model.model_dump()
+            default_value = model_defaults.get(default_key)
+            if isinstance(default_value, dict):
+                return default_value
+            return {}
+
+        solver_config_payload = resolve_model_config(req.solver_config, "solver_config")
+        reviewer_config_payload = resolve_model_config(
+            req.reviewer_config, "reviewer_config"
+        )
+        formatter_config_payload = resolve_model_config(
+            req.formatter_config, "formatter_config"
+        )
+
         runtime_settings = read_runtime_settings()
-        workflow_template_id = req.workflow_template_id or runtime_settings.get(
-            "active_template_id"
+        workflow_template_id = (
+            req.workflow_template_id
+            or model_defaults.get("workflow_template_id")
+            or runtime_settings.get("active_template_id")
         )
         normalized_image_urls = normalize_image_urls(req.image_urls, req.image_url)
         if not normalized_image_urls:
@@ -565,6 +586,10 @@ async def create_task(
         if not req.draft_solution:
             req.draft_solution = "见图片"
 
+        effective_draft_solution = req.draft_solution
+        if effective_draft_solution is None:
+            effective_draft_solution = model_defaults.get("draft_solution")
+
         new_task = Task(
             task_id=new_task_id,
             thread_id=new_thread_id,
@@ -573,19 +598,11 @@ async def create_task(
             history=json.dumps(
                 {
                     "image_urls": normalized_image_urls,
-                    "solver_config": (
-                        req.solver_config.model_dump() if req.solver_config else {}
-                    ),
-                    "reviewer_config": (
-                        req.reviewer_config.model_dump() if req.reviewer_config else {}
-                    ),
-                    "formatter_config": (
-                        req.formatter_config.model_dump()
-                        if req.formatter_config
-                        else {}
-                    ),
+                    "solver_config": (solver_config_payload),
+                    "reviewer_config": (reviewer_config_payload),
+                    "formatter_config": (formatter_config_payload),
                     "workflow_template_id": workflow_template_id,
-                    "draft_solution": req.draft_solution,
+                    "draft_solution": effective_draft_solution,
                 },
                 ensure_ascii=False,
             ),

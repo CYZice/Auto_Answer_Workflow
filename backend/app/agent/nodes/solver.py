@@ -70,6 +70,14 @@ async def solve_node(state: AgentState) -> AgentState:
             state["task_id"],
             question_text,
         )
+        draft = result.get("draft")
+        if not isinstance(draft, str) or not draft.strip():
+            return {
+                **state,
+                "status": "failed",
+                "failed_node": "solver",
+                "error_msg": "Solver returned empty draft_solution.",
+            }
         safe_total_tokens = coerce_token_count(
             state.get("total_tokens"), 0
         ) + coerce_token_count(result.get("tokens"), 0)
@@ -77,7 +85,7 @@ async def solve_node(state: AgentState) -> AgentState:
         return {
             **state,
             "status": "reviewing",
-            "draft_solution": result["draft"],
+            "draft_solution": draft,
             "total_tokens": safe_total_tokens,
         }
     except asyncio.CancelledError:

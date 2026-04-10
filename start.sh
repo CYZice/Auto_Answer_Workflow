@@ -65,12 +65,31 @@ export AUTOMATION_SKIP_BROWSER_INSTALL=${AUTOMATION_SKIP_BROWSER_INSTALL:-1}
 export AUTOMATION_BROWSER_CHANNEL=${AUTOMATION_BROWSER_CHANNEL:-chrome}
 export AUTOMATION_TARGET_URL=${AUTOMATION_TARGET_URL:-https://yy.xuejie.cn/#/login}
 
+# Windows-like 环境默认关闭 reload，避免 asyncio 子进程在部分事件循环下报 NotImplementedError
+if [ -z "${AUTOMATION_BACKEND_RELOAD}" ]; then
+    case "$(uname -s 2>/dev/null)" in
+        MINGW*|MSYS*|CYGWIN*)
+            AUTOMATION_BACKEND_RELOAD=0
+            ;;
+        *)
+            AUTOMATION_BACKEND_RELOAD=1
+            ;;
+    esac
+fi
+export AUTOMATION_BACKEND_RELOAD
+
 echo -e "${GREEN}自动化模式: AUTOMATION_USE_MOCK=${AUTOMATION_USE_MOCK}${NC}"
 if [ -n "${AUTOMATION_TARGET_URL}" ]; then
     echo -e "${GREEN}目标地址: ${AUTOMATION_TARGET_URL}${NC}"
 fi
 echo -e "${GREEN}浏览器通道: ${AUTOMATION_BROWSER_CHANNEL}${NC}"
 echo -e "${GREEN}跳过浏览器下载: AUTOMATION_SKIP_BROWSER_INSTALL=${AUTOMATION_SKIP_BROWSER_INSTALL}${NC}"
+echo -e "${GREEN}后端热重载: AUTOMATION_BACKEND_RELOAD=${AUTOMATION_BACKEND_RELOAD}${NC}"
+
+UVICORN_RELOAD_ARGS=()
+if [ "${AUTOMATION_BACKEND_RELOAD}" = "1" ]; then
+    UVICORN_RELOAD_ARGS=(--reload)
+fi
 
 # 检查并创建虚拟环境 (虚拟环境在项目根目录 .venv)
 if [ ! -d ".venv" ]; then
@@ -99,7 +118,7 @@ fi
 # 启动后端服务 (后台运行)
 echo -e "${GREEN}启动后端服务 (端口 8080)...${NC}"
 # uvicorn 会继承当前 shell 的 stdout，把它放在后台运行
-uvicorn app.main:app --reload --port 8080 &
+uvicorn app.main:app "${UVICORN_RELOAD_ARGS[@]}" --port 8080 &
 BACKEND_PID=$!
 # 等待1秒确保后端如果报错能打印出来
 sleep 1

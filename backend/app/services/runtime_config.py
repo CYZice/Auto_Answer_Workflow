@@ -9,6 +9,7 @@ import yaml
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
 RUNTIME_SETTINGS_PATH = CONFIG_DIR / "runtime_settings.yaml"
 PROMPT_TEMPLATES_PATH = CONFIG_DIR / "prompt_templates.yaml"
+MODEL_DEFAULTS_PATH = CONFIG_DIR / "model_defaults.local.yaml"
 
 DEFAULT_RUNTIME_SETTINGS = {
     "active_template_id": "workflow_a",
@@ -45,6 +46,29 @@ DEFAULT_PROMPT_TEMPLATES = {
             },
         }
     }
+}
+
+DEFAULT_MODEL_DEFAULTS = {
+    "solver_config": {
+        "model_name": "",
+        "api_key": "",
+        "base_url": "",
+        "max_tokens": 4096,
+    },
+    "reviewer_config": {
+        "model_name": "",
+        "api_key": "",
+        "base_url": "",
+        "max_tokens": 2048,
+    },
+    "formatter_config": {
+        "model_name": "",
+        "api_key": "",
+        "base_url": "",
+        "max_tokens": 1024,
+    },
+    "workflow_template_id": "workflow_a",
+    "draft_solution": None,
 }
 
 _LOCK = threading.RLock()
@@ -98,6 +122,45 @@ def normalize_positive_int(value: Any, default: int, minimum: int = 0) -> int:
     if normalized < minimum:
         return default
     return normalized
+
+
+def normalize_model_config(value: Any, default_max_tokens: int) -> dict[str, Any]:
+    config = value if isinstance(value, dict) else {}
+    model_name = str(config.get("model_name") or "").strip()
+    api_key = str(config.get("api_key") or "").strip()
+    base_url = str(config.get("base_url") or "").strip()
+    max_tokens = normalize_positive_int(
+        config.get("max_tokens"),
+        default_max_tokens,
+        minimum=1,
+    )
+    return {
+        "model_name": model_name,
+        "api_key": api_key,
+        "base_url": base_url,
+        "max_tokens": max_tokens,
+    }
+
+
+def read_model_defaults() -> dict[str, Any]:
+    with _LOCK:
+        raw = _safe_read_yaml(MODEL_DEFAULTS_PATH, DEFAULT_MODEL_DEFAULTS)
+
+    solver = normalize_model_config(raw.get("solver_config"), 4096)
+    reviewer = normalize_model_config(raw.get("reviewer_config"), 2048)
+    formatter = normalize_model_config(raw.get("formatter_config"), 1024)
+    workflow_template_id = str(
+        raw.get("workflow_template_id")
+        or DEFAULT_MODEL_DEFAULTS["workflow_template_id"]
+    ).strip()
+
+    return {
+        "solver_config": solver,
+        "reviewer_config": reviewer,
+        "formatter_config": formatter,
+        "workflow_template_id": workflow_template_id,
+        "draft_solution": raw.get("draft_solution"),
+    }
 
 
 def read_runtime_settings() -> dict[str, Any]:

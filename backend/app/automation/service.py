@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import time
 import uuid
@@ -42,6 +43,10 @@ class AutomationService:
         self._workflow_api_base = os.getenv(
             "AUTOMATION_WORKFLOW_API_BASE", "http://127.0.0.1:8080"
         ).rstrip("/")
+
+    def _build_workflow_create_payload(self, image_url: str) -> dict:
+        # 完全复用主工作流默认路径：只传图片，模型与模板由 runtime settings 决定。
+        return {"image_url": image_url}
 
     async def start_session(self, req: StartSessionReq) -> RunRuntime:
         run = RunRuntime(
@@ -200,17 +205,13 @@ class AutomationService:
             repo = AutomationRepository(db)
             for task_id in expired_task_ids:
                 task = repo.get_task(task_id)
-                if (
-                    task is None
-                    or task.run_id != run_id
-                    or task.status != "review_pending"
-                ):
+                if task is None or task.status != "review_pending":
                     self._review_deadlines.pop(task_id, None)
                     continue
                 repo.update_status(task, "skipped")
                 self._log(
                     db,
-                    run_id,
+                    task.run_id,
                     "review_timeout",
                     "review timeout, auto skipped",
                     task_id=task.task_id,
@@ -259,17 +260,42 @@ class AutomationService:
                         if task is None:
                             continue
                         self._check_stopped(run)
+                        task.run_id = run_id
+                        db.commit()
+
+                        def _grab_logger(level: str, step: str, message: str) -> None:
+                            self._log_runtime(
+                                run_id,
+                                step,
+                                message,
+                                level=level,
+                                task_id=task.task_id,
+                                school_name=school_name,
+                            )
+
                         ok = await self._browser.grab_task(
                             run_id,
                             task.task_id,
                             task.school_name or "",
                             task.topic_title or "",
+                            on_log=_grab_logger,
                         )
                         if not ok:
                             repo.update_task_content(
                                 task,
                                 error_code="grab_failed",
-                                error_message="grab failed",
+                                error_message=(
+                                    "grab failed: school or topic not matched on page"
+                                ),
+                            )
+                            self._log(
+                                db,
+                                run_id,
+                                "grab",
+                                "task grab failed: school/topic locate failed",
+                                task_id=task.task_id,
+                                school_name=school_name,
+                                level="WARN",
                             )
                             continue
                         repo.update_status(task, "grabbed")
@@ -288,35 +314,74 @@ class AutomationService:
             run.state = "idle"
             return done
 
-    async def _invoke_existing_workflow(self, image_url: str) -> str:
-        payload = {"image_url": image_url}
-        async with httpx.AsyncClient(timeout=180) as client:
-            create_resp = await client.post(
-                f"{self._workflow_api_base}/api/tasks", json=payload
-            )
-            create_resp.raise_for_status()
-            task_id = create_resp.json()["task_id"]
+    async def _download_image_as_data_url(self, image_url: str) -> str:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            resp = await client.get(image_url)
+            resp.raise_for_status()
+            content_type = (resp.headers.get("content-type") or "").split(";")[0]
+            content_type = content_type.strip().lower()
+            if not content_type.startswith("image/"):
+                content_type = "image/png"
+            encoded = base64.b64encode(resp.content).decode("ascii")
+            return f"data:{content_type};base64,{encoded}"
 
-            for _ in range(180):
-                detail_resp = await client.get(
-                    f"{self._workflow_api_base}/api/tasks/{task_id}"
+    async def _ensure_data_url(self, image_url: str) -> str:
+        source = (image_url or "").strip()
+        if source.startswith("data:image/"):
+            return source
+        return await self._download_image_as_data_url(source)
+
+    async def _invoke_existing_workflow(
+        self,
+        image_url: str,
+        on_log=None,
+    ) -> dict:
+        def emit(level: str, message: str) -> None:
+            if on_log is None:
+                return
+            on_log(level, "solve.workflow", message)
+
+        async def _run_once(payload_image_url: str) -> dict:
+            payload = self._build_workflow_create_payload(payload_image_url)
+            async with httpx.AsyncClient(timeout=180) as client:
+                create_resp = await client.post(
+                    f"{self._workflow_api_base}/api/tasks", json=payload
                 )
-                detail_resp.raise_for_status()
-                detail = detail_resp.json()
-                if detail.get("state") in {
-                    "completed",
-                    "failed",
-                    "manual",
-                    "cancelled",
-                }:
-                    if detail.get("state") != "completed":
-                        raise RuntimeError(
-                            detail.get("error_code") or "workflow failed"
-                        )
-                    return detail.get("final_result") or ""
-                await asyncio.sleep(1)
+                create_resp.raise_for_status()
+                task_id = create_resp.json()["task_id"]
+                emit("INFO", f"workflow task created (base64): {task_id}")
 
-        raise TimeoutError("workflow timeout")
+                for _ in range(180):
+                    detail_resp = await client.get(
+                        f"{self._workflow_api_base}/api/tasks/{task_id}"
+                    )
+                    detail_resp.raise_for_status()
+                    detail = detail_resp.json()
+                    if detail.get("state") in {
+                        "completed",
+                        "failed",
+                        "manual",
+                        "cancelled",
+                    }:
+                        if detail.get("state") != "completed":
+                            error_code = detail.get("error_code") or "workflow failed"
+                            emit(
+                                "WARN",
+                                f"workflow task failed (base64): {task_id}; error={error_code}",
+                            )
+                            raise RuntimeError(error_code)
+                        emit("INFO", f"workflow task completed (base64): {task_id}")
+                        return {
+                            "workflow_task_id": task_id,
+                            "final_result": detail.get("final_result") or "",
+                            "answer_preview": detail.get("answer_preview") or "",
+                        }
+                    await asyncio.sleep(1)
+
+            raise TimeoutError("workflow timeout")
+
+        data_url = await self._ensure_data_url(image_url)
+        return await _run_once(data_url)
 
     async def start_solve(self, run_id: str, limit: int = 0) -> int:
         async with self._run_lock:
@@ -326,7 +391,7 @@ class AutomationService:
             done = 0
             with SessionLocal() as db:
                 repo = AutomationRepository(db)
-                rows = repo.list_by_status(run_id, ["grabbed"])
+                rows = repo.list_by_status(run_id, ["grabbed", "solve_failed"])
                 if limit > 0:
                     rows = rows[:limit]
 
@@ -343,16 +408,70 @@ class AutomationService:
                             continue
                         self._check_stopped(run)
                         run.current_task_id = task.task_id
+                        task.run_id = run_id
                         repo.update_status(task, "solving")
 
                     try:
-                        final_markdown = await self._invoke_existing_workflow(
-                            task.topic_image_url or ""
+
+                        def _solve_logger(level: str, step: str, message: str) -> None:
+                            self._log_runtime(
+                                run_id,
+                                step,
+                                message,
+                                level=level,
+                                task_id=task.task_id,
+                                school_name=task.school_name,
+                            )
+
+                        latest_image_url = await self._browser.prepare_solve_task(
+                            run_id,
+                            task.task_id,
+                            task.school_name or "",
+                            task.topic_title or "",
+                            on_log=_solve_logger,
                         )
+
+                        image_for_workflow = (
+                            latest_image_url or task.topic_image_url or ""
+                        )
+                        if not image_for_workflow:
+                            raise RuntimeError("missing source image url for workflow")
+
+                        if latest_image_url and latest_image_url != (
+                            task.topic_image_url or ""
+                        ):
+                            with SessionLocal() as db:
+                                repo = AutomationRepository(db)
+                                latest_task = repo.get_task(task_id)
+                                if latest_task is not None:
+                                    repo.update_task_content(
+                                        latest_task,
+                                        error_code=None,
+                                        error_message=None,
+                                    )
+                                    latest_task.topic_image_url = latest_image_url
+                                    db.commit()
+
+                        workflow_result = await self._invoke_existing_workflow(
+                            image_for_workflow,
+                            on_log=_solve_logger,
+                        )
+                        workflow_task_id = workflow_result.get("workflow_task_id") or ""
+                        final_markdown = workflow_result.get("final_result") or ""
+                        answer_preview = workflow_result.get("answer_preview") or ""
                         analysis_md, extension = self._renderer.split_answer(
                             final_markdown
                         )
-                        image_path = self._renderer.save_analysis_snapshot(analysis_md)
+                        render_markdown = (answer_preview or analysis_md).strip()
+                        image_path = self._renderer.save_analysis_snapshot(
+                            render_markdown
+                        )
+
+                        _solve_logger(
+                            "INFO",
+                            "solve.workflow",
+                            f"workflow detail loaded by task_id={workflow_task_id}; answer_preview_len={len(answer_preview)}",
+                        )
 
                         with SessionLocal() as db:
                             repo = AutomationRepository(db)

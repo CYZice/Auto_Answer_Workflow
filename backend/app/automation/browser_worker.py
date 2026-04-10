@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import os
+import re
 import uuid
 from typing import Any
 from collections.abc import Callable
@@ -91,11 +94,30 @@ class BrowserWorker:
             "div:has-text('待开始')",
             "div:has-text('待解题')",
         ]
-        self._task_action_button_selector = "button:has-text('我会做，抢单答题')"
+        self._task_action_button_selector = "button:has-text('我会做，抢单答题'), button:has-text('我会做'), button:has-text('抢单答题'), button:has-text('接单'), span:has-text('我会做，抢单答题'), span:has-text('我会做'), span:has-text('抢单答题'), span:has-text('接单')"
         self._task_rows_selector = ".d2-container-full__body .el-table__body-wrapper .el-table__body tbody tr.el-table__row"
         self._view_button_selector = (
-            "td:nth-child(4) .cell button.el-button.el-button--text.el-button--default:has(span:has-text('查看')), "
-            "td:last-child .cell button.el-button.el-button--text.el-button--default:has(span:has-text('查看'))"
+            "td:nth-child(4) button:has(span:has-text('查看')), "
+            "td:nth-child(4) button:has-text('查看'), "
+            "td:nth-child(4) span:has-text('查看'), "
+            "td:last-child button:has(span:has-text('查看')), "
+            "td:last-child button:has-text('查看')"
+        )
+        self._dialog_grab_button_selector = (
+            ".el-dialog__footer button:has-text('我会做，抢单答题'), "
+            ".el-dialog__footer button:has-text('我会做'), "
+            ".el-dialog__footer button:has-text('抢单答题'), "
+            ".el-dialog__footer button:has-text('接单'), "
+            ".el-dialog__footer span:has-text('我会做，抢单答题'), "
+            ".el-dialog__footer span:has-text('我会做'), "
+            ".el-dialog__footer span:has-text('抢单答题'), "
+            ".el-dialog__footer span:has-text('接单')"
+        )
+        self._dialog_solve_confirm_selector = (
+            ".el-dialog button:has-text('确认题目识别内容正确'), "
+            ".el-dialog button:has-text('开始填答案'), "
+            ".el-dialog span:has-text('确认题目识别内容正确'), "
+            ".el-dialog span:has-text('开始填答案')"
         )
         self._scan_noise_keywords = {
             "薪酬统计",
@@ -442,6 +464,25 @@ class BrowserWorker:
 
         return topic_title, topic_image_url
 
+    async def _extract_preview_title_from_row(self, row: Any) -> str:
+        selectors = [
+            "td:nth-child(2) .topic p",
+            "td:nth-child(2) .topic",
+            "td:nth-child(2) p",
+            "td:nth-child(2)",
+        ]
+        for selector in selectors:
+            try:
+                node = row.locator(selector).first
+                if await node.count() == 0:
+                    continue
+                text = (await node.inner_text()).replace("\n", " ").strip()
+                if len(text) >= 4:
+                    return text
+            except Exception:
+                continue
+        return ""
+
     async def _extract_table_tasks(
         self,
         page: Any,
@@ -530,7 +571,9 @@ class BrowserWorker:
                 emit("INFO", f"row {idx}: 状态非待处理({status_cell})，跳过")
                 continue
 
-            topic_title = title_cell or row_text
+            preview_title = await self._extract_preview_title_from_row(row)
+            topic_title = preview_title or title_cell or row_text
+            topic_title = topic_title.replace("\n", " ").strip()
             if len(topic_title) < 4:
                 emit("INFO", f"row {idx}: 标题过短，跳过")
                 continue
@@ -541,14 +584,21 @@ class BrowserWorker:
                 topic_title,
                 on_log=on_log,
             )
-            topic_title = (full_title or topic_title).replace("\n", " ").strip()
+            # 扫描阶段统一保存“列表预览文本”为后续接单/解题匹配基准；
+            # 查看详情仅用于补充题图链接与兜底文本。
+            if not topic_title and full_title:
+                topic_title = full_title.replace("\n", " ").strip()
             if len(topic_title) > 280:
                 topic_title = topic_title[:280]
 
             display_school = school_name or school_cell or "默认学校"
+            stable_key = f"{display_school}|{topic_title}|{topic_image_url}".encode(
+                "utf-8", errors="ignore"
+            )
+            stable_id = f"auto_{hashlib.sha1(stable_key).hexdigest()[:16]}"
             tasks.append(
                 {
-                    "task_id": f"auto_{uuid.uuid4().hex[:10]}",
+                    "task_id": stable_id,
                     "run_id": run_id,
                     "school_name": display_school,
                     "topic_title": topic_title,
@@ -667,42 +717,457 @@ class BrowserWorker:
         await page.wait_for_timeout(300)
 
     @staticmethod
-    def _compact_text(value: str) -> str:
-        return "".join((value or "").split())
+    def _normalize_text(text: str) -> str:
+        return "".join((text or "").split()).lower()
 
-    async def _switch_school(self, page: Any, school_name: str) -> bool:
-        if not school_name:
-            return True
-        opened = await self._open_school_dropdown(page)
-        if not opened:
+    @staticmethod
+    def _normalize_preview_text(text: str) -> str:
+        raw = (text or "").lower()
+        if not raw:
+            return ""
+
+        # 去掉 HTML 标签、公式片段与常见模板噪声，提升跨页面匹配稳定性。
+        raw = re.sub(r"<[^>]+>", " ", raw)
+        raw = re.sub(r"\{[^{}]*\}", " ", raw)
+        raw = re.sub(r"[\r\n\t]+", " ", raw)
+        raw = raw.replace("&nbsp;", " ")
+        noise_tokens = [
+            "试题原始图片",
+            "ai识别内容",
+            "插入公式",
+            "image.png",
+            "katex",
+            "mathml",
+            "annotation",
+            "application/x-tex",
+            "data-w-e-type",
+            "is_latex",
+        ]
+        for token in noise_tokens:
+            raw = raw.replace(token, " ")
+        raw = re.sub(r"\s+", "", raw)
+        return raw
+
+    def _build_title_keywords(self, topic_title: str) -> list[str]:
+        normalized = self._normalize_preview_text(topic_title)
+        if not normalized:
+            return []
+        candidates = [
+            normalized,
+            normalized[:48],
+            normalized[:32],
+            normalized[:24],
+            normalized[:16],
+        ]
+        unique: list[str] = []
+        for item in candidates:
+            if len(item) < 6:
+                continue
+            if item not in unique:
+                unique.append(item)
+        return unique
+
+    @staticmethod
+    def _extract_match_tokens(text: str) -> set[str]:
+        normalized = BrowserWorker._normalize_preview_text(text)
+        if not normalized:
+            return set()
+        tokens = set(re.findall(r"[\u4e00-\u9fff]{2,}|[a-z0-9]{3,}", normalized))
+        if len(normalized) >= 12:
+            tokens.add(normalized[:12])
+        if len(normalized) >= 20:
+            tokens.add(normalized[:20])
+        return tokens
+
+    def _is_row_text_match(self, row_text: str, topic_title: str) -> bool:
+        normalized_row = self._normalize_preview_text(row_text)
+        normalized_title = self._normalize_preview_text(topic_title)
+        if not normalized_row or not normalized_title:
             return False
 
-        option = (
-            page.locator(self._school_option_selector)
-            .filter(has_text=school_name)
-            .first
+        if normalized_title in normalized_row or normalized_row in normalized_title:
+            return True
+
+        keywords = self._build_title_keywords(topic_title)
+        if any(key in normalized_row for key in keywords):
+            return True
+
+        row_tokens = self._extract_match_tokens(row_text)
+        title_tokens = self._extract_match_tokens(topic_title)
+        if not row_tokens or not title_tokens:
+            return False
+        overlap = row_tokens.intersection(title_tokens)
+        if len(overlap) >= 2:
+            return True
+        long_overlap = [token for token in overlap if len(token) >= 6]
+        if len(long_overlap) >= 1:
+            return True
+
+        # OCR/公式场景下文本噪声大，允许较低阈值的 token 重合率。
+        ratio = len(overlap) / max(1, min(len(row_tokens), len(title_tokens)))
+        return ratio >= 0.3
+
+    def _is_row_text_match_with_reason(
+        self, row_text: str, topic_title: str
+    ) -> tuple[bool, str]:
+        normalized_row = self._normalize_preview_text(row_text)
+        normalized_title = self._normalize_preview_text(topic_title)
+        if not normalized_row:
+            return False, "row_text_empty"
+        if not normalized_title:
+            return False, "topic_text_empty"
+
+        if normalized_title in normalized_row:
+            return True, "full_contains"
+        if normalized_row in normalized_title:
+            return True, "reverse_contains"
+
+        keywords = self._build_title_keywords(topic_title)
+        if any(key in normalized_row for key in keywords):
+            return True, "keyword_contains"
+
+        row_tokens = self._extract_match_tokens(row_text)
+        title_tokens = self._extract_match_tokens(topic_title)
+        if not row_tokens or not title_tokens:
+            return False, "token_empty"
+        overlap = row_tokens.intersection(title_tokens)
+        if len(overlap) >= 2:
+            return True, f"token_overlap:{len(overlap)}"
+        long_overlap = [token for token in overlap if len(token) >= 6]
+        if len(long_overlap) >= 1:
+            return True, "long_token_overlap"
+
+        ratio = len(overlap) / max(1, min(len(row_tokens), len(title_tokens)))
+        if ratio >= 0.3:
+            return True, f"token_ratio:{ratio:.2f}"
+        return False, f"no_match(overlap={len(overlap)},ratio={ratio:.2f})"
+
+    async def _select_school(self, page: Any, school_name: str) -> bool:
+        if not school_name:
+            return True
+
+        # 已经是目标学校时直接通过，避免重复选择触发下拉框异常。
+        school_inputs = page.locator(
+            "input[placeholder='选择学校'], input[placeholder*='学校'], div.el-select input"
         )
+        try:
+            count = min(await school_inputs.count(), 6)
+            for idx in range(count):
+                value = (await school_inputs.nth(idx).input_value()).strip()
+                if value and school_name in value:
+                    return True
+        except Exception:
+            pass
+
+        await self._open_school_dropdown(page)
+        options = page.locator(self._school_option_selector)
+        option = options.filter(has_text=school_name).first
         if await option.count() == 0:
             return False
 
         try:
-            await option.click(timeout=2000)
+            await option.click(timeout=1500)
+            await self._wait_school_switch_settled(page, school_name=school_name)
+            await self._switch_to_pending(page)
+            await self._wait_school_switch_settled(page, school_name=school_name)
+            return True
         except Exception:
             return False
 
-        await self._wait_school_switch_settled(page, school_name=school_name)
-        await self._switch_to_pending(page)
-        await self._wait_school_switch_settled(page, school_name=school_name)
-        return True
+    async def _open_row_view_dialog(
+        self,
+        page: Any,
+        row: Any,
+        on_log: Callable[[str, str, str], None] | None = None,
+        school_name: str | None = None,
+        task_id: str | None = None,
+        row_index: int | None = None,
+    ) -> tuple[bool, Any | None, str]:
+        def emit(level: str, message: str) -> None:
+            if on_log is None:
+                return
+            prefix_parts = []
+            if school_name:
+                prefix_parts.append(f"school={school_name}")
+            if task_id:
+                prefix_parts.append(f"task={task_id}")
+            if row_index is not None:
+                prefix_parts.append(f"row={row_index}")
+            prefix = f"[{' '.join(prefix_parts)}] " if prefix_parts else ""
+            on_log(level, "grab.view", f"{prefix}{message}")
 
-    async def _find_task_row_index(self, page: Any, topic_title: str) -> int:
+        view_trigger = row.locator(self._view_button_selector).first
+        if await view_trigger.count() == 0:
+            emit("WARN", "view button not found in row")
+            return False, None, "view_button_not_found"
+
+        try:
+            await view_trigger.scroll_into_view_if_needed()
+        except Exception:
+            pass
+
+        for attempt in (
+            {"timeout": 1800, "force": False},
+            {"timeout": 1800, "force": True},
+        ):
+            try:
+                await view_trigger.click(**attempt)
+                emit("INFO", f"view clicked force={attempt['force']}")
+                break
+            except Exception as exc:
+                emit("WARN", f"view click failed force={attempt['force']}: {exc}")
+        else:
+            return False, None, "view_click_failed"
+
+        dialog = None
+        for _ in range(20):
+            dialog = await self._get_visible_dialog_wrapper(page)
+            if dialog is not None:
+                return True, dialog, "dialog_opened"
+            await page.wait_for_timeout(120)
+
+        emit("WARN", "dialog not visible after clicking view")
+        return False, None, "dialog_not_visible"
+
+    async def _close_dialog_best_effort(self, page: Any, dialog: Any | None) -> None:
+        if dialog is not None:
+            closed = await self._click_first_available(
+                dialog,
+                [
+                    "button:has-text('返回')",
+                    "button:has-text('关闭')",
+                    ".el-dialog__headerbtn",
+                ],
+            )
+            if closed:
+                await page.wait_for_timeout(180)
+                return
+
+        await self._click_first_available(
+            page,
+            [
+                ".el-dialog__wrapper .el-dialog__headerbtn",
+                ".el-dialog__headerbtn",
+            ],
+        )
+        await page.wait_for_timeout(180)
+
+    async def _click_grab_button_in_dialog(
+        self,
+        page: Any,
+        dialog: Any,
+        on_log: Callable[[str, str, str], None] | None = None,
+        school_name: str | None = None,
+        task_id: str | None = None,
+        row_index: int | None = None,
+    ) -> tuple[bool, str]:
+        def emit(level: str, message: str) -> None:
+            if on_log is None:
+                return
+            prefix_parts = []
+            if school_name:
+                prefix_parts.append(f"school={school_name}")
+            if task_id:
+                prefix_parts.append(f"task={task_id}")
+            if row_index is not None:
+                prefix_parts.append(f"row={row_index}")
+            prefix = f"[{' '.join(prefix_parts)}] " if prefix_parts else ""
+            on_log(level, "grab.click", f"{prefix}{message}")
+
+        button = dialog.locator(self._dialog_grab_button_selector).first
+        if await button.count() == 0:
+            emit("WARN", "dialog footer grab button not found")
+            return False, "dialog_grab_button_not_found"
+
+        try:
+            await button.scroll_into_view_if_needed()
+        except Exception:
+            pass
+
+        try:
+            await button.click(timeout=2500)
+            emit("INFO", "dialog grab button clicked")
+            await page.wait_for_timeout(220)
+            return True, "dialog_grab_clicked"
+        except Exception as exc:
+            emit("WARN", f"dialog grab click failed: {exc}")
+            try:
+                handle = await button.element_handle()
+                if handle is not None:
+                    await handle.evaluate("el => el.click()")
+                    emit("INFO", "dialog grab clicked via js evaluate")
+                    await page.wait_for_timeout(220)
+                    return True, "dialog_grab_clicked_js"
+            except Exception as inner_exc:
+                emit("WARN", f"dialog grab js click failed: {inner_exc}")
+            return False, "dialog_grab_all_click_methods_failed"
+
+    async def _extract_image_url_from_dialog(self, dialog: Any) -> str:
+        candidates = [
+            ".el-dialog__body img",
+            ".topic img",
+            "img",
+        ]
+        for selector in candidates:
+            img = dialog.locator(selector).first
+            if await img.count() == 0:
+                continue
+            src = await img.get_attribute("src")
+            if src:
+                cleaned = src.strip()
+                if cleaned:
+                    return cleaned
+        return ""
+
+    async def _click_solve_confirm_in_dialog(
+        self,
+        page: Any,
+        dialog: Any,
+        on_log: Callable[[str, str, str], None] | None = None,
+        school_name: str | None = None,
+        task_id: str | None = None,
+        row_index: int | None = None,
+    ) -> tuple[bool, str]:
+        def emit(level: str, message: str) -> None:
+            if on_log is None:
+                return
+            prefix_parts = []
+            if school_name:
+                prefix_parts.append(f"school={school_name}")
+            if task_id:
+                prefix_parts.append(f"task={task_id}")
+            if row_index is not None:
+                prefix_parts.append(f"row={row_index}")
+            prefix = f"[{' '.join(prefix_parts)}] " if prefix_parts else ""
+            on_log(level, "solve.click", f"{prefix}{message}")
+
+        button = dialog.locator(self._dialog_solve_confirm_selector).first
+        if await button.count() == 0:
+            emit("WARN", "solve confirm button not found in dialog")
+            return False, "solve_confirm_button_not_found"
+
+        try:
+            await button.scroll_into_view_if_needed()
+        except Exception:
+            pass
+
+        for attempt in (
+            {"timeout": 2500, "force": False},
+            {"timeout": 2500, "force": True},
+        ):
+            try:
+                await button.click(**attempt)
+                emit("INFO", f"solve confirm clicked force={attempt['force']}")
+                await page.wait_for_timeout(250)
+                return True, f"solve_confirm_clicked(force={attempt['force']})"
+            except Exception as exc:
+                emit(
+                    "WARN",
+                    f"solve confirm click failed force={attempt['force']}: {exc}",
+                )
+
+        try:
+            handle = await button.element_handle()
+            if handle is not None:
+                await handle.evaluate("el => el.click()")
+                emit("INFO", "solve confirm clicked via js evaluate")
+                await page.wait_for_timeout(250)
+                return True, "solve_confirm_clicked_js"
+        except Exception as exc:
+            emit("WARN", f"solve confirm js click failed: {exc}")
+
+        return False, "solve_confirm_all_click_methods_failed"
+
+    async def _is_answer_mode_ready(self, page: Any) -> bool:
+        # 任一关键控件可见即可视为已进入填答案界面。
+        selectors = [
+            self._ocr_button_selector,
+            self._paste_input_selector,
+            "input.el-input__inner[placeholder='请输入内容']",
+            self._editor_selector,
+        ]
+        for selector in selectors:
+            try:
+                locator = page.locator(selector)
+                count = min(await locator.count(), 6)
+                for idx in range(count):
+                    if await locator.nth(idx).is_visible():
+                        return True
+            except Exception:
+                continue
+        return False
+
+    async def _wait_answer_mode_ready(self, page: Any, timeout_ms: int = 6000) -> bool:
+        loops = max(1, timeout_ms // 250)
+        for _ in range(loops):
+            if await self._is_answer_mode_ready(page):
+                return True
+            await page.wait_for_timeout(250)
+        return False
+
+    async def prepare_solve_task(
+        self,
+        run_id: str,
+        task_id: str,
+        school_name: str,
+        topic_title: str,
+        on_log: Callable[[str, str, str], None] | None = None,
+    ) -> str:
+        def emit(level: str, step: str, message: str) -> None:
+            if on_log is None:
+                return
+            on_log(level, step, f"task={task_id} school={school_name} {message}")
+
+        if self._use_mock:
+            await asyncio.sleep(0.05)
+            return ""
+
+        session = self._sessions.get(run_id)
+        if session is None:
+            raise ValueError(f"session not found: {run_id}")
+        await self._ensure_login(run_id)
+        page = session.page
+
+        if not await self._ensure_single_research_ready(page):
+            raise RuntimeError("failed to enter 单题研发")
+
+        async def switch_to_solving_tab() -> bool:
+            solving_items = page.locator(self._solving_status_selector).filter(
+                has_text="解题中"
+            )
+            if await solving_items.count() == 0:
+                return False
+            await solving_items.first.click()
+            await page.wait_for_timeout(250)
+            await self._wait_school_switch_settled(page, school_name=school_name)
+            return True
+
+        # 第一段短路：若已经在解题上下文，直接进入解题中，不强依赖学校切换成功。
+        solving_ready = await switch_to_solving_tab()
+        if solving_ready:
+            emit("INFO", "solve.nav", "switched to 解题中 tab")
+
+        selected = await self._select_school(page, school_name)
+        if selected:
+            emit("INFO", "solve.school", "school selected")
+            solving_ready = await switch_to_solving_tab()
+            if not solving_ready:
+                raise RuntimeError("解题中 tab not found")
+            emit("INFO", "solve.nav", "switched to 解题中 tab")
+        else:
+            emit(
+                "WARN",
+                "solve.school",
+                "school selection failed, continue with current context",
+            )
+            if not solving_ready:
+                raise RuntimeError("school selection failed in solve flow")
+
         rows = page.locator(self._task_rows_selector)
         row_count = min(await rows.count(), 120)
+        emit("INFO", "solve.match", f"candidate rows: {row_count}")
         if row_count == 0:
-            return -1
-
-        normalized_target = self._compact_text(topic_title)
-        shortlist: list[tuple[int, str]] = []
+            raise RuntimeError("no rows found in 解题中 list")
 
         for idx in range(row_count):
             row = rows.nth(idx)
@@ -715,55 +1180,159 @@ class BrowserWorker:
             row_text = (await row.inner_text()).strip()
             if not row_text:
                 continue
-
-            row_compact = self._compact_text(row_text)
-            title_cell = row.locator(
-                "td:nth-child(2) .topic, td:nth-child(2) .cell"
-            ).first
-            title_text = ""
-            if await title_cell.count() > 0:
-                title_text = (await title_cell.inner_text()).strip()
-            title_compact = self._compact_text(title_text)
-
-            candidates = [x for x in [title_compact, row_compact] if x]
-            if not candidates:
+            preview_title = await self._extract_preview_title_from_row(row)
+            candidate_text = preview_title or row_text
+            matched, reason = self._is_row_text_match_with_reason(
+                candidate_text, topic_title
+            )
+            if not matched:
                 continue
 
-            if normalized_target:
-                for candidate in candidates:
-                    if normalized_target in candidate or candidate in normalized_target:
-                        return idx
-
-            shortlist.append((idx, title_compact or row_compact))
-
-        if not normalized_target:
-            return shortlist[0][0] if shortlist else -1
-
-        # 兜底：按前缀相似度选最接近的行，减少页面文案截断导致的漏匹配。
-        target_prefix = normalized_target[:18]
-        best_idx = -1
-        best_score = -1
-        for idx, text in shortlist:
-            if not text:
+            opened, dialog, open_reason = await self._open_row_view_dialog(
+                page,
+                row,
+                on_log=on_log,
+                school_name=school_name,
+                task_id=task_id,
+                row_index=idx,
+            )
+            if not opened or dialog is None:
+                emit("WARN", "solve.view", f"open view failed: {open_reason}")
                 continue
-            score = 0
-            if target_prefix and target_prefix in text:
-                score += 2
-            if text[:18] == target_prefix:
-                score += 2
-            overlap = min(len(text), len(normalized_target))
-            if overlap > 0:
-                same = sum(
-                    1
-                    for i in range(min(overlap, 18))
-                    if text[i] == normalized_target[i]
+
+            image_url = await self._extract_image_url_from_dialog(dialog)
+            if image_url:
+                emit("INFO", "solve.image", "captured source image from dialog")
+            else:
+                emit("WARN", "solve.image", "image url not found in dialog")
+
+            confirmed, confirm_reason = await self._click_solve_confirm_in_dialog(
+                page,
+                dialog,
+                on_log=on_log,
+                school_name=school_name,
+                task_id=task_id,
+                row_index=idx,
+            )
+            if not confirmed:
+                await self._close_dialog_best_effort(page, dialog)
+                emit("WARN", "solve.click", f"confirm failed: {confirm_reason}")
+                continue
+
+            entered_answer_mode = await self._wait_answer_mode_ready(page)
+            if not entered_answer_mode:
+                await self._close_dialog_best_effort(page, dialog)
+                emit(
+                    "WARN",
+                    "solve.click",
+                    "confirm clicked but answer mode not ready, continue next candidate",
                 )
-                score += same
-            if score > best_score:
-                best_score = score
-                best_idx = idx
+                continue
 
-        return best_idx
+            emit("INFO", "solve.click", "answer mode ready after confirm")
+
+            emit("INFO", "solve.match", f"matched row {idx} with reason={reason}")
+            return image_url
+
+        raise RuntimeError("solve row locate failed")
+
+    async def _grab_task_from_current_table(
+        self,
+        page: Any,
+        topic_title: str,
+        on_log: Callable[[str, str, str], None] | None = None,
+        school_name: str | None = None,
+        task_id: str | None = None,
+    ) -> bool:
+        def emit(level: str, message: str) -> None:
+            if on_log is None:
+                return
+            prefix_parts = []
+            if school_name:
+                prefix_parts.append(f"school={school_name}")
+            if task_id:
+                prefix_parts.append(f"task={task_id}")
+            prefix = f"[{' '.join(prefix_parts)}] " if prefix_parts else ""
+            on_log(level, "grab.match", f"{prefix}{message}")
+
+        rows = page.locator(self._task_rows_selector)
+        row_count = min(await rows.count(), 120)
+        emit("INFO", f"candidate rows: {row_count}")
+        if row_count == 0:
+            emit("WARN", "no rows found in current table")
+            return False
+
+        miss_count = 0
+        matched_count = 0
+        for idx in range(row_count):
+            row = rows.nth(idx)
+            try:
+                if not await row.is_visible():
+                    if idx < 5:
+                        emit("INFO", f"row {idx}: not visible")
+                    continue
+            except Exception:
+                continue
+
+            row_text = (await row.inner_text()).strip()
+            if not row_text:
+                if idx < 5:
+                    emit("INFO", f"row {idx}: empty row text")
+                continue
+
+            preview_title = await self._extract_preview_title_from_row(row)
+            candidate_text = preview_title or row_text
+
+            matched, reason = self._is_row_text_match_with_reason(
+                candidate_text, topic_title
+            )
+            if not matched:
+                miss_count += 1
+                if idx < 5:
+                    snippet = candidate_text.replace("\n", " ").strip()[:80]
+                    emit("INFO", f"row {idx}: miss {reason}; text={snippet}")
+                continue
+
+            matched_count += 1
+            opened, dialog, open_reason = await self._open_row_view_dialog(
+                page,
+                row,
+                on_log=on_log,
+                school_name=school_name,
+                task_id=task_id,
+                row_index=idx,
+            )
+            if not opened or dialog is None:
+                emit("WARN", f"row {idx}: matched but open view failed ({open_reason})")
+                continue
+
+            clicked, click_reason = await self._click_grab_button_in_dialog(
+                page,
+                dialog,
+                on_log=on_log,
+                school_name=school_name,
+                task_id=task_id,
+                row_index=idx,
+            )
+            if clicked:
+                await page.wait_for_timeout(250)
+                await self._close_dialog_best_effort(page, dialog)
+                emit(
+                    "INFO", f"row {idx}: matched and clicked ({reason}, {click_reason})"
+                )
+                return True
+
+            await self._close_dialog_best_effort(page, dialog)
+            emit(
+                "WARN",
+                f"row {idx}: matched but grab button click failed ({click_reason})",
+            )
+
+        emit(
+            "WARN",
+            f"grab not completed after scanning {row_count} rows, matches={matched_count}, misses={miss_count}",
+        )
+        return False
 
     async def scan_discovered_tasks(
         self,
@@ -907,9 +1476,15 @@ class BrowserWorker:
         self,
         run_id: str,
         task_id: str,
-        school_name: str = "",
-        topic_title: str = "",
+        school_name: str,
+        topic_title: str,
+        on_log: Callable[[str, str, str], None] | None = None,
     ) -> bool:
+        def emit(level: str, step: str, message: str) -> None:
+            if on_log is None:
+                return
+            on_log(level, step, f"task={task_id} school={school_name} {message}")
+
         if self._use_mock:
             await asyncio.sleep(0.05)
             return True
@@ -921,69 +1496,41 @@ class BrowserWorker:
         page = session.page
 
         if not await self._ensure_single_research_ready(page):
+            emit("WARN", "grab.nav", "failed to enter 单题研发")
             return False
-
         await self._switch_to_pending(page)
-        if school_name:
-            switched = await self._switch_school(page, school_name)
-            if not switched:
-                return False
+        emit("INFO", "grab.nav", "switched to pending tab")
 
-        row_index = await self._find_task_row_index(page, topic_title)
-        if row_index < 0:
+        selected = await self._select_school(page, school_name)
+        if not selected:
+            emit("WARN", "grab.school", "school selection failed")
             return False
+        emit("INFO", "grab.school", "school selected")
 
-        rows = page.locator(self._task_rows_selector)
-        if row_index >= await rows.count():
-            return False
+        # 接单阶段比扫描更容易遇到学校切换后的延迟刷新，这里再做一次稳定等待与重试。
+        await self._wait_school_switch_settled(page, school_name=school_name)
+        await page.wait_for_timeout(250)
+        emit("INFO", "grab.school", "table settled after school switch")
 
-        row = rows.nth(row_index)
-        view_trigger = row.locator(self._view_button_selector).first
-        if await view_trigger.count() == 0:
-            view_trigger = row.locator(
-                "button:has(span:has-text('查看')), button:has-text('查看'), span:has-text('查看')"
-            ).first
-        if await view_trigger.count() == 0:
-            return False
-
-        try:
-            await view_trigger.click(timeout=2500)
-        except Exception:
-            return False
-
-        dialog = None
-        for _ in range(20):
-            dialog = await self._get_visible_dialog_wrapper(page)
-            if dialog is not None:
-                break
-            await page.wait_for_timeout(150)
-        if dialog is None:
-            return False
-
-        clicked = await self._click_first_available(
-            dialog,
-            [
-                "button:has-text('我会做')",
-                "button:has-text('抢单答题')",
-                "button.el-button--warning",
-                self._task_action_button_selector,
-            ],
-        )
-        if not clicked:
-            clicked = await self._click_first_available(
+        for attempt in range(3):
+            emit("INFO", "grab.match", f"match attempt {attempt + 1}/3")
+            grabbed = await self._grab_task_from_current_table(
                 page,
-                [
-                    ".el-dialog__footer button:has-text('我会做')",
-                    ".el-dialog__footer button:has-text('抢单答题')",
-                    ".el-dialog__footer button.el-button--warning",
-                    self._task_action_button_selector,
-                ],
+                topic_title,
+                on_log=on_log,
+                school_name=school_name,
+                task_id=task_id,
             )
-        if not clicked:
-            return False
+            if grabbed:
+                emit("INFO", "grab.match", "grab success")
+                return True
+            await self._wait_school_switch_settled(page, school_name=school_name)
+            await page.wait_for_timeout(250)
+            emit("INFO", "grab.match", "retry after settle")
 
-        await page.wait_for_timeout(300)
-        return True
+        await asyncio.sleep(0.05)
+        emit("WARN", "grab.match", "all attempts failed")
+        return False
 
     async def write_solution(
         self,
@@ -1002,29 +1549,61 @@ class BrowserWorker:
         await self._ensure_login(run_id)
         page = session.page
 
+        # workflow 完成后页面常有弹层残留，先清理再执行后续点击，避免被拦截。
+        await self._dismiss_blocking_dialogs(page)
+
+        already_in_answer_mode = await self._is_answer_mode_ready(page)
+
         # 进入“解题中”列表（若存在）
         solving_items = page.locator(self._solving_status_selector).filter(
             has_text="解题中"
         )
-        if await solving_items.count() > 0:
-            await solving_items.first.click()
-            await page.wait_for_timeout(200)
+        if (not already_in_answer_mode) and await solving_items.count() > 0:
+            switched = False
+            for _ in range(2):
+                try:
+                    await solving_items.first.click(timeout=2200)
+                    await page.wait_for_timeout(220)
+                    switched = True
+                    break
+                except Exception:
+                    await self._dismiss_blocking_dialogs(page)
+            if not switched:
+                # 已经在答题上下文时允许继续，不因页签点击失败中断整题流程。
+                await page.wait_for_timeout(100)
 
         # OCR 识别录入入口
         ocr_button = page.locator(self._ocr_button_selector).filter(has_text="识别录入")
         if await ocr_button.count() > 0:
-            await ocr_button.first.click()
-            await page.wait_for_timeout(200)
+            clicked_ocr = False
+            for _ in range(2):
+                try:
+                    await ocr_button.first.click(timeout=2200)
+                    await page.wait_for_timeout(220)
+                    clicked_ocr = True
+                    break
+                except Exception:
+                    await self._dismiss_blocking_dialogs(page)
+            if not clicked_ocr:
+                await page.wait_for_timeout(100)
 
-        # 尝试将图片路径写入粘贴框（目标站可能为 readonly，失败时继续回填编辑器）
+        # 粘贴解析截图到“粘贴答案图片”区域，触发站点识别流程。
         if image_path:
             paste_input = page.locator(self._paste_input_selector)
             if await paste_input.count() > 0:
                 try:
-                    await paste_input.first.fill(image_path)
+                    await paste_input.first.click(timeout=1200)
                 except Exception:
                     pass
+                await self._paste_image_to_input(paste_input.first, image_path)
 
+        await self._wait_recognition_settled(page)
+
+        # “考点延伸”输入框（placeholder=请输入内容）填入扩展内容。
+        if extension_text:
+            await self._fill_extension_input(page, extension_text)
+
+        # 兼容旧页面：如果仍存在富文本编辑器，补一份兜底文本。
         editors = page.locator(self._editor_selector)
         if await editors.count() > 0:
             # 第一个编辑器写入解析
@@ -1035,6 +1614,136 @@ class BrowserWorker:
 
         await page.wait_for_timeout(150)
         return True
+
+    async def _dismiss_blocking_dialogs(self, page: Any) -> None:
+        # 关闭最常见的 ElementUI 弹窗按钮。
+        for _ in range(3):
+            closed = await self._click_first_available(
+                page,
+                [
+                    ".el-dialog__wrapper .el-dialog__headerbtn",
+                    ".el-dialog__headerbtn",
+                    "button:has-text('关闭')",
+                    "button:has-text('返回')",
+                    "span:has-text('关闭')",
+                    "span:has-text('返回')",
+                ],
+            )
+            if not closed:
+                break
+            await page.wait_for_timeout(120)
+
+        # 再发一轮 ESC，处理无按钮可见但仍抢焦点的弹层。
+        try:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(80)
+        except Exception:
+            pass
+
+    async def _paste_image_to_input(self, target_input: Any, image_path: str) -> bool:
+        try:
+            with open(image_path, "rb") as file:
+                raw = file.read()
+        except Exception:
+            return False
+
+        if not raw:
+            return False
+
+        ext = os.path.splitext(image_path)[1].lower()
+        mime = "image/png"
+        if ext in {".jpg", ".jpeg"}:
+            mime = "image/jpeg"
+        elif ext == ".webp":
+            mime = "image/webp"
+
+        b64 = base64.b64encode(raw).decode("ascii")
+
+        try:
+            await target_input.evaluate(
+                """
+                async (inputEl, payload) => {
+                    const { imageBase64, mimeType } = payload;
+                    const binary = atob(imageBase64);
+                    const bytes = new Uint8Array(binary.length);
+                    for (let i = 0; i < binary.length; i += 1) {
+                        bytes[i] = binary.charCodeAt(i);
+                    }
+                    const file = new File([bytes], 'answer.png', { type: mimeType });
+
+                    const dataTransfer = new DataTransfer();
+                    dataTransfer.items.add(file);
+
+                    const target = inputEl || document.activeElement || document.body;
+                    const pasteEvent = new ClipboardEvent('paste', {
+                        bubbles: true,
+                        cancelable: true,
+                        clipboardData: dataTransfer,
+                    });
+                    target.dispatchEvent(pasteEvent);
+                    document.dispatchEvent(pasteEvent);
+                }
+                """,
+                {
+                    "imageBase64": b64,
+                    "mimeType": mime,
+                },
+            )
+            return True
+        except Exception:
+            return False
+
+    async def _wait_recognition_settled(
+        self, page: Any, timeout_ms: int = 15000
+    ) -> None:
+        loops = max(1, timeout_ms // 250)
+        stable_rounds = 0
+        for _ in range(loops):
+            busy = False
+            for selector in [
+                ".el-loading-mask",
+                ".el-loading-spinner",
+                ".el-icon-loading",
+            ]:
+                try:
+                    nodes = page.locator(selector)
+                    count = min(await nodes.count(), 6)
+                    for idx in range(count):
+                        if await nodes.nth(idx).is_visible():
+                            busy = True
+                            break
+                except Exception:
+                    continue
+                if busy:
+                    break
+
+            if not busy:
+                stable_rounds += 1
+                if stable_rounds >= 3:
+                    return
+            else:
+                stable_rounds = 0
+
+            await page.wait_for_timeout(250)
+
+    async def _fill_extension_input(self, page: Any, extension_text: str) -> bool:
+        inputs = page.locator("input.el-input__inner[placeholder='请输入内容']")
+        try:
+            count = await inputs.count()
+        except Exception:
+            return False
+
+        for idx in range(max(0, count - 1), -1, -1):
+            input_node = inputs.nth(idx)
+            try:
+                if not await input_node.is_visible():
+                    continue
+                await input_node.fill(extension_text)
+                return True
+            except Exception:
+                continue
+
+        return False
 
     async def submit_task(self, run_id: str, task_id: str) -> bool:
         if self._use_mock:

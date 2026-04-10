@@ -3965,7 +3965,7 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
         </button>
       </div>
 
-      <div className="grid grid-cols-3 gap-6">
+      <div className="grid grid-cols-2 gap-6">
         {/* 左侧：上传区域 */}
         <div className="bg-white rounded-xl shadow-sm p-6">
           <h3 className="text-lg font-semibold mb-4">上传试卷</h3>
@@ -4038,7 +4038,7 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
           )}
         </div>
 
-        {/* 中间：题目列表 */}
+        {/* 右侧：题目列表 */}
         <div className="bg-white rounded-xl shadow-sm p-6">
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-lg font-semibold">题目列表</h3>
@@ -4054,7 +4054,7 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
           )}
 
           {questions.length > 0 && (
-            <div className="space-y-4 max-h-[500px] overflow-y-auto">
+            <div className="space-y-4 max-h-[calc(100vh-320px)] overflow-y-auto">
               {Object.entries(groupedQuestions).map(([type, qs]) => (
                 <div key={type}>
                   <h4 className="text-sm font-medium text-indigo-600 mb-2">{type}</h4>

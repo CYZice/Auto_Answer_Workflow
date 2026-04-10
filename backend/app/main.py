@@ -645,6 +645,7 @@ def get_task(task_id: str, db: Session = Depends(get_db)):
 
 
 @app.get("/api/tasks/active", response_model=list[TaskDetailResponse])
+@app.get("/api/tasks/active/list", response_model=list[TaskDetailResponse])
 def list_active_tasks(db: Session = Depends(get_db)):
     """
     返回所有未完成任务，供主页面同步显示。

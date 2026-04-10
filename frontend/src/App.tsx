@@ -632,7 +632,7 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
 
   const { data: activeTasksFromDb } = useQuery({
     queryKey: ['dashboard-active-tasks'],
-    queryFn: () => api.get<AdminTask[]>('/api/tasks/active').then((res) => res.data),
+    queryFn: () => api.get<AdminTask[]>('/api/tasks/active/list').then((res) => res.data),
     refetchInterval: 3000,
   })
 
@@ -3437,6 +3437,9 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
   const [questions, setQuestions] = useState<ParsedQuestion[]>(
     JSON.parse(sessionStorage.getItem('smartParser_questions') || '[]')
   )
+  const [editableQuestions, setEditableQuestions] = useState<ParsedQuestion[]>(
+    JSON.parse(sessionStorage.getItem('smartParser_editable_questions') || '[]')
+  )
   const [groupedQuestions, setGroupedQuestions] = useState<Record<string, Array<{ number: number; content: string }>>>(
     JSON.parse(sessionStorage.getItem('smartParser_grouped') || '{}')
   )
@@ -3449,6 +3452,67 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
   const [questionStatuses, setQuestionStatuses] = useState<Record<string, QuestionSolveStatus>>(
     JSON.parse(sessionStorage.getItem('smartParser_statuses') || '{}')
   )
+  const [selectedTaskIds, setSelectedTaskIds] = useState<string[]>([])
+  const [batchActionLoading, setBatchActionLoading] = useState(false)
+  const [originalImages, setOriginalImages] = useState<string[]>([])
+
+  const readImageFileAsDataUrl = (file: File) => new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        resolve(reader.result)
+        return
+      }
+      reject(new Error('图片读取失败'))
+    }
+    reader.onerror = () => reject(new Error('图片读取失败'))
+    reader.readAsDataURL(file)
+  })
+
+  const loadOriginalImagesForSolve = async (file: File) => {
+    if (!file.type.startsWith('image/')) {
+      setOriginalImages([])
+      return
+    }
+    try {
+      const dataUrl = await readImageFileAsDataUrl(file)
+      setOriginalImages([dataUrl])
+    } catch {
+      setOriginalImages([])
+    }
+  }
+
+  const rebuildGroupedQuestions = (nextQuestions: ParsedQuestion[]) => {
+    return nextQuestions.reduce<Record<string, Array<{ number: number; content: string }>>>((acc, question) => {
+      const type = (question.type || '').trim() || '未分类'
+      if (!acc[type]) {
+        acc[type] = []
+      }
+      acc[type].push({
+        number: question.number,
+        content: question.content,
+      })
+      return acc
+    }, {})
+  }
+
+  const updateEditableQuestion = (number: number, patch: Partial<ParsedQuestion>) => {
+    setEditableQuestions((prev) => {
+      const next = prev.map((question) => {
+        if (question.number !== number) return question
+        const nextType = patch.type !== undefined ? patch.type : question.type
+        const nextContent = patch.content !== undefined ? patch.content : question.content
+        return {
+          ...question,
+          ...patch,
+          type: nextType,
+          content: nextContent,
+        }
+      })
+      setGroupedQuestions(rebuildGroupedQuestions(next))
+      return next
+    })
+  }
 
   // 状态变化时持久化到 sessionStorage
   useEffect(() => {
@@ -3466,6 +3530,17 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
   useEffect(() => {
     sessionStorage.setItem('smartParser_questions', JSON.stringify(questions))
   }, [questions])
+
+  useEffect(() => {
+    if (questions.length === 0) return
+    if (editableQuestions.length > 0) return
+    setEditableQuestions(questions)
+    setGroupedQuestions(rebuildGroupedQuestions(questions))
+  }, [questions, editableQuestions.length])
+
+  useEffect(() => {
+    sessionStorage.setItem('smartParser_editable_questions', JSON.stringify(editableQuestions))
+  }, [editableQuestions])
   useEffect(() => {
     sessionStorage.setItem('smartParser_grouped', JSON.stringify(groupedQuestions))
   }, [groupedQuestions])
@@ -3484,21 +3559,23 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
   useEffect(() => {
     sessionStorage.setItem('smartParser_parseProgress', JSON.stringify(parseProgress))
   }, [parseProgress])
-
   const handleFileSelect = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (file) {
       setSelectedFile(file)
+      void loadOriginalImagesForSolve(file)
       const url = URL.createObjectURL(file)
       setPreviewUrl(url)
       setParseStage('idle')
       setMarkdownContent(null)
       setErrorMessage(null)
       setQuestions([])
+      setEditableQuestions([])
       setGroupedQuestions({})
       setSolveResult(null)
       setSolveProgress('idle')
       setQuestionStatuses({})
+      setSelectedTaskIds([])
     }
   }
 
@@ -3549,8 +3626,10 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
             // 获取题目列表
             try {
               const questionsRes = await api.get<ParsedQuestionsResponse>(`/api/mineru/paper/${batch_id}/questions`)
-              setQuestions(questionsRes.data.questions)
-              setGroupedQuestions(questionsRes.data.grouped)
+              const parsedQuestions = questionsRes.data.questions || []
+              setQuestions(parsedQuestions)
+              setEditableQuestions(parsedQuestions)
+              setGroupedQuestions(rebuildGroupedQuestions(parsedQuestions))
             } catch {
               // 题目列表获取失败不影响主流程
             }
@@ -3576,9 +3655,37 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
   const handleStartSolve = async () => {
     if (!batchId) return
 
+    const sourceQuestions = editableQuestions.length > 0 ? editableQuestions : questions
+    const normalizedQuestions = sourceQuestions.map((question) => ({
+      number: question.number,
+      type: (question.type || '').trim(),
+      content: (question.content || '').trim(),
+      images: question.images || [],
+    }))
+    const emptyTypeQuestion = normalizedQuestions.find((question) => question.type.length === 0)
+    if (emptyTypeQuestion) {
+      setErrorMessage(`第 ${emptyTypeQuestion.number} 题题型不能为空`)
+      return
+    }
+    const emptyContentQuestion = normalizedQuestions.find((question) => question.content.length === 0)
+    if (emptyContentQuestion) {
+      setErrorMessage(`第 ${emptyContentQuestion.number} 题题干不能为空`)
+      return
+    }
+    const numberSet = new Set<number>()
+    for (const question of normalizedQuestions) {
+      if (numberSet.has(question.number)) {
+        setErrorMessage(`题号重复：${question.number}`)
+        return
+      }
+      numberSet.add(question.number)
+    }
+
     setSolveProgress('solving')
     setQuestionStatuses({})
+    setSelectedTaskIds([])
     try {
+      const runtimeConfigs = getLatestRetryConfigs()
       const res = await api.post<{
         paper_task_id: string;
         question_count: number;
@@ -3586,13 +3693,23 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
         thread_id: string;
       }>(
         `/api/mineru/paper/${batchId}/solve`,
-        {}
+        {
+          original_images: originalImages,
+          questions_override: normalizedQuestions,
+          solver_config: runtimeConfigs.solver_config,
+          reviewer_config: runtimeConfigs.reviewer_config,
+          formatter_config: runtimeConfigs.formatter_config,
+          workflow_template_id: runtimeConfigs.workflow_template_id,
+        }
       )
       setSolveResult({
         paper_task_id: res.data.paper_task_id,
         question_count: res.data.question_count,
         thread_id: res.data.thread_id,
         task_ids: res.data.task_ids,
+      })
+      res.data.task_ids.forEach((taskId) => {
+        persistTaskForDashboard(taskId)
       })
 
       // 轮询解题状态
@@ -3603,33 +3720,39 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
     }
   }
 
+  const refreshSolveStatusOnce = async (threadId: string) => {
+    const res = await api.get<PaperSolveStatusResponse>(
+      `/api/mineru/paper/${threadId}/status`
+    )
+    const data = res.data
+    const newStatuses: Record<string, QuestionSolveStatus> = {}
+    let completedCount = 0
+    let terminalCount = 0
+    for (const result of data.results) {
+      newStatuses[result.task_id] = result
+      if (result.status === 'completed') {
+        completedCount++
+      }
+      if (['completed', 'failed', 'manual', 'cancelled'].includes(result.status)) {
+        terminalCount++
+      }
+    }
+    setQuestionStatuses(newStatuses)
+    if (terminalCount === data.total && data.total > 0) {
+      setSolveProgress(completedCount === data.total ? 'completed' : 'error')
+      return true
+    }
+    return false
+  }
+
   const pollSolveStatus = async (threadId: string) => {
     const maxWait = 600000 // 10分钟
     const startTime = Date.now()
 
     while (Date.now() - startTime < maxWait) {
       try {
-        const res = await api.get<PaperSolveStatusResponse>(
-          `/api/mineru/paper/${threadId}/status`
-        )
-        const data = res.data
-
-        // 更新每道题的状态
-        const newStatuses: Record<string, QuestionSolveStatus> = {}
-        let completedCount = 0
-        for (const result of data.results) {
-          newStatuses[result.task_id] = result
-          if (result.status === 'completed') {
-            completedCount++
-          }
-        }
-        setQuestionStatuses(newStatuses)
-
-        // 检查是否全部完成
-        if (completedCount === data.total && data.total > 0) {
-          setSolveProgress('completed')
-          return
-        }
+        const isCompleted = await refreshSolveStatusOnce(threadId)
+        if (isCompleted) return
       } catch {
         // 继续轮询
       }
@@ -3638,6 +3761,111 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
     }
 
     setSolveProgress('error')
+  }
+
+  const runningTaskIds = useMemo(() => {
+    return Object.values(questionStatuses)
+      .filter((item) => ['queued', 'solving', 'reviewing', 'formatting'].includes(item.status))
+      .map((item) => item.task_id)
+  }, [questionStatuses])
+
+  const retryableTaskIds = useMemo(() => {
+    return Object.values(questionStatuses)
+      .filter((item) => ['failed', 'manual', 'cancelled'].includes(item.status))
+      .map((item) => item.task_id)
+  }, [questionStatuses])
+
+  const toggleTaskSelection = (taskId: string) => {
+    setSelectedTaskIds((prev) => (
+      prev.includes(taskId) ? prev.filter((id) => id !== taskId) : [...prev, taskId]
+    ))
+  }
+
+  const selectAllRunning = () => {
+    setSelectedTaskIds(runningTaskIds)
+  }
+
+  const selectAllRetryable = () => {
+    setSelectedTaskIds(retryableTaskIds)
+  }
+
+  const clearSelectedTasks = () => {
+    setSelectedTaskIds([])
+  }
+
+  const handleBatchPause = async () => {
+    if (selectedTaskIds.length === 0) {
+      setErrorMessage('请先勾选要暂停的题目')
+      return
+    }
+    const toPause = selectedTaskIds.filter((taskId) => runningTaskIds.includes(taskId))
+    if (toPause.length === 0) {
+      setErrorMessage('当前勾选题目中没有可暂停任务')
+      return
+    }
+    setBatchActionLoading(true)
+    try {
+      const results = await Promise.allSettled(toPause.map((taskId) => api.post(`/api/tasks/${taskId}/cancel`)))
+      const successCount = results.filter((result) => result.status === 'fulfilled').length
+      const failedCount = results.length - successCount
+      setErrorMessage(null)
+      if (failedCount > 0) {
+        setErrorMessage(`批量暂停完成：成功 ${successCount}，失败 ${failedCount}`)
+      }
+      if (solveResult?.thread_id) {
+        await refreshSolveStatusOnce(solveResult.thread_id)
+      }
+    } finally {
+      setBatchActionLoading(false)
+    }
+  }
+
+  const handleBatchRetry = async () => {
+    if (selectedTaskIds.length === 0) {
+      setErrorMessage('请先勾选要重试的题目')
+      return
+    }
+    const toRetry = selectedTaskIds.filter((taskId) => retryableTaskIds.includes(taskId))
+    if (toRetry.length === 0) {
+      setErrorMessage('当前勾选题目中没有可重试任务')
+      return
+    }
+
+    setBatchActionLoading(true)
+    try {
+      const retryConfigs = getLatestRetryConfigs()
+      const results = await Promise.allSettled(
+        toRetry.map((taskId) => {
+          const status = questionStatuses[taskId]?.status
+          if (status === 'failed' || status === 'manual') {
+            return api.post(`/api/tasks/${taskId}/manual`, {
+              action: 'resume',
+              draft_solution: undefined,
+              ...retryConfigs,
+            })
+          }
+          return api.post(`/api/tasks/${taskId}/manual`, {
+            action: 'custom_run',
+            draft_solution: '见图片',
+            entry_point: 'solver',
+            target_nodes: ['solver', 'reviewer', 'formatter'],
+            ...retryConfigs,
+          })
+        })
+      )
+      const successCount = results.filter((result) => result.status === 'fulfilled').length
+      const failedCount = results.length - successCount
+      setErrorMessage(null)
+      if (failedCount > 0) {
+        setErrorMessage(`批量重试完成：成功 ${successCount}，失败 ${failedCount}`)
+      }
+      setSolveProgress('solving')
+      if (solveResult?.thread_id) {
+        await refreshSolveStatusOnce(solveResult.thread_id)
+      }
+    } finally {
+      setBatchActionLoading(false)
+    }
   }
 
   const handleExportDocx = async () => {
@@ -3731,12 +3959,11 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
           )}
 
           <div className="mt-4 flex items-center gap-2">
-            <div className={`w-3 h-3 rounded-full ${
-              parseStage === 'idle' ? 'bg-gray-300' :
+            <div className={`w-3 h-3 rounded-full ${parseStage === 'idle' ? 'bg-gray-300' :
               parseStage === 'done' ? 'bg-green-500' :
-              parseStage === 'error' ? 'bg-red-500' :
-              'bg-blue-500 animate-pulse'
-            }`} />
+                parseStage === 'error' ? 'bg-red-500' :
+                  'bg-blue-500 animate-pulse'
+              }`} />
             {renderParseStatus()}
           </div>
 
@@ -3787,35 +4014,61 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
               {Object.entries(groupedQuestions).map(([type, qs]) => (
                 <div key={type}>
                   <h4 className="text-sm font-medium text-indigo-600 mb-2">{type}</h4>
-                  <div className="space-y-1">
+                  <div className="space-y-2">
                     {qs.map((q) => {
-                      // 查找对应的解题状态
-                      const taskId = Object.keys(questionStatuses).find(
-                        k => questionStatuses[k].number === q.number
-                      )
+                      const editable = editableQuestions.find((item) => item.number === q.number)
+                      const taskId = Object.keys(questionStatuses).find((key) => questionStatuses[key].number === q.number)
                       const status = taskId ? questionStatuses[taskId] : null
                       const statusColor = !status ? 'bg-gray-300' :
                         status.status === 'completed' ? 'bg-green-500' :
-                        status.status === 'failed' ? 'bg-red-500' :
-                        'bg-blue-500 animate-pulse'
+                          status.status === 'failed' ? 'bg-red-500' :
+                            status.status === 'manual' ? 'bg-amber-500' :
+                              status.status === 'cancelled' ? 'bg-gray-500' :
+                                'bg-blue-500 animate-pulse'
+                      const canEditBeforeSolve = solveProgress === 'idle'
 
                       return (
-                        <div key={q.number} className="text-sm p-2 bg-gray-50 rounded flex items-center gap-2">
-                          <div className={`w-2 h-2 rounded-full ${statusColor}`} />
-                          <div className="flex-1">
+                        <div key={q.number} className="text-sm p-3 bg-gray-50 rounded border border-gray-200 space-y-2">
+                          <div className="flex items-center gap-2">
+                            {status?.task_id && (
+                              <input
+                                type="checkbox"
+                                checked={selectedTaskIds.includes(status.task_id)}
+                                onChange={() => toggleTaskSelection(status.task_id)}
+                              />
+                            )}
+                            <div className={`w-2 h-2 rounded-full ${statusColor}`} />
                             <span className="font-medium">第{q.number}题</span>
-                            <p className="text-gray-600 truncate text-xs">{q.content}</p>
+                            {status && (
+                              <span className="text-xs text-gray-500 ml-auto">
+                                {status.status === 'completed' ? '完成' :
+                                  status.status === 'failed' ? '失败' :
+                                    status.status === 'manual' ? '人工处理' :
+                                      status.status === 'cancelled' ? '已暂停' :
+                                        status.status === 'solving' ? '解题中' :
+                                          status.status === 'reviewing' ? '审查中' :
+                                            status.status === 'formatting' ? '排版中' :
+                                              status.status}
+                              </span>
+                            )}
                           </div>
-                          {status && (
-                            <span className="text-xs text-gray-500">
-                              {status.status === 'completed' ? '完成' :
-                               status.status === 'failed' ? '失败' :
-                               status.status === 'solving' ? '解题中' :
-                               status.status === 'reviewing' ? '审查中' :
-                               status.status === 'formatting' ? '排版中' :
-                               status.status}
-                            </span>
-                          )}
+
+                          <div className="grid grid-cols-1 gap-2">
+                            <input
+                              value={editable?.type || ''}
+                              disabled={!canEditBeforeSolve}
+                              onChange={(event) => updateEditableQuestion(q.number, { type: event.target.value })}
+                              placeholder="题型（可编辑）"
+                              className="w-full rounded border border-gray-300 px-2 py-1 text-xs disabled:bg-gray-100"
+                            />
+                            <textarea
+                              value={editable?.content || ''}
+                              disabled={!canEditBeforeSolve}
+                              onChange={(event) => updateEditableQuestion(q.number, { content: event.target.value })}
+                              placeholder="题目文本（可编辑）"
+                              className="w-full min-h-16 rounded border border-gray-300 px-2 py-1 text-xs disabled:bg-gray-100"
+                            />
+                          </div>
                         </div>
                       )
                     })}
@@ -3845,6 +4098,45 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
               <p className="text-xs text-gray-500 mt-1">
                 {Object.values(questionStatuses).filter(s => s.status === 'completed').length} / {questions.length} 题完成
               </p>
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                <button
+                  onClick={selectAllRunning}
+                  className="px-2 py-1 text-xs border rounded hover:bg-gray-50"
+                >
+                  全选可暂停
+                </button>
+                <button
+                  onClick={selectAllRetryable}
+                  className="px-2 py-1 text-xs border rounded hover:bg-gray-50"
+                >
+                  全选可重试
+                </button>
+                <button
+                  onClick={clearSelectedTasks}
+                  className="px-2 py-1 text-xs border rounded hover:bg-gray-50"
+                >
+                  清空勾选
+                </button>
+                <div className="text-xs text-gray-500 flex items-center justify-end">
+                  已勾选 {selectedTaskIds.length} 题
+                </div>
+              </div>
+              <div className="mt-2 flex gap-2">
+                <button
+                  onClick={handleBatchPause}
+                  disabled={batchActionLoading || selectedTaskIds.length === 0}
+                  className="flex-1 px-3 py-2 text-xs rounded border border-amber-300 text-amber-700 hover:bg-amber-50 disabled:opacity-50"
+                >
+                  {batchActionLoading ? '处理中...' : '批量暂停'}
+                </button>
+                <button
+                  onClick={handleBatchRetry}
+                  disabled={batchActionLoading || selectedTaskIds.length === 0}
+                  className="flex-1 px-3 py-2 text-xs rounded border border-blue-300 text-blue-700 hover:bg-blue-50 disabled:opacity-50"
+                >
+                  {batchActionLoading ? '处理中...' : '批量重试'}
+                </button>
+              </div>
             </div>
           )}
 

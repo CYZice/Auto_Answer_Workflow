@@ -3,6 +3,7 @@ Markdown 试卷解析器
 
 解析 MinerU 返回的 Markdown 格式试卷，提取题目结构
 """
+
 import re
 from dataclasses import dataclass, field
 from typing import Optional
@@ -11,6 +12,7 @@ from typing import Optional
 @dataclass(frozen=True)
 class Question:
     """单个题目"""
+
     number: int  # 题号
     question_type: str  # 题型（选择题、填空题、解答题等）
     content: str  # 题干文本
@@ -22,6 +24,7 @@ class Question:
 @dataclass
 class QuestionWithImage:
     """带题图的题目"""
+
     question: Question
     original_images: list[str]  # 关联的原题图片
 
@@ -30,17 +33,19 @@ class QuestionWithImage:
 # 支持多种格式：一、选择题，一 、 直流电路 等
 CHINESE_NUMERAL_PATTERN = r"^[一二三四五六七八九十]+\s*[、.]\s*"
 
+
 # 用于提取题型名称：从大写数字+顿号位置到行尾的内容
 def extract_question_type_name(line: str) -> str:
     """从标题行提取题型名称"""
     match = re.search(CHINESE_NUMERAL_PATTERN, line)
     if match:
         # 去掉匹配到的部分，剩余就是题型名称
-        name = line[match.end():].strip()
+        name = line[match.end() :].strip()
         # 去掉可能的括号内容（如分数信息）
         name = re.sub(r"[（(].*$", "", name).strip()
         return name if name else "未分类"
     return "未分类"
+
 
 # 题号识别正则
 NUMBER_PATTERNS = [
@@ -113,14 +118,21 @@ def detect_question_type(line: str, current_type: str) -> tuple[str, bool]:
         # 如果提取出的"题型名称"包含 LaTeX 或 "如图所示"/"求"/"计算" 等关键词，
         # 说明这行实际上是题目内容（如"二、如图所示电路..."），
         # 不是独立的题型标题，不触发新题型
-        type_content = line_after_hash[line_after_hash.index(re.match(CHINESE_NUMERAL_PATTERN, line_after_hash).group()) + 1:].strip()
-        if '$' in type_content or '如图' in type_content or '求' in type_content[:10]:
+        type_content = line_after_hash[
+            line_after_hash.index(
+                re.match(CHINESE_NUMERAL_PATTERN, line_after_hash).group()
+            )
+            + 1 :
+        ].strip()
+        if "$" in type_content or "如图" in type_content or "求" in type_content[:10]:
             return current_type, False
 
         return new_type, True
 
     # 检查是否为 # 开头的纯题型名称（## 选择题、## 填空题 等）
-    if line_stripped.startswith("#") and not re.match(CHINESE_NUMERAL_PATTERN, line_after_hash):
+    if line_stripped.startswith("#") and not re.match(
+        CHINESE_NUMERAL_PATTERN, line_after_hash
+    ):
         # 去掉括号中的内容
         type_name = re.sub(r"[（(].*$", "", line_after_hash).strip()
         if type_name:
@@ -157,12 +169,14 @@ class MarkdownParser:
             content = "\n".join(current_content_lines).strip()
             if content:
                 question_count += 1
-                questions.append(Question(
-                    number=question_count,
-                    question_type="未分类",
-                    content=content,
-                    images=current_images.copy(),
-                ))
+                questions.append(
+                    Question(
+                        number=question_count,
+                        question_type="未分类",
+                        content=content,
+                        images=current_images.copy(),
+                    )
+                )
                 current_content_lines = []
                 current_images = []
 
@@ -242,18 +256,35 @@ class MarkdownParser:
             # 找出所有与当前题目关联的图片
             # 策略：如果题目本身没有图片，则尝试从 original_images 中按顺序获取
             if question.images:
-                # 题目内容已包含图片，使用题目自带的图片
-                assoc_images = question.images
-            elif i < len(original_images):
+                # 仅保留模型可直接访问的图片地址（http(s) 或 data URL）
+                usable_question_images = [
+                    img
+                    for img in question.images
+                    if isinstance(img, str)
+                    and (
+                        img.startswith("http://")
+                        or img.startswith("https://")
+                        or img.startswith("data:")
+                    )
+                ]
+                if usable_question_images:
+                    assoc_images = usable_question_images
+                elif original_images:
+                    assoc_images = [original_images[min(i, len(original_images) - 1)]]
+                else:
+                    assoc_images = []
+            elif original_images:
                 # 题目没有图片，但有原图，按位置分配
-                assoc_images = [original_images[i]]
+                assoc_images = [original_images[min(i, len(original_images) - 1)]]
             else:
                 assoc_images = []
 
-            result.append(QuestionWithImage(
-                question=question,
-                original_images=assoc_images,
-            ))
+            result.append(
+                QuestionWithImage(
+                    question=question,
+                    original_images=assoc_images,
+                )
+            )
 
         return result
 

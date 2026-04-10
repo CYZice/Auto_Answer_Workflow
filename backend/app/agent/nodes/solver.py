@@ -46,13 +46,16 @@ async def solve_node(state: AgentState) -> AgentState:
     workflow_template_id = state.get("workflow_template_id")
     question_text = state.get("question_text")  # MinerU 解析的题目文字
 
-    # 防御性编程：如果没有图片地址，直接失败
-    if not image_urls:
+    # 防御性编程：支持“仅题干文本”解题。
+    # 只有图片与题干文本都缺失时才判定失败。
+    if not image_urls and not (
+        isinstance(question_text, str) and question_text.strip()
+    ):
         return {
             **state,
             "status": "failed",
             "failed_node": "solver",
-            "error_msg": "Missing image_urls in state.",
+            "error_msg": "Missing both image_urls and question_text in state.",
         }
 
     try:

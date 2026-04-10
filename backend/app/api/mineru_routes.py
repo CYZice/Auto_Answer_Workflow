@@ -3,6 +3,7 @@ MinerU API 路由
 
 提供试卷智能解析的 API 接口（使用 v4 精准解析 API）
 """
+
 import asyncio
 import json
 import os
@@ -20,7 +21,7 @@ from pydantic import BaseModel, Field
 
 from app.core.database import SessionLocal
 from app.models.domain import Task
-from app.models.schemas import TaskStatus
+from app.models.schemas import ModelConfig, TaskStatus
 from app.services.mineru_v4_service import get_mineru_v4_service, MineruV4Service
 
 router = APIRouter(prefix="/api/mineru", tags=["mineru"])
@@ -31,14 +32,17 @@ MINERU_V4_API_BASE = "https://mineru.net/api/v4"
 
 # === 请求/响应模型 ===
 
+
 class MineruParseUrlRequest(BaseModel):
     """URL 解析请求"""
+
     url: str = Field(description="试卷图片或 PDF 的 URL")
     model_version: Optional[str] = Field(default="vlm", description="模型版本")
 
 
 class MineruParseResponse(BaseModel):
     """解析任务创建响应"""
+
     mineru_task_id: str
     status: str
     created_at: datetime
@@ -46,6 +50,7 @@ class MineruParseResponse(BaseModel):
 
 class MineruParseResultResponse(BaseModel):
     """解析结果查询响应"""
+
     mineru_task_id: str
     status: str
     markdown_url: Optional[str] = None
@@ -56,21 +61,51 @@ class MineruParseResultResponse(BaseModel):
 
 class MineruUploadUrlResponse(BaseModel):
     """获取上传 URL 响应"""
+
     batch_id: str
     upload_url: str
 
 
 # === 试卷解题请求/响应 ===
 
+
 class PaperSolveRequest(BaseModel):
     """试卷解题请求"""
-    original_images: Optional[list[str]] = Field(default=None, description="原图 Base64 列表")
+
+    class QuestionOverrideItem(BaseModel):
+        number: int = Field(ge=1, description="题号")
+        type: str = Field(description="题型")
+        content: str = Field(description="题干文本")
+        images: Optional[list[str]] = Field(
+            default=None, description="题目关联图片 URL（可选）"
+        )
+
+    original_images: Optional[list[str]] = Field(
+        default=None, description="原图 Base64 列表"
+    )
     paper_title: Optional[str] = Field(default="", description="试卷标题")
     paper_subject: Optional[str] = Field(default="", description="试卷科目")
+    solver_config: Optional[ModelConfig] = Field(
+        default=None, description="Solver 节点模型配置"
+    )
+    reviewer_config: Optional[ModelConfig] = Field(
+        default=None, description="Reviewer 节点模型配置"
+    )
+    formatter_config: Optional[ModelConfig] = Field(
+        default=None, description="Formatter 节点模型配置"
+    )
+    workflow_template_id: Optional[str] = Field(
+        default=None, description="本次解题使用的提示词模板 ID"
+    )
+    questions_override: Optional[list[QuestionOverrideItem]] = Field(
+        default=None,
+        description="人工修订后的题目列表（可选，若提供则优先用于解题）",
+    )
 
 
 class PaperSolveResponse(BaseModel):
     """试卷解题响应"""
+
     paper_task_id: str
     question_count: int
     status: str
@@ -80,6 +115,7 @@ class PaperSolveResponse(BaseModel):
 
 
 # === 辅助函数 ===
+
 
 def get_v4_service() -> MineruV4Service:
     """获取 MinerU v4 服务实例"""
@@ -93,6 +129,10 @@ def _create_question_task(
     image_urls: list[str],
     thread_id: str,
     background_tasks: BackgroundTasks,
+    solver_config: Optional[dict] = None,
+    reviewer_config: Optional[dict] = None,
+    formatter_config: Optional[dict] = None,
+    workflow_template_id: Optional[str] = None,
 ) -> str:
     """
     为单道题创建任务并启动工作流
@@ -109,7 +149,9 @@ def _create_question_task(
 
     # 获取当前激活的模板 ID
     runtime_settings = read_runtime_settings()
-    active_template_id = runtime_settings.get("active_template_id")
+    active_template_id = workflow_template_id or runtime_settings.get(
+        "active_template_id"
+    )
 
     history_data = {
         "image_urls": image_urls,
@@ -117,9 +159,9 @@ def _create_question_task(
         "question_type": question_type,
         "question_content": question_content,
         "workflow_template_id": active_template_id,
-        "solver_config": {},
-        "reviewer_config": {},
-        "formatter_config": {},
+        "solver_config": dict(solver_config or {}),
+        "reviewer_config": dict(reviewer_config or {}),
+        "formatter_config": dict(formatter_config or {}),
     }
 
     new_task = Task(
@@ -147,6 +189,7 @@ def _create_question_task(
 
 # === 路由实现 ===
 
+
 @router.post("/parse/file", response_model=MineruParseResponse)
 async def parse_file(
     file: UploadFile = File(..., description="试卷图片或 PDF 文件"),
@@ -173,7 +216,9 @@ async def parse_file(
     result = resp.json()
 
     if result.get("code") != 0:
-        raise HTTPException(status_code=500, detail=f"获取上传链接失败: {result.get('msg')}")
+        raise HTTPException(
+            status_code=500, detail=f"获取上传链接失败: {result.get('msg')}"
+        )
 
     batch_id = result["data"]["batch_id"]
     upload_url = result["data"]["file_urls"][0]
@@ -181,7 +226,9 @@ async def parse_file(
     # 2. 后端代理上传到 OSS（避免浏览器跨域限制）
     upload_resp = requests.put(upload_url, data=file_content, timeout=120)
     if upload_resp.status_code not in (200, 201):
-        raise HTTPException(status_code=500, detail=f"文件上传失败, HTTP {upload_resp.status_code}")
+        raise HTTPException(
+            status_code=500, detail=f"文件上传失败, HTTP {upload_resp.status_code}"
+        )
 
     # 3. 返回 batch_id，前端轮询 /parse/{batch_id} 获取结果
     return MineruParseResponse(
@@ -215,18 +262,23 @@ async def upload_file(
     result = resp.json()
 
     if result.get("code") != 0:
-        raise HTTPException(status_code=500, detail=f"获取上传链接失败: {result.get('msg')}")
+        raise HTTPException(
+            status_code=500, detail=f"获取上传链接失败: {result.get('msg')}"
+        )
 
     upload_url = result["data"]["file_urls"][0]
 
     upload_resp = requests.put(upload_url, data=file_content, timeout=60)
     if upload_resp.status_code not in (200, 201):
-        raise HTTPException(status_code=500, detail=f"文件上传失败, HTTP {upload_resp.status_code}")
+        raise HTTPException(
+            status_code=500, detail=f"文件上传失败, HTTP {upload_resp.status_code}"
+        )
 
     # 轮询等待解析完成
     result_url = f"{MINERU_V4_API_BASE}/extract-results/batch/{batch_id}"
 
     import time
+
     start = time.time()
     max_wait = 600.0
 
@@ -246,7 +298,9 @@ async def upload_file(
                 )
 
             if state == "failed":
-                raise HTTPException(status_code=500, detail=f"解析失败: {extract_result.get('err_msg')}")
+                raise HTTPException(
+                    status_code=500, detail=f"解析失败: {extract_result.get('err_msg')}"
+                )
 
         time.sleep(3)
 
@@ -313,7 +367,9 @@ async def wait_parse_completion(
     markdown_content = None
     if result.status == "done" and result.full_zip_url:
         try:
-            markdown_content = await service.download_and_extract_markdown(result.full_zip_url)
+            markdown_content = await service.download_and_extract_markdown(
+                result.full_zip_url
+            )
         except Exception:
             pass
 
@@ -328,6 +384,7 @@ async def wait_parse_completion(
 
 
 # === 试卷解题与导出 ===
+
 
 @router.post("/paper/{mineru_task_id}/solve", response_model=PaperSolveResponse)
 async def solve_paper(
@@ -350,7 +407,9 @@ async def solve_paper(
     result = await service.wait_for_batch_completion(mineru_task_id, max_wait=600.0)
 
     if result.status != "done":
-        raise HTTPException(status_code=400, detail=f"MinerU 解析未完成，当前状态: {result.status}")
+        raise HTTPException(
+            status_code=400, detail=f"MinerU 解析未完成，当前状态: {result.status}"
+        )
 
     # 获取 markdown 内容
     markdown = result.markdown_content
@@ -362,12 +421,70 @@ async def solve_paper(
 
     # 解析题目
     from app.services.markdown_parser import MarkdownParser
+
     parser = MarkdownParser()
-    questions = parser.parse(markdown)
+    parsed_questions = parser.parse(markdown)
+
+    # 若前端传入人工修订题目，优先使用修订结果。
+    questions_override = request.questions_override or []
+    if questions_override:
+        from app.services.markdown_parser import Question
+
+        seen_numbers: set[int] = set()
+        questions: list[Question] = []
+        for item in questions_override:
+            q_number = int(item.number)
+            q_type = (item.type or "").strip()
+            q_content = (item.content or "").strip()
+            q_images = [
+                img.strip()
+                for img in (item.images or [])
+                if isinstance(img, str) and img.strip()
+            ]
+
+            if q_number < 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="questions_override 中题号必须大于等于 1",
+                )
+            if q_number in seen_numbers:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"questions_override 中存在重复题号: {q_number}",
+                )
+            if not q_type:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"questions_override 第 {q_number} 题题型不能为空",
+                )
+            if not q_content:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"questions_override 第 {q_number} 题题干不能为空",
+                )
+
+            seen_numbers.add(q_number)
+            questions.append(
+                Question(
+                    number=q_number,
+                    question_type=q_type,
+                    content=q_content,
+                    images=q_images,
+                )
+            )
+    else:
+        questions = parsed_questions
 
     # 关联原图
     original_images = request.original_images or []
     questions_with_images = parser.associate_images(questions, original_images)
+    solver_config = request.solver_config.model_dump() if request.solver_config else {}
+    reviewer_config = (
+        request.reviewer_config.model_dump() if request.reviewer_config else {}
+    )
+    formatter_config = (
+        request.formatter_config.model_dump() if request.formatter_config else {}
+    )
 
     # 创建试卷解题的线程 ID
     paper_task_id = f"paper_{mineru_task_id}"
@@ -383,6 +500,10 @@ async def solve_paper(
             image_urls=qwi.original_images,
             thread_id=thread_id,
             background_tasks=background_tasks,
+            solver_config=solver_config,
+            reviewer_config=reviewer_config,
+            formatter_config=formatter_config,
+            workflow_template_id=request.workflow_template_id,
         )
         task_ids.append(task_id)
 
@@ -407,14 +528,10 @@ async def get_paper_solve_status(mineru_task_id: str):
 
     # 查找相关的所有任务
     with SessionLocal() as db:
-        tasks = db.query(Task).filter(
-            Task.thread_id.like(f"%{mineru_task_id}%")
-        ).all()
+        tasks = db.query(Task).filter(Task.thread_id.like(f"%{mineru_task_id}%")).all()
 
     if not tasks:
-        tasks = db.query(Task).filter(
-            Task.task_id.like(f"%{mineru_task_id}%")
-        ).all()
+        tasks = db.query(Task).filter(Task.task_id.like(f"%{mineru_task_id}%")).all()
 
     results = []
     completed = 0
@@ -427,13 +544,15 @@ async def get_paper_solve_status(mineru_task_id: str):
         if status == "completed":
             completed += 1
 
-        results.append({
-            "task_id": t.task_id,
-            "number": question_num,
-            "type": question_type,
-            "status": status,
-            "final_result": t.final_result,
-        })
+        results.append(
+            {
+                "task_id": t.task_id,
+                "number": question_num,
+                "type": question_type,
+                "status": status,
+                "final_result": t.final_result,
+            }
+        )
 
     # 按题号排序
     results.sort(key=lambda x: x["number"])
@@ -462,9 +581,7 @@ async def export_paper_docx(
 
     # 查找所有子任务
     with SessionLocal() as db:
-        tasks = db.query(Task).filter(
-            Task.thread_id.like(f"%{mineru_task_id}%")
-        ).all()
+        tasks = db.query(Task).filter(Task.thread_id.like(f"%{mineru_task_id}%")).all()
 
     if not tasks:
         raise HTTPException(status_code=404, detail="未找到解题任务")
@@ -483,12 +600,14 @@ async def export_paper_docx(
             if img_url.startswith("data:") or img_url.startswith("http"):
                 question_text += f"\n\n![题{question_num}]({img_url})"
 
-        task_results.append({
-            "number": question_num,
-            "type": question_type,
-            "question": question_text,
-            "answer": t.final_result or "",
-        })
+        task_results.append(
+            {
+                "number": question_num,
+                "type": question_type,
+                "question": question_text,
+                "answer": t.final_result or "",
+            }
+        )
 
     # 按题型和题号排序
     task_results.sort(key=lambda x: (x["type"], x["number"]))
@@ -500,11 +619,13 @@ async def export_paper_docx(
         if qtype not in grouped:
             grouped[qtype] = []
         # 构建符合 build_split_export_markdown 要求的 items 格式
-        grouped[qtype].append({
-            "question": item["question"],
-            "answer": item["answer"],
-            "only_question": not bool(item["answer"]),
-        })
+        grouped[qtype].append(
+            {
+                "question": item["question"],
+                "answer": item["answer"],
+                "only_question": not bool(item["answer"]),
+            }
+        )
 
     groups = [{"group_name": k, "items": v} for k, v in grouped.items()]
 
@@ -516,17 +637,27 @@ async def export_paper_docx(
     )
 
     # 转换为 DOCX
-    with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as f:
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as f:
         docx_path = f.name
 
-    md_path = tempfile.mktemp(suffix='.md')
-    with open(md_path, 'w', encoding='utf-8') as f:
+    md_path = tempfile.mktemp(suffix=".md")
+    with open(md_path, "w", encoding="utf-8") as f:
         f.write(markdown_content)
 
     try:
         import subprocess
+
         subprocess.run(
-            ["pandoc", "-f", "markdown+hard_line_breaks", "-t", "docx", "-o", docx_path, md_path],
+            [
+                "pandoc",
+                "-f",
+                "markdown+hard_line_breaks",
+                "-t",
+                "docx",
+                "-o",
+                docx_path,
+                md_path,
+            ],
             check=True,
             capture_output=True,
         )
@@ -549,7 +680,9 @@ async def get_paper_questions(mineru_task_id: str):
     result = await service.wait_for_batch_completion(mineru_task_id, max_wait=600.0)
 
     if result.status != "done":
-        raise HTTPException(status_code=400, detail=f"MinerU 解析未完成，当前状态: {result.status}")
+        raise HTTPException(
+            status_code=400, detail=f"MinerU 解析未完成，当前状态: {result.status}"
+        )
 
     markdown = result.markdown_content
     if not markdown and result.full_zip_url:
@@ -559,6 +692,7 @@ async def get_paper_questions(mineru_task_id: str):
         raise HTTPException(status_code=500, detail="无法获取 Markdown 内容")
 
     from app.services.markdown_parser import MarkdownParser
+
     parser = MarkdownParser()
     questions = parser.parse(markdown)
 

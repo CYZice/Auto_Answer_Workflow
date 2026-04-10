@@ -611,10 +611,9 @@ async def export_paper_docx(
     """
     导出试卷为 DOCX
 
-    复用现有的 build_split_export_markdown 函数
-    按原卷题型顺序和题号顺序排版
+    复用排版台的 build_split_export_markdown 和 apply_docx_default_style
     """
-    from app.main import build_split_export_markdown
+    from app.main import build_split_export_markdown, apply_docx_default_style
 
     # 查找所有子任务
     with SessionLocal() as db:
@@ -623,7 +622,7 @@ async def export_paper_docx(
     if not tasks:
         raise HTTPException(status_code=404, detail="未找到解题任务")
 
-    # 收集结果
+    # 收集结果，构建 groups 数据格式
     task_results = []
     for t in tasks:
         history_data = json.loads(t.history or "{}")
@@ -638,7 +637,7 @@ async def export_paper_docx(
         image_urls = history_data.get("image_urls") or []
         for img_url in image_urls:
             if img_url.startswith("data:") or img_url.startswith("http"):
-                question_text += f"\n\n![题{question_num}]({img_url})"
+                question_text += f"\n\n![]({img_url})"
 
         task_results.append(
             {
@@ -653,13 +652,12 @@ async def export_paper_docx(
     # 按题型和题号排序
     task_results.sort(key=lambda x: (x["type"], x["number"]))
 
-    # 按题型分组，items 格式符合 build_split_export_markdown 要求
+    # 按题型分组，构建 groups 数据
     grouped = {}
     for item in task_results:
         qtype = item["type"]
         if qtype not in grouped:
             grouped[qtype] = []
-        # 构建符合 build_split_export_markdown 要求的 items 格式
         grouped[qtype].append(
             {
                 "question": item["question"],
@@ -670,7 +668,7 @@ async def export_paper_docx(
 
     groups = [{"group_name": k, "items": v} for k, v in grouped.items()]
 
-    # 生成 Markdown
+    # 生成 Markdown（复用排版台逻辑）
     markdown_content = build_split_export_markdown(
         groups,
         paper_subject=paper_subject.strip(),
@@ -702,6 +700,19 @@ async def export_paper_docx(
             check=True,
             capture_output=True,
         )
+
+        # 应用样式（复用排版台逻辑）
+        with open(docx_path, "rb") as f:
+            docx_bytes = f.read()
+
+        docx_bytes = apply_docx_default_style(
+            docx_bytes,
+            paper_subject=paper_subject.strip(),
+            paper_title=paper_title.strip(),
+        )
+
+        with open(docx_path, "wb") as f:
+            f.write(docx_bytes)
     finally:
         Path(md_path).unlink(missing_ok=True)
 

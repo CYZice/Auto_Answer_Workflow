@@ -334,7 +334,9 @@ async def get_parse_result(task_id: str):
 
     try:
         result = await service.get_batch_result(task_id)
+        print(f"[DEBUG get_parse_result] task_id={task_id}, result.status={result.status}, result.full_zip_url={result.full_zip_url}, result.extract_progress={result.extract_progress}")
     except Exception as e:
+        print(f"[DEBUG get_parse_result] error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
     return MineruParseResultResponse(
@@ -413,11 +415,28 @@ async def solve_paper(
 
     # 获取 markdown 内容
     markdown = result.markdown_content
+    images_base64: dict[str, str] = {}  # {relative_path: base64_data_url}
+
     if not markdown and result.full_zip_url:
         markdown = await service.download_and_extract_markdown(result.full_zip_url)
 
     if not markdown:
         raise HTTPException(status_code=500, detail="无法获取 Markdown 内容")
+
+    # 从 zip 包中提取图片并转换为 base64
+    if result.full_zip_url:
+        try:
+            images_base64 = await service.download_and_extract_images(result.full_zip_url)
+            print(f"[solve_paper] 提取了 {len(images_base64)} 张图片为 base64")
+
+            # 将 markdown 中的相对路径图片替换为 base64 data URL
+            if images_base64:
+                for relative_path, data_url in images_base64.items():
+                    # 替换 ![...](relative_path) 为 ![...](data_url)
+                    markdown = markdown.replace(f"({relative_path})", f"({data_url})")
+        except Exception as e:
+            print(f"[solve_paper] 提取图片失败: {e}")
+            images_base64 = {}
 
     # 解析题目
     from app.services.markdown_parser import MarkdownParser
@@ -430,17 +449,35 @@ async def solve_paper(
     if questions_override:
         from app.services.markdown_parser import Question
 
+        # 获取所有 base64 图片列表（用于 fallback）
+        all_base64_images = list(images_base64.values()) if images_base64 else []
+        base64_idx = 0  # 用于按顺序分配 base64 图片
+
         seen_numbers: set[int] = set()
         questions: list[Question] = []
         for item in questions_override:
             q_number = int(item.number)
             q_type = (item.type or "").strip()
             q_content = (item.content or "").strip()
-            q_images = [
-                img.strip()
-                for img in (item.images or [])
-                if isinstance(img, str) and img.strip()
-            ]
+
+            # 将相对路径图片替换为 base64 data URL
+            q_images = []
+            has_any_image = False
+            for img in (item.images or []):
+                if not isinstance(img, str) or not img.strip():
+                    continue
+                img = img.strip()
+                has_any_image = True
+                # 如果是相对路径（如 images/xxx.jpg），替换为 base64
+                if images_base64 and img in images_base64:
+                    q_images.append(images_base64[img])
+                else:
+                    q_images.append(img)
+
+            # 如果没有提供任何图片，使用 base64 fallback（按顺序分配）
+            if not has_any_image and all_base64_images:
+                q_images = [all_base64_images[base64_idx % len(all_base64_images)]]
+                base64_idx += 1
 
             if q_number < 1:
                 raise HTTPException(
@@ -475,7 +512,7 @@ async def solve_paper(
     else:
         questions = parsed_questions
 
-    # 关联原图
+    # 关联原图（仅当没有可用图片时使用）
     original_images = request.original_images or []
     questions_with_images = parser.associate_images(questions, original_images)
     solver_config = request.solver_config.model_dump() if request.solver_config else {}
@@ -486,9 +523,9 @@ async def solve_paper(
         request.formatter_config.model_dump() if request.formatter_config else {}
     )
 
-    # 创建试卷解题的线程 ID
+    # 创建试卷解题的线程 ID（包含 mineru_task_id 以便后续导出查询）
     paper_task_id = f"paper_{mineru_task_id}"
-    thread_id = f"thread_{uuid.uuid4().hex[:8]}"
+    thread_id = f"thread_{mineru_task_id}"
 
     # 为每道题创建任务（复用现有工作流）
     task_ids = []
@@ -592,7 +629,10 @@ async def export_paper_docx(
         history_data = json.loads(t.history or "{}")
         question_num = history_data.get("question_number", 0)
         question_type = history_data.get("question_type", "未分类")
-        question_text = history_data.get("question_content", "") or ""
+
+        # 使用 question_preview 和 answer_preview（从 final_result 解析出来的）
+        question_text = (t.question_preview or "").strip()
+        answer_text = (t.answer_preview or "").strip()
 
         # 嵌入原卷题图
         image_urls = history_data.get("image_urls") or []
@@ -605,7 +645,8 @@ async def export_paper_docx(
                 "number": question_num,
                 "type": question_type,
                 "question": question_text,
-                "answer": t.final_result or "",
+                "answer": answer_text,
+                "only_question": not bool(answer_text),
             }
         )
 
@@ -623,7 +664,7 @@ async def export_paper_docx(
             {
                 "question": item["question"],
                 "answer": item["answer"],
-                "only_question": not bool(item["answer"]),
+                "only_question": item.get("only_question", False),
             }
         )
 
@@ -685,8 +726,30 @@ async def get_paper_questions(mineru_task_id: str):
         )
 
     markdown = result.markdown_content
+
+    # 如果 markdown_content 为 None，则从 zip 包下载
     if not markdown and result.full_zip_url:
-        markdown = await service.download_and_extract_markdown(result.full_zip_url)
+        try:
+            markdown = await service.download_and_extract_markdown(result.full_zip_url)
+            print(f"[get_paper_questions] 从 zip 下载了 markdown，长度: {len(markdown) if markdown else 0}")
+        except Exception as e:
+            print(f"[get_paper_questions] 下载 markdown 失败: {e}")
+
+    # 从 zip 包中提取图片并转换为 base64（与 solve_paper 保持一致）
+    if result.full_zip_url:
+        try:
+            images_base64 = await service.download_and_extract_images(result.full_zip_url)
+            print(f"[get_paper_questions] 提取了 {len(images_base64)} 张图片为 base64")
+
+            # 将 markdown 中的相对路径图片替换为 base64 data URL
+            if images_base64 and markdown:
+                for relative_path, data_url in images_base64.items():
+                    markdown = markdown.replace(f"({relative_path})", f"({data_url})")
+        except Exception as e:
+            print(f"[get_paper_questions] 提取图片失败: {e}")
+            images_base64 = {}
+    else:
+        images_base64 = {}
 
     if not markdown:
         raise HTTPException(status_code=500, detail="无法获取 Markdown 内容")

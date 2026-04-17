@@ -7,6 +7,7 @@ from fastapi import (
     Query,
 )
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -61,9 +62,7 @@ from app.services.runtime_config import (
     update_runtime_settings,
     upsert_template,
 )
-from app.api.automation_routes import router as automation_router
 from app.api.mineru_routes import router as mineru_router
-from app.automation import models as automation_models  # noqa: F401
 
 # 全局并发信号量，控制同时进行的大模型推理任务数（根据 PRD 要求默认为 5）
 MAX_CONCURRENT_TASKS = 5
@@ -449,7 +448,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="智能题目解析 Agent 自动化流水线 API", version="1.0.0", lifespan=lifespan
 )
-app.include_router(automation_router)
 app.include_router(mineru_router)
 
 # 配置 CORS，增加对大请求体（Base64图片）的支持
@@ -1608,3 +1606,10 @@ def admin_list_logs(task_id: str, db: Session = Depends(get_db)):
         total=len(logs),
         items=[AdminLogItemResponse.model_validate(log) for log in logs],
     )
+
+
+# 挂载前端静态文件（SPA 支持）
+# 在所有 API 路由之后挂载，确保 /api/* 优先匹配
+frontend_dist_path = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+if os.path.exists(frontend_dist_path):
+    app.mount("/", StaticFiles(directory=frontend_dist_path, html=True), name="frontend")

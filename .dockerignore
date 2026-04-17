@@ -1,0 +1,56 @@
+# Git
+.git
+.gitignore
+
+# Node modules - will be reinstalled in container
+frontend/node_modules
+
+# Frontend build - will be built in container
+frontend/dist
+
+# Python venv - will be reinstalled in container
+backend/.venv
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info
+.eggs
+
+# Environment files (use docker-compose env vars instead)
+.env
+.env.*
+
+# Logs
+*.log
+logs
+
+# Temp files
+*.tmp
+*.temp
+.cache
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local scripts
+start.sh
+
+# Docker files (we'll copy them explicitly)
+docker-compose*.yml
+*.tar.gz
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Database files (should persist in data/)
+*.db
+*.sqlite
+*.sqlite3

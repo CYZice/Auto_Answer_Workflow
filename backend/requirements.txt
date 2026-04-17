@@ -8,6 +8,5 @@ langgraph
 langchain-core
 langchain-openai
 PyYAML>=6.0.1
-playwright==1.53.0
 python-multipart>=0.0.9
 markdown-it-py>=3.0.0

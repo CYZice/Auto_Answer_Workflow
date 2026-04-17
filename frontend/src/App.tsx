@@ -10,7 +10,7 @@ import remarkMath from 'remark-math'
 const queryClient = new QueryClient()
 
 const api = axios.create({
-  baseURL: 'http://localhost:8080',
+  baseURL: import.meta.env.VITE_API_BASE_URL || '',
 })
 
 const RUNNING_TASK_STATES = ['queued', 'solving', 'reviewing', 'formatting']
@@ -1388,7 +1388,7 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
   useEffect(() => {
     if (isTaskEnded) return;
 
-    const sse = new EventSource(`http://localhost:8080/api/tasks/${taskId}/stream`);
+    const sse = new EventSource(`${import.meta.env.VITE_API_BASE_URL || ''}/api/tasks/${taskId}/stream`);
 
     sse.onmessage = (e) => {
       try {

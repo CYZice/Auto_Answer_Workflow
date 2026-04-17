@@ -1,0 +1,25 @@
+version: "3.8"
+
+name: zyb_agent
+
+services:
+  zyb_agent:
+    image: ${IMAGE_NAME:-zyb_agent:latest}
+    container_name: zyb_agent
+    restart: unless-stopped
+    working_dir: /app
+    environment:
+      - TZ=Asia/Shanghai
+      - PYTHONUNBUFFERED=1
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://api.openai.com/v1}
+      - LLM_MODEL_NAME=${LLM_MODEL_NAME:-gpt-4o-mini}
+    ports:
+      - "35828:38080"
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

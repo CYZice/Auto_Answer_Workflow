@@ -59,35 +59,21 @@ cd "${PROJECT_ROOT}" || exit
 # 清理端口占用，避免重复启动导致 Address already in use
 kill_port_process 8080
 
-# 默认启用真实模式（可由外部环境变量覆盖）
-export AUTOMATION_USE_MOCK=${AUTOMATION_USE_MOCK:-0}
-export AUTOMATION_SKIP_BROWSER_INSTALL=${AUTOMATION_SKIP_BROWSER_INSTALL:-1}
-export AUTOMATION_BROWSER_CHANNEL=${AUTOMATION_BROWSER_CHANNEL:-chrome}
-export AUTOMATION_TARGET_URL=${AUTOMATION_TARGET_URL:-https://yy.xuejie.cn/#/login}
-
 # Windows-like 环境默认关闭 reload，避免 asyncio 子进程在部分事件循环下报 NotImplementedError
-if [ -z "${AUTOMATION_BACKEND_RELOAD}" ]; then
+if [ -z "${BACKEND_RELOAD}" ]; then
     case "$(uname -s 2>/dev/null)" in
         MINGW*|MSYS*|CYGWIN*)
-            AUTOMATION_BACKEND_RELOAD=0
+            BACKEND_RELOAD=0
             ;;
         *)
-            AUTOMATION_BACKEND_RELOAD=1
+            BACKEND_RELOAD=1
             ;;
     esac
 fi
-export AUTOMATION_BACKEND_RELOAD
-
-echo -e "${GREEN}自动化模式: AUTOMATION_USE_MOCK=${AUTOMATION_USE_MOCK}${NC}"
-if [ -n "${AUTOMATION_TARGET_URL}" ]; then
-    echo -e "${GREEN}目标地址: ${AUTOMATION_TARGET_URL}${NC}"
-fi
-echo -e "${GREEN}浏览器通道: ${AUTOMATION_BROWSER_CHANNEL}${NC}"
-echo -e "${GREEN}跳过浏览器下载: AUTOMATION_SKIP_BROWSER_INSTALL=${AUTOMATION_SKIP_BROWSER_INSTALL}${NC}"
-echo -e "${GREEN}后端热重载: AUTOMATION_BACKEND_RELOAD=${AUTOMATION_BACKEND_RELOAD}${NC}"
+export BACKEND_RELOAD
 
 UVICORN_RELOAD_ARGS=()
-if [ "${AUTOMATION_BACKEND_RELOAD}" = "1" ]; then
+if [ "${BACKEND_RELOAD}" = "1" ]; then
     UVICORN_RELOAD_ARGS=(--reload)
 fi
 
@@ -106,14 +92,6 @@ cd "${PROJECT_ROOT}/backend" || exit
 # 安装依赖
 echo -e "${YELLOW}正在检查后端依赖...${NC}"
 pip install -r requirements.txt -q
-
-# 安装 Playwright Chromium（AUTOMATION_SKIP_BROWSER_INSTALL=1 可跳过）
-if [ "${AUTOMATION_SKIP_BROWSER_INSTALL}" = "1" ]; then
-    echo -e "${YELLOW}已设置 AUTOMATION_SKIP_BROWSER_INSTALL=1，跳过浏览器安装${NC}"
-else
-    echo -e "${YELLOW}检查 Playwright Chromium 安装状态...${NC}"
-    python3 -m playwright install chromium >/dev/null 2>&1 || true
-fi
 
 # 启动后端服务 (后台运行)
 echo -e "${GREEN}启动后端服务 (端口 8080)...${NC}"

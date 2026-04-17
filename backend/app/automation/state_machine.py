@@ -12,6 +12,8 @@ AUTOMATION_STATUSES = {
     "filled",
     "review_pending",
     "ready_to_submit",
+    "written",
+    "failed_write",
     "submitting",
     "submitted",
     "failed_submit",
@@ -29,7 +31,9 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     "solve_failed": {"selected", "solving", "paused", "stopped"},
     "filled": {"review_pending", "paused", "stopped"},
     "review_pending": {"ready_to_submit", "skipped", "paused", "stopped"},
-    "ready_to_submit": {"submitting", "paused", "stopped"},
+    "ready_to_submit": {"written", "failed_write", "paused", "stopped"},
+    "written": set(),  # 终态：内容已写入网站，等待用户到网站手动提交
+    "failed_write": {"ready_to_submit", "paused", "stopped"},  # 写入失败，可重试写入
     "submitting": {"submitted", "failed_submit", "paused", "stopped"},
     "submitted": set(),
     "failed_submit": {"ready_to_submit", "paused", "stopped"},

@@ -10,6 +10,7 @@ from app.automation.schemas import (
     RunReq,
     RunStatusResp,
     SaveReviewReq,
+    ScanReq,
     SelectTasksReq,
     StartSessionReq,
     StartSessionResp,
@@ -42,12 +43,19 @@ async def get_run_status(run_id: str):
 
 
 @router.post("/scan/start", response_model=AckResp)
-async def start_scan(req: RunReq):
+async def start_scan(req: ScanReq):
     try:
-        await automation_service.trigger_scan(req.run_id)
+        await automation_service.trigger_scan(req.run_id, req.school_id)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return AckResp(message="scan started")
+
+
+@router.get("/schools")
+async def list_schools():
+    """获取学校列表，供扫描时选择"""
+    schools = await automation_service.list_schools()
+    return {"items": schools}
 
 
 @router.get("/tasks", response_model=TaskListResp)

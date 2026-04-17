@@ -16,8 +16,13 @@ export async function startSession(username: string, password: string, mode: 'he
     return data
 }
 
-export async function startScan(run_id: string) {
-    await client.post('/scan/start', { run_id })
+export async function startScan(run_id: string, school_id?: number) {
+    await client.post('/scan/start', { run_id, school_id })
+}
+
+export async function listSchools() {
+    const { data } = await client.get<{ items: { school_id: number; school_name: string }[] }>('/schools')
+    return data.items
 }
 
 export async function listTasks(run_id: string, status?: string) {

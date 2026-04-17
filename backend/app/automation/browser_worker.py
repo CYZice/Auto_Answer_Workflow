@@ -222,6 +222,8 @@ class BrowserWorker:
             from playwright.async_api import TimeoutError as PlaywrightTimeoutError
         except Exception as exc:
             raise RuntimeError("playwright runtime unavailable") from exc
+
+        # 自动登录（headed 模式也自动，用户只需要看着浏览器界面）
         try:
             await page.locator(self._login_user_selector).fill(session.username)
             await page.locator(self._login_password_selector).fill(session.password)

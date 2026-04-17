@@ -603,6 +603,7 @@ async def create_task(
                     "formatter_config": (formatter_config_payload),
                     "workflow_template_id": workflow_template_id,
                     "draft_solution": effective_draft_solution,
+                    "question_content": req.question_text or "",
                 },
                 ensure_ascii=False,
             ),
@@ -1584,14 +1585,23 @@ def ensure_task_preview_columns() -> None:
     """为已有 SQLite 数据库补齐新列，避免老库缺列导致查询失败。"""
     try:
         with engine.begin() as conn:
-            columns = {
+            # 补齐 tasks 表的列
+            tasks_columns = {
                 row[1]
                 for row in conn.execute(text("PRAGMA table_info(tasks)")).fetchall()
             }
-            if "question_preview" not in columns:
+            if "question_preview" not in tasks_columns:
                 conn.execute(text("ALTER TABLE tasks ADD COLUMN question_preview TEXT"))
-            if "answer_preview" not in columns:
+            if "answer_preview" not in tasks_columns:
                 conn.execute(text("ALTER TABLE tasks ADD COLUMN answer_preview TEXT"))
+
+            # 补齐 automation_tasks 表的列
+            auto_columns = {
+                row[1]
+                for row in conn.execute(text("PRAGMA table_info(automation_tasks)")).fetchall()
+            }
+            if "topic_text" not in auto_columns:
+                conn.execute(text("ALTER TABLE automation_tasks ADD COLUMN topic_text TEXT"))
     except Exception as exc:
         print(f"[DB] Failed to ensure preview columns: {exc}")
 

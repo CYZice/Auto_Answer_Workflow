@@ -5,9 +5,12 @@ type Props = {
     username: string
     password: string
     mode: 'headed' | 'headless'
+    schools: { school_id: number; school_name: string }[]
+    selectedSchoolId: number | undefined
     onUsernameChange: (value: string) => void
     onPasswordChange: (value: string) => void
     onModeChange: (value: 'headed' | 'headless') => void
+    onSchoolChange: (value: number | undefined) => void
     onStart: () => Promise<void>
     onScan: () => Promise<void>
     onSelect: () => Promise<void>
@@ -18,13 +21,13 @@ type Props = {
     onStop: () => Promise<void>
 }
 
-export function RunControls({ hasRun, runId, runState, username, password, mode, onUsernameChange, onPasswordChange, onModeChange, onStart, onScan, onSelect, onGrab, onSolve, onPause, onResume, onStop }: Props) {
+export function RunControls({ hasRun, runId, runState, username, password, mode, schools, selectedSchoolId, onUsernameChange, onPasswordChange, onModeChange, onSchoolChange, onStart, onScan, onSelect, onGrab, onSolve, onPause, onResume, onStop }: Props) {
     return (
         <div className="rounded-xl border border-slate-200 bg-white p-4">
             <h3 className="mb-2 text-lg font-semibold text-slate-800">运行控制</h3>
             <p className="mb-3 text-xs text-slate-500">run_id: {runId || '未启动'}</p>
             <p className="mb-3 text-xs text-slate-500">state: {runState || 'idle'}</p>
-            <div className="mb-3 grid grid-cols-1 gap-2 md:grid-cols-3">
+            <div className="mb-3 grid grid-cols-1 gap-2 md:grid-cols-4">
                 <input
                     className="rounded border border-slate-300 px-2 py-2 text-sm"
                     placeholder="账号"
@@ -49,6 +52,18 @@ export function RunControls({ hasRun, runId, runState, username, password, mode,
                 >
                     <option value="headed">headed</option>
                     <option value="headless">headless</option>
+                </select>
+                <select
+                    className="rounded border border-slate-300 px-2 py-2 text-sm"
+                    value={selectedSchoolId ?? ''}
+                    onChange={(e) => onSchoolChange(e.target.value ? Number(e.target.value) : undefined)}
+                >
+                    <option value="">全部学校</option>
+                    {schools.map((s) => (
+                        <option key={s.school_id} value={s.school_id}>
+                            {s.school_name}
+                        </option>
+                    ))}
                 </select>
             </div>
             <div className="flex flex-wrap gap-2">

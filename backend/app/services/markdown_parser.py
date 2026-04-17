@@ -200,10 +200,20 @@ class MarkdownParser:
                     current_content_lines.append(content_without_hash)
                 continue
 
-            # 检测大写数字+顿号开头的行，触发新题目
+            # 检测大写数字+顿号开头的行（如 一、二、三），触发新题型
             if re.match(CHINESE_NUMERAL_PATTERN, stripped):
                 flush_question()
                 current_content_lines.append(stripped)
+                continue
+
+            # 检测小写数字+顿号/点开头的行（如 13、1. 2.），触发新题目
+            number_match = re.match(r"^(\d+)[.、]\s*(?=\S)", stripped)
+            if number_match:
+                flush_question()
+                # 题号后面是题目内容
+                after_number = stripped[number_match.end():]
+                if after_number:
+                    current_content_lines.append(after_number)
                 continue
 
             # 普通内容行，追加到当前题目

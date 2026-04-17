@@ -4,6 +4,7 @@ MinerU 精准解析 API v4 服务
 提供高精度文档解析，支持 PDF、DOC、PPT、图片等格式
 需要 Token 认证，每天 2000 页高优先级额度
 """
+
 import asyncio
 import os
 import tempfile
@@ -20,6 +21,7 @@ MINERU_V4_API_BASE = "https://mineru.net/api/v4"
 @dataclass(frozen=True)
 class MineruV4ParseResult:
     """MinerU v4 解析结果"""
+
     task_id: str
     status: str  # pending, running, done, failed
     state: str  # 同 status
@@ -27,7 +29,9 @@ class MineruV4ParseResult:
     markdown_content: Optional[str] = None
     full_zip_url: Optional[str] = None
     error_msg: Optional[str] = None
-    extract_progress: Optional[dict] = None  # {"extracted_pages": int, "total_pages": int}
+    extract_progress: Optional[dict] = (
+        None  # {"extracted_pages": int, "total_pages": int}
+    )
 
 
 class MineruV4Service:
@@ -188,7 +192,9 @@ class MineruV4Service:
             label = state_labels.get(result.status, result.status)
             if result.extract_progress:
                 ep = result.extract_progress
-                print(f"[{elapsed}s] {label}... ({ep.get('extracted_pages', 0)}/{ep.get('total_pages', '?')})")
+                print(
+                    f"[{elapsed}s] {label}... ({ep.get('extracted_pages', 0)}/{ep.get('total_pages', '?')})"
+                )
             else:
                 print(f"[{elapsed}s] {label}...")
 
@@ -241,7 +247,9 @@ class MineruV4Service:
             label = state_labels.get(result.status, result.status)
             if result.extract_progress:
                 ep = result.extract_progress
-                print(f"[{elapsed}s] {label}... ({ep.get('extracted_pages', 0)}/{ep.get('total_pages', '?')})")
+                print(
+                    f"[{elapsed}s] {label}... ({ep.get('extracted_pages', 0)}/{ep.get('total_pages', '?')})"
+                )
             else:
                 print(f"[{elapsed}s] {label}...")
 
@@ -361,7 +369,9 @@ class MineruV4Service:
                 status=result.status,
                 state=result.state,
                 full_zip_url=result.full_zip_url,
-                markdown_content=await self.download_and_extract_markdown(result.full_zip_url),
+                markdown_content=await self.download_and_extract_markdown(
+                    result.full_zip_url
+                ),
                 error_msg=result.error_msg,
             )
 

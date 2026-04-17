@@ -17,9 +17,12 @@ class AutomationRepository:
         run_id: str,
         school_name: str,
         topic_title: str,
-        topic_image_url: str | None,
+        topic_image_url: str | None = None,
+        topic_text: str | None = None,
         status: str = "discovered",
     ) -> AutomationTask:
+        import json as _json
+
         item = (
             self.db.query(AutomationTask)
             .filter(AutomationTask.task_id == task_id)
@@ -41,6 +44,7 @@ class AutomationRepository:
                 school_name=school_name,
                 topic_title=topic_title,
                 topic_image_url=topic_image_url,
+                topic_text=topic_text,
                 status=status,
             )
             self.db.add(item)
@@ -49,6 +53,8 @@ class AutomationRepository:
             item.school_name = school_name
             item.topic_title = topic_title
             item.topic_image_url = topic_image_url
+            if topic_text is not None:
+                item.topic_text = topic_text
         self.db.commit()
         self.db.refresh(item)
         return item
@@ -69,7 +75,7 @@ class AutomationRepository:
         page: int,
         page_size: int,
     ) -> tuple[int, list[AutomationTask]]:
-        query = self.db.query(AutomationTask)
+        query = self.db.query(AutomationTask).filter(AutomationTask.run_id == run_id)
         if status:
             query = query.filter(AutomationTask.status == status)
         if school:

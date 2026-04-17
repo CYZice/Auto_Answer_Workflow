@@ -1,4 +1,4 @@
-active_template_id: workflow_a
+active_template_id: workflow_b
 request_timeout_seconds: 300
 max_retries: 2
 fallback:

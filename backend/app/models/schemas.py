@@ -43,6 +43,10 @@ class TaskCreateRequest(BaseModel):
     image_urls: Optional[List[str]] = Field(
         default=None, description="题目图片列表（单题多图）"
     )
+    question_text: Optional[str] = Field(
+        default=None,
+        description="题目OCR识别文字（来自网站API的topic_text字段），会附加到解题提示词中增强理解",
+    )
     solver_config: Optional[ModelConfig] = Field(
         default=None, description="Solver(解题)节点的大模型配置"
     )

@@ -48,6 +48,11 @@ class RunReq(BaseModel):
     run_id: str
 
 
+class ScanReq(BaseModel):
+    run_id: str
+    school_id: int | None = None  # None 表示扫描所有学校
+
+
 class BatchReq(BaseModel):
     run_id: str
     limit: int = Field(default=0, ge=0)

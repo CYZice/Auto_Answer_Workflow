@@ -5,6 +5,7 @@ import {
     deleteTasks,
     getRunStatus,
     listLogs,
+    listSchools,
     listTasks,
     pauseRun,
     resumeRun,
@@ -24,6 +25,11 @@ import type { LogItem, RunStatus, TaskItem } from './types'
 
 const LAST_RUN_ID_KEY = 'automation_console_last_run_id'
 
+interface School {
+    school_id: number
+    school_name: string
+}
+
 function App() {
     const [username, setUsername] = useState('13320115908')
     const [password, setPassword] = useState('2011590xue')
@@ -35,6 +41,8 @@ function App() {
     const [selected, setSelected] = useState<Set<string>>(new Set())
     const [activeReview, setActiveReview] = useState<TaskItem | null>(null)
     const [sourcePreview, setSourcePreview] = useState<TaskItem | null>(null)
+    const [schools, setSchools] = useState<School[]>([])
+    const [selectedSchoolId, setSelectedSchoolId] = useState<number | undefined>(undefined)
 
     const hasRun = runId.length > 0
 
@@ -136,20 +144,26 @@ function App() {
                     username={username}
                     password={password}
                     mode={mode}
+                    schools={schools}
+                    selectedSchoolId={selectedSchoolId}
                     onUsernameChange={setUsername}
                     onPasswordChange={setPassword}
                     onModeChange={setMode}
+                    onSchoolChange={setSelectedSchoolId}
                     onStart={async () => {
                         await runAction('启动会话', async () => {
                             const session = await startSession(username, password, mode)
                             setRunId(session.run_id)
                             setRunState(session.state)
+                            // 加载学校列表
+                            const schoolList = await listSchools()
+                            setSchools(schoolList)
                             await refresh()
                         }, '启动会话成功')
                     }}
                     onScan={async () => {
                         await runAction('扫描', async () => {
-                            await startScan(runId)
+                            await startScan(runId, selectedSchoolId)
                             await refresh()
                         }, '扫描已启动，请留意运行日志')
                     }}

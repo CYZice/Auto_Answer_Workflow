@@ -12,7 +12,8 @@ class AutomationTask(Base):
     run_id = Column(String, index=True, nullable=False)
     school_name = Column(String, index=True, nullable=False)
     topic_title = Column(String, nullable=False, default="")
-    topic_image_url = Column(Text, nullable=True)
+    topic_image_url = Column(Text, nullable=True)  # 图片 URL（JSON 数组格式，支持多图）
+    topic_text = Column(Text, nullable=True)  # 网站 OCR 识别后的题目文字（带 LaTeX 公式）
     status = Column(String, index=True, nullable=False, default="discovered")
 
     final_markdown = Column(Text, nullable=True)

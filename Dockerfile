@@ -18,6 +18,7 @@ WORKDIR /app
 # 安装系统依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    pandoc \
     && rm -rf /var/lib/apt/lists/*
 
 # 复制后端 requirements
@@ -41,4 +42,4 @@ RUN mkdir -p /app/data
 
 EXPOSE 38080
 
-CMD ["gunicorn", "--bind", "0.0.0.0:38080", "-w", "2", "-k", "uvicorn.workers.UvicornWorker", "app.main:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:38080", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "app.main:app"]

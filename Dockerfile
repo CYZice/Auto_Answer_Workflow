@@ -15,7 +15,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# 安装系统依赖
+# 安装系统依赖，DOCX 导出依赖 pandoc
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     pandoc \
@@ -42,4 +42,4 @@ RUN mkdir -p /app/data
 
 EXPOSE 38080
 
-CMD ["gunicorn", "--bind", "0.0.0.0:38080", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "app.main:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:38080", "-w", "2", "-k", "uvicorn.workers.UvicornWorker", "app.main:app"]

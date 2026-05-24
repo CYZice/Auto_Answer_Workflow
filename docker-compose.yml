@@ -5,6 +5,9 @@ name: zyb_agent
 services:
   zyb_agent:
     image: ${IMAGE_NAME:-zyb_agent:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: zyb_agent
     restart: unless-stopped
     working_dir: /app
@@ -14,10 +17,12 @@ services:
       - LLM_API_KEY=${LLM_API_KEY}
       - LLM_BASE_URL=${LLM_BASE_URL:-https://api.openai.com/v1}
       - LLM_MODEL_NAME=${LLM_MODEL_NAME:-gpt-4o-mini}
+      - CONFIG_DIR=/app/config
     ports:
-      - "35828:38080"
+      - "${APP_PORT:-35828}:38080"
     volumes:
       - ./data:/app/data
+      - ./config:/app/config
     logging:
       driver: "json-file"
       options:

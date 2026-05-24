@@ -2621,6 +2621,7 @@ function PaperBuilder({
   const [isLoadingDraft, setIsLoadingDraft] = useState(false)
   const [lastSavedAt, setLastSavedAt] = useState<string | null>(null)
   const [selectedTaskIds, setSelectedTaskIds] = useState<string[]>([])
+  const [batchTargetGroupId, setBatchTargetGroupId] = useState('')
   const [draggingTaskId, setDraggingTaskId] = useState<string | null>(null)
   const [dragOverGroupId, setDragOverGroupId] = useState<string | null>(null)
   const [dragOverTaskKey, setDragOverTaskKey] = useState<string | null>(null)
@@ -2803,6 +2804,17 @@ function PaperBuilder({
     setSelectedTaskIds((prev) => prev.filter((taskId) => available.has(taskId)))
   }, [tasks])
 
+  useEffect(() => {
+    if (groups.length === 0) {
+      setBatchTargetGroupId('')
+      return
+    }
+    setBatchTargetGroupId((prev) => {
+      if (prev && groups.some((group) => group.id === prev)) return prev
+      return groups[0]?.id || ''
+    })
+  }, [groups])
+
   const getStateBadgeClass = (state: string) => {
     if (state === 'completed') return 'bg-green-100 text-green-700 border-green-200'
     if (state === 'failed') return 'bg-red-100 text-red-700 border-red-200'
@@ -2839,22 +2851,52 @@ function PaperBuilder({
     setSelectedTaskIds([])
   }
 
+  const sortTaskIdsByTime = (taskIds: string[]) => {
+    const toTimestamp = (value?: string | null) => {
+      if (!value) return Number.NaN
+      const parsed = Date.parse(value)
+      return Number.isNaN(parsed) ? Number.NaN : parsed
+    }
+
+    return [...taskIds].sort((leftId, rightId) => {
+      const leftTask = taskMap.get(leftId)
+      const rightTask = taskMap.get(rightId)
+      const leftTime = toTimestamp(leftTask?.created_at) || toTimestamp(leftTask?.updated_at)
+      const rightTime = toTimestamp(rightTask?.created_at) || toTimestamp(rightTask?.updated_at)
+
+      const leftValid = Number.isFinite(leftTime)
+      const rightValid = Number.isFinite(rightTime)
+      if (leftValid && rightValid && leftTime !== rightTime) return leftTime - rightTime
+      if (leftValid !== rightValid) return leftValid ? -1 : 1
+      return leftId.localeCompare(rightId)
+    })
+  }
+
   const addSelectedTasksToGroup = (groupId: string) => {
     if (selectedTaskIds.length === 0) {
       setOperationMessage('请先在任务池勾选题目，再执行批量分配')
       return
     }
+    const sortedSelectedTaskIds = sortTaskIdsByTime(selectedTaskIds)
     setGroups((prev) => prev.map((group) => {
       if (group.id !== groupId) return group
       const next = [...group.taskIds]
-      selectedTaskIds.forEach((taskId) => {
+      sortedSelectedTaskIds.forEach((taskId) => {
         if (!next.includes(taskId)) {
           next.push(taskId)
         }
       })
       return { ...group, taskIds: next }
     }))
-    setOperationMessage(`已批量分配 ${selectedTaskIds.length} 题到「${groups.find((group) => group.id === groupId)?.name || '目标题型'}」`)
+    setOperationMessage(`已按时间顺序批量分配 ${sortedSelectedTaskIds.length} 题到「${groups.find((group) => group.id === groupId)?.name || '目标题型'}」`)
+  }
+
+  const addSelectedTasksToBatchTarget = () => {
+    if (!batchTargetGroupId) {
+      setOperationMessage('请先创建题型，再执行批量分配')
+      return
+    }
+    addSelectedTasksToGroup(batchTargetGroupId)
   }
 
   const removeSelectedTasksFromAllGroups = () => {
@@ -3013,6 +3055,10 @@ function PaperBuilder({
     }
   }
 
+  const selectedCount = selectedTaskIds.length
+  const completedTaskCount = tasks.filter((task) => task.state === 'completed').length
+  const batchTargetGroupName = groups.find((group) => group.id === batchTargetGroupId)?.name || ''
+
   return (
     <div className="max-w-7xl mx-auto p-8 space-y-6">
       <header className="border-b pb-4 flex justify-between items-center">
@@ -3073,17 +3119,63 @@ function PaperBuilder({
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div className="bg-white border rounded-xl p-4 space-y-4">
-          <h2 className="text-lg font-semibold text-gray-800">任务池（与数据库状态一致）</h2>
-          <div className="grid grid-cols-2 gap-2">
-            <button onClick={selectAllCompletedTasks} className="text-xs px-2.5 py-1.5 border rounded hover:bg-gray-50">
-              全选已完成
-            </button>
-            <button onClick={clearTaskSelection} className="text-xs px-2.5 py-1.5 border rounded hover:bg-gray-50">
-              清空选择
-            </button>
-            <button onClick={removeSelectedTasksFromAllGroups} className="col-span-2 text-xs px-2.5 py-1.5 border rounded hover:bg-gray-50">
-              从所有题型移除已选
-            </button>
+          <div className="space-y-3">
+            <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <h2 className="text-lg font-semibold text-gray-800">任务池（与数据库状态一致）</h2>
+                <p className="text-xs text-gray-500">勾选题目后，直接在这里指定题型并批量加入，不必再去右侧逐个点。</p>
+              </div>
+              <div className="flex items-center gap-2 text-xs text-gray-500">
+                <span className="rounded-full bg-indigo-50 px-2.5 py-1 text-indigo-700">已选 {selectedCount} 题</span>
+                <span>可分配 {completedTaskCount} 题</span>
+              </div>
+            </div>
+            <div className="rounded-xl border border-gray-200 bg-gray-50 p-3 space-y-3">
+              <div className="flex flex-wrap gap-2">
+                <button onClick={selectAllCompletedTasks} className="text-xs px-3 py-1.5 border rounded-lg bg-white hover:bg-gray-100">
+                  全选已完成
+                </button>
+                <button onClick={clearTaskSelection} className="text-xs px-3 py-1.5 border rounded-lg bg-white hover:bg-gray-100">
+                  清空选择
+                </button>
+                <button
+                  onClick={removeSelectedTasksFromAllGroups}
+                  disabled={selectedCount === 0}
+                  className="text-xs px-3 py-1.5 border rounded-lg bg-white text-amber-700 hover:bg-amber-50 disabled:opacity-50"
+                >
+                  从所有题型移除
+                </button>
+              </div>
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <select
+                  value={batchTargetGroupId}
+                  onChange={(e) => setBatchTargetGroupId(e.target.value)}
+                  disabled={groups.length === 0}
+                  className="flex-1 rounded-lg border bg-white px-3 py-2 text-sm disabled:bg-gray-100 disabled:text-gray-400"
+                >
+                  {groups.length === 0 ? (
+                    <option value="">请先在右侧创建题型</option>
+                  ) : (
+                    groups.map((group) => (
+                      <option key={group.id} value={group.id}>
+                        加入到：{group.name}
+                      </option>
+                    ))
+                  )}
+                </select>
+                <button
+                  onClick={addSelectedTasksToBatchTarget}
+                  disabled={selectedCount === 0 || groups.length === 0}
+                  className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+                >
+                  {selectedCount === 0
+                    ? '先勾选题目'
+                    : batchTargetGroupName
+                      ? `加入「${batchTargetGroupName}」`
+                      : '批量加入题型'}
+                </button>
+              </div>
+            </div>
           </div>
           {isLoading ? (
             <div className="text-sm text-gray-500">加载中...</div>
@@ -3113,6 +3205,7 @@ function PaperBuilder({
                         type="checkbox"
                         checked={selectedTaskIds.includes(task.task_id)}
                         onChange={() => toggleTaskSelection(task.task_id)}
+                        className="h-5 w-5 cursor-pointer rounded border-gray-300 accent-indigo-600"
                       />
                       <div className="font-mono text-xs text-gray-700 truncate">{task.task_id}</div>
                     </div>

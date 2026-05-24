@@ -7,7 +7,7 @@ from app.agent.nodes.reviewer import review_node
 from app.agent.nodes.formatter import format_node
 
 
-def route_after_solver(state: AgentState) -> Literal["reviewer", "end"]:
+def route_after_solver(state: AgentState) -> Literal["reviewer", "formatter", "end"]:
     """
     条件路由：Solver 后根据状态决定是否进入 Reviewer。
     - failed/cancelled: 直接终止，保留失败上下文
@@ -18,6 +18,12 @@ def route_after_solver(state: AgentState) -> Literal["reviewer", "end"]:
         print(f"  [Router] Solver ended with {solver_status} -> end")
         return "end"
     if solver_status == "reviewing":
+        target_nodes = state.get("target_nodes") or []
+        if target_nodes and "reviewer" not in target_nodes:
+            if "formatter" in target_nodes:
+                return "formatter"
+            print("  [Router] Reviewer skipped and formatter not selected -> end")
+            return "end"
         return "reviewer"
     print(f"  [Router] Solver produced unexpected status {solver_status} -> end")
     return "end"
@@ -96,6 +102,7 @@ def build_graph(
         route_after_solver,
         {
             "reviewer": "reviewer",
+            "formatter": "formatter",
             "end": END,
         },
     )

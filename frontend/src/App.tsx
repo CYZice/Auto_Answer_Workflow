@@ -30,6 +30,12 @@ const PAPER_BUILDER_REMOTE_DRAFT_ID = 'default'
 
 type WorkflowNode = (typeof WORKFLOW_NODE_ORDER)[number]
 
+const isOrderedWorkflowSelection = (nodes: WorkflowNode[]) => {
+  if (nodes.length === 0) return false
+  const indices = nodes.map((node) => WORKFLOW_NODE_ORDER.indexOf(node))
+  return indices.every((idx, i) => i === 0 || indices[i - 1] < idx)
+}
+
 const getErrorMessage = (error: unknown, fallback: string) => {
   if (axios.isAxiosError(error)) {
     return (error.response?.data as { detail?: string } | undefined)?.detail || error.message || fallback
@@ -253,7 +259,8 @@ const persistTaskForDashboard = (taskId: string) => {
 function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const [pendingInputImages, setPendingInputImages] = useState<string[]>([])
-  const [inputDraft, setInputDraft] = useState('')
+  const [inputQuestionText, setInputQuestionText] = useState('')
+  const [inputSkipReview, setInputSkipReview] = useState(false)
   const [inputSelectedNodes, setInputSelectedNodes] = useState<WorkflowNode[]>(() => {
     const saved = readStoredJson<WorkflowNode[]>(INPUT_SELECTED_NODES_STORAGE_KEY, [...WORKFLOW_NODE_ORDER])
     if (!Array.isArray(saved)) return [...WORKFLOW_NODE_ORDER]
@@ -597,38 +604,42 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   const createMutation = useMutation({
     mutationFn: (payload: {
       imageUrls: string[];
+      questionText?: string;
       entryPoint: WorkflowNode;
       targetNodes: WorkflowNode[];
-      draftSolution?: string;
     }) => api.post('/api/tasks', {
       image_urls: payload.imageUrls,
+      question_text: payload.questionText || null,
       solver_config: withSharedConnection(solverConfig),
       reviewer_config: withSharedConnection(reviewerConfig),
       formatter_config: withSharedConnection(formatterConfig),
       workflow_template_id: activeTemplateId,
       entry_point: payload.entryPoint,
-      target_nodes: payload.targetNodes,
-      draft_solution: payload.draftSolution || null
+      target_nodes: payload.targetNodes
     }).then(res => res.data),
   })
 
   const orderedInputNodes = WORKFLOW_NODE_ORDER.filter((node) => inputSelectedNodes.includes(node))
-  const inputNodeIndices = orderedInputNodes.map((node) => WORKFLOW_NODE_ORDER.indexOf(node))
-  const inputHasContiguousSelection = inputNodeIndices.every((idx, i) => i === 0 || idx - inputNodeIndices[i - 1] === 1)
-  const inputEntryPoint = orderedInputNodes.length > 0 ? orderedInputNodes[0] : undefined
-  const inputNeedsDraft = false  // 不再强制要求
-  const inputDraftValue = inputDraft.trim()
-  const canSubmitInputTask = pendingInputImages.length > 0
-    && orderedInputNodes.length > 0
-    && inputHasContiguousSelection
+  const effectiveInputNodes = inputSkipReview ? ['solver', 'formatter'] as WorkflowNode[] : orderedInputNodes
+  const inputHasOrderedSelection = isOrderedWorkflowSelection(orderedInputNodes)
+  const inputStartsAtSolver = effectiveInputNodes[0] === 'solver'
+  const inputEntryPoint = effectiveInputNodes.length > 0 ? effectiveInputNodes[0] : undefined
+  const inputQuestionTextValue = inputQuestionText.trim()
+  const hasInputSource = pendingInputImages.length > 0 || inputQuestionTextValue.length > 0
+  const canSubmitInputTask = hasInputSource
+    && effectiveInputNodes.length > 0
+    && inputStartsAtSolver
+    && (inputSkipReview || inputHasOrderedSelection)
     && !createMutation.isPending
-  const inputBlockedReason = pendingInputImages.length === 0
-    ? '请先添加至少一张题目图片。'
-    : (orderedInputNodes.length === 0
+  const inputBlockedReason = !hasInputSource
+    ? '请至少提供题目图片或文本。'
+    : (effectiveInputNodes.length === 0
       ? '请至少选择一个工作流节点。'
-      : (!inputHasContiguousSelection
-        ? '工作流节点必须连续，不能跳选。'
-        : ''))
+      : (!inputStartsAtSolver
+        ? '当前题目输入必须从 Solver 开始。'
+      : (!inputSkipReview && !inputHasOrderedSelection
+        ? '工作流节点必须按 solver -> reviewer -> formatter 的顺序选择。'
+        : '')))
 
   const { data: activeTasksFromDb } = useQuery({
     queryKey: ['dashboard-active-tasks'],
@@ -753,15 +764,15 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
 
   // 处理“提交本题”逻辑
   const handleSubmitCurrentTask = async () => {
-    if (!canSubmitInputTask || pendingInputImages.length === 0 || !inputEntryPoint) return;
+    if (!canSubmitInputTask || !inputEntryPoint) return;
     setErrorMessage(null);
 
     try {
       const result = await createMutation.mutateAsync({
         imageUrls: pendingInputImages,
+        questionText: inputQuestionTextValue,
         entryPoint: inputEntryPoint,
-        targetNodes: orderedInputNodes,
-        draftSolution: inputDraftValue.length > 0 ? inputDraftValue : '见图片',
+        targetNodes: effectiveInputNodes,
       });
       setSubmittedTasks((prev) => (
         prev.some((item) => item.taskId === result.task_id)
@@ -770,7 +781,7 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       ));
       setActiveTaskId(result.task_id);
       setPendingInputImages([]);
-      setInputDraft('');
+      setInputQuestionText('');
     } catch (error: unknown) {
       const errorMsg = getErrorMessage(error, "未知错误");
       setErrorMessage(`提交失败: ${errorMsg}`);
@@ -827,7 +838,7 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       <header className="border-b pb-4 flex justify-between items-start">
         <div>
           <h1 className="text-3xl font-bold text-gray-900">Zyb-Agent 生产流水线</h1>
-          <p className="text-sm text-gray-500 mt-2">提示: 直接在这个页面 <kbd className="bg-gray-100 px-1 rounded border">Ctrl+V</kbd> 粘贴图片，每次仅允许录入一题并提交后再录入下一题。</p>
+          <p className="text-sm text-gray-500 mt-2">提示: 可以直接在这个页面 <kbd className="bg-gray-100 px-1 rounded border">Ctrl+V</kbd> 粘贴图片，也可以输入题目文本；每次录入一题并提交后再开始下一题。</p>
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -890,6 +901,16 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           </div>
         </div>
 
+        <div className="space-y-2">
+          <label className="text-sm font-medium text-gray-700">题目文本输入</label>
+          <textarea
+            className="w-full min-h-32 p-3 border rounded-lg text-sm font-mono bg-white focus:ring-2 focus:ring-blue-500 outline-none"
+            value={inputQuestionText}
+            onChange={(e) => setInputQuestionText(e.target.value)}
+            placeholder="可直接输入题目文本；可与图片同时提交，也可只提交文本。"
+          />
+        </div>
+
         {pendingInputImages.length > 0 ? (
           <div className="space-y-4">
             <div className="flex items-center justify-between text-xs text-gray-600">
@@ -897,7 +918,7 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
               <button
                 onClick={() => {
                   setPendingInputImages([])
-                  setInputDraft('')
+                  setInputQuestionText('')
                 }}
                 className="text-red-600 hover:text-red-700"
               >
@@ -930,19 +951,28 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           <div className="h-36 border-2 border-dashed border-gray-300 rounded-lg flex flex-col items-center justify-center text-gray-400 bg-gray-50">
             <Plus size={24} className="mb-2" />
             <span className="text-sm">支持 Ctrl+V 粘贴，或点击上方“本地选图”上传一张或多张题目截图</span>
-            <span className="text-xs mt-1">一次只录入一题，可包含多张图片，提交后再开始下一题</span>
+            <span className="text-xs mt-1">也可以不传图片，直接在上方文本框输入题目后提交</span>
           </div>
         )}
 
         <div className="sticky bottom-0 z-10 -mx-6 px-6 py-4 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] bg-white/95 backdrop-blur border-t border-gray-200 space-y-3">
+          <label className="inline-flex items-center gap-2 text-sm text-gray-700">
+            <input
+              type="checkbox"
+              checked={inputSkipReview}
+              onChange={(e) => setInputSkipReview(e.target.checked)}
+            />
+            <span>跳过 Review，直接从 Solver 进入 Formatter</span>
+          </label>
           <div className="flex flex-wrap items-center gap-2">
             {WORKFLOW_NODE_ORDER.map((node, idx) => (
               <div key={node} className="flex items-center gap-2">
-                <label className="inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded border bg-white border-gray-200">
+                <label className={`inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded border bg-white border-gray-200 ${inputSkipReview ? 'opacity-50' : ''}`}>
                   <input
                     type="checkbox"
                     checked={inputSelectedNodes.includes(node)}
                     onChange={() => toggleInputNodeSelection(node)}
+                    disabled={inputSkipReview}
                   />
                   <span className="font-medium">
                     {node === 'solver' ? 'Solver 解题' : node === 'reviewer' ? 'Reviewer 审查' : 'Formatter 排版'}
@@ -955,20 +985,8 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
 
           <div className="text-xs text-gray-600 bg-white rounded border px-3 py-2">
             <div>入口节点: <span className="font-mono">{inputEntryPoint || '-'}</span></div>
-            <div>目标节点: <span className="font-mono">{orderedInputNodes.join(', ') || '-'}</span></div>
+            <div>目标节点: <span className="font-mono">{effectiveInputNodes.join(', ') || '-'}</span></div>
           </div>
-
-          {inputNeedsDraft && (
-            <div className="space-y-2">
-              <label className="text-sm font-medium text-gray-700">草稿文本（可选）</label>
-              <textarea
-                className="w-full h-28 p-3 border rounded text-sm font-mono bg-white focus:ring-2 focus:ring-blue-500 outline-none resize-none"
-                value={inputDraft}
-                onChange={(e) => setInputDraft(e.target.value)}
-                placeholder="从 Reviewer/Formatter 开始执行时可输入草稿，留空将默认使用“见图片”"
-              />
-            </div>
-          )}
 
           {inputBlockedReason && !canSubmitInputTask && (
             <div className="text-xs text-red-600 bg-red-50 border border-red-100 px-3 py-2 rounded">
@@ -1471,21 +1489,20 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
   }
 
   const orderedSelectedNodes = WORKFLOW_NODE_ORDER.filter((node) => selectedNodes.includes(node))
-  const selectedNodeIndices = orderedSelectedNodes.map((node) => WORKFLOW_NODE_ORDER.indexOf(node))
-  const hasContiguousSelection = selectedNodeIndices.every((idx, i) => i === 0 || idx - selectedNodeIndices[i - 1] === 1)
+  const hasOrderedSelection = isOrderedWorkflowSelection(orderedSelectedNodes)
   const customEntryPoint = orderedSelectedNodes.length > 0 ? orderedSelectedNodes[0] : undefined
   const customNeedsDraft = customEntryPoint === 'reviewer' || customEntryPoint === 'formatter'
   const customDraftValue = customDraftInput.trim().length > 0
     ? customDraftInput.trim()
     : (typeof history.draft_solution === 'string' ? history.draft_solution : '')
   const canSubmitCustomRun = orderedSelectedNodes.length > 0
-    && hasContiguousSelection
+    && hasOrderedSelection
     && (!customNeedsDraft || customDraftValue.trim().length > 0)
     && !manualMutation.isPending
   const customRunBlockedReason = orderedSelectedNodes.length === 0
     ? '请至少选择一个节点。'
-    : (!hasContiguousSelection
-      ? '工作流节点必须连续，不能跳选。'
+    : (!hasOrderedSelection
+      ? '工作流节点必须按 solver -> reviewer -> formatter 的顺序选择。'
       : (customNeedsDraft && customDraftValue.trim().length === 0
         ? '从 Reviewer 或 Formatter 开始时，草稿文本为必填。'
         : ''))
@@ -1917,9 +1934,9 @@ function AdminPanel({
       const orderedNodes = WORKFLOW_NODE_ORDER.filter((node) => customRunNodes.includes(node))
       if (orderedNodes.length === 0) throw new Error('请至少选择一个节点')
 
-      const nodeIndices = orderedNodes.map((node) => WORKFLOW_NODE_ORDER.indexOf(node))
-      const isContiguous = nodeIndices.every((idx, i) => i === 0 || idx - nodeIndices[i - 1] === 1)
-      if (!isContiguous) throw new Error('节点选择必须连续，不能跳选')
+      if (!isOrderedWorkflowSelection(orderedNodes)) {
+        throw new Error('节点选择必须按 solver -> reviewer -> formatter 的顺序排列')
+      }
 
       const entryPoint = orderedNodes[0]
 
@@ -1934,12 +1951,11 @@ function AdminPanel({
       }
 
       const historyDraft = typeof parsedHistory.draft_solution === 'string' ? parsedHistory.draft_solution : ''
-      const rawDraft = customRunDraft.trim().length > 0 ? customRunDraft.trim() : historyDraft
-      const draftSolution = rawDraft.trim().length > 0 ? rawDraft : '见图片'
+      const draftSolution = customRunDraft.trim().length > 0 ? customRunDraft.trim() : historyDraft
 
       await api.post(`/api/tasks/${selectedTaskId}/manual`, {
         action: 'custom_run',
-        draft_solution: draftSolution,
+        draft_solution: draftSolution || undefined,
         entry_point: entryPoint,
         target_nodes: orderedNodes,
         ...getLatestRetryConfigs()
@@ -2008,8 +2024,7 @@ function AdminPanel({
 
   const orderedCustomRunNodes = WORKFLOW_NODE_ORDER.filter((node) => customRunNodes.includes(node))
   const customRunEntryPoint = orderedCustomRunNodes.length > 0 ? orderedCustomRunNodes[0] : undefined
-  const customRunIndices = orderedCustomRunNodes.map((node) => WORKFLOW_NODE_ORDER.indexOf(node))
-  const customRunContiguous = customRunIndices.every((idx, i) => i === 0 || idx - customRunIndices[i - 1] === 1)
+  const customRunOrdered = isOrderedWorkflowSelection(orderedCustomRunNodes)
   const customRunNeedDraft = customRunEntryPoint === 'reviewer' || customRunEntryPoint === 'formatter'
 
   let customRunHistoryDraft = ''
@@ -2023,7 +2038,7 @@ function AdminPanel({
   const customRunDraftValue = customRunDraft.trim().length > 0 ? customRunDraft.trim() : customRunHistoryDraft
   const canSubmitCustomRun = canCustomRunSelectedTask
     && orderedCustomRunNodes.length > 0
-    && customRunContiguous
+    && customRunOrdered
     && (!customRunNeedDraft || customRunDraftValue.trim().length > 0)
     && !customRunMutation.isPending
 
@@ -2031,8 +2046,8 @@ function AdminPanel({
     ? '当前任务状态不支持自定义执行。'
     : (orderedCustomRunNodes.length === 0
       ? '请至少勾选一个节点。'
-      : (!customRunContiguous
-        ? '节点必须连续，不能跳选。'
+      : (!customRunOrdered
+        ? '节点必须按 solver -> reviewer -> formatter 的顺序选择。'
         : (customRunNeedDraft && customRunDraftValue.trim().length === 0
           ? '从 Reviewer/Formatter 开始时草稿文本必填。'
           : '')))
@@ -3453,6 +3468,7 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
     JSON.parse(sessionStorage.getItem('smartParser_statuses') || '{}')
   )
   const [selectedTaskIds, setSelectedTaskIds] = useState<string[]>([])
+  const [skipReviewOnRetry, setSkipReviewOnRetry] = useState(false)
   const [batchActionLoading, setBatchActionLoading] = useState(false)
   const [originalImages, setOriginalImages] = useState<string[]>([])
   const [paperSubject, setPaperSubject] = useState('')
@@ -3875,7 +3891,7 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
       const results = await Promise.allSettled(
         toRetry.map((taskId) => {
           const status = questionStatuses[taskId]?.status
-          if (status === 'failed' || status === 'manual') {
+          if (!skipReviewOnRetry && (status === 'failed' || status === 'manual')) {
             return api.post(`/api/tasks/${taskId}/manual`, {
               action: 'resume',
               draft_solution: undefined,
@@ -3884,9 +3900,8 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
           }
           return api.post(`/api/tasks/${taskId}/manual`, {
             action: 'custom_run',
-            draft_solution: '见图片',
             entry_point: 'solver',
-            target_nodes: ['solver', 'reviewer', 'formatter'],
+            target_nodes: skipReviewOnRetry ? ['solver', 'formatter'] : ['solver', 'reviewer', 'formatter'],
             ...retryConfigs,
           })
         })
@@ -4175,6 +4190,14 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
               <p className="text-xs text-gray-500 mt-1">
                 {Object.values(questionStatuses).filter(s => s.status === 'completed').length} / {questions.length} 题完成
               </p>
+              <label className="mt-3 inline-flex items-center gap-2 text-xs text-gray-600">
+                <input
+                  type="checkbox"
+                  checked={skipReviewOnRetry}
+                  onChange={(e) => setSkipReviewOnRetry(e.target.checked)}
+                />
+                <span>批量重试时跳过 Review，直接进入 Formatter</span>
+              </label>
               <div className="mt-3 grid grid-cols-2 gap-2">
                 <button
                   onClick={selectAllRunning}
@@ -4253,6 +4276,14 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
           {solveProgress === 'error' && (
             <div className="mt-4 pt-4 border-t">
               <p className="text-sm text-red-600 mb-3">部分题目解题失败</p>
+              <label className="mb-3 inline-flex items-center gap-2 text-xs text-gray-600">
+                <input
+                  type="checkbox"
+                  checked={skipReviewOnRetry}
+                  onChange={(e) => setSkipReviewOnRetry(e.target.checked)}
+                />
+                <span>批量重试时跳过 Review，直接进入 Formatter</span>
+              </label>
               <div className="grid grid-cols-2 gap-2">
                 <button
                   onClick={selectAllRunning}

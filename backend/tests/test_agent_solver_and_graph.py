@@ -19,6 +19,11 @@ def test_route_after_solver_go_reviewer_when_active():
     assert route_after_solver(state) == "reviewer"
 
 
+def test_route_after_solver_go_formatter_when_review_is_skipped():
+    state = {"status": "reviewing", "target_nodes": ["solver", "formatter"]}
+    assert route_after_solver(state) == "formatter"
+
+
 def test_route_after_solver_end_on_unexpected_status():
     state = {"status": "solving"}
     assert route_after_solver(state) == "end"

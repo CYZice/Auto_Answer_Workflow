@@ -1635,6 +1635,6 @@ def admin_list_logs(task_id: str, db: Session = Depends(get_db)):
 # 在所有 API 路由之后挂载，确保 /api/* 优先匹配
 frontend_dist_path = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 if os.path.exists(frontend_dist_path):
-app.mount(
+    app.mount(
         "/", StaticFiles(directory=frontend_dist_path, html=True), name="frontend"
     )

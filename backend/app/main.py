@@ -64,8 +64,8 @@ from app.services.runtime_config import (
 )
 from app.api.mineru_routes import router as mineru_router
 
-# 全局并发信号量，控制同时进行的大模型推理任务数（根据 PRD 要求默认为 5）
-MAX_CONCURRENT_TASKS = 5
+# 全局并发信号量，控制同时进行的大模型推理任务数
+MAX_CONCURRENT_TASKS = 10
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 # 全局流式事件总线，用于将后台工作流的流式输出分发给所有 SSE 客户端
@@ -175,11 +175,38 @@ def normalize_image_urls(
     return normalized
 
 
-def validate_contiguous_nodes(nodes: list[str]) -> bool:
+def validate_ordered_target_nodes(nodes: list[str]) -> bool:
     if not nodes:
         return False
-    indices = sorted(WORKFLOW_ORDER.index(node) for node in nodes)
-    return all(indices[i + 1] - indices[i] == 1 for i in range(len(indices) - 1))
+    if len(set(nodes)) != len(nodes):
+        return False
+    try:
+        indices = [WORKFLOW_ORDER.index(node) for node in nodes]
+    except ValueError:
+        return False
+    return all(indices[i] < indices[i + 1] for i in range(len(indices) - 1))
+
+
+def validate_requested_target_nodes(raw_nodes) -> list[str]:
+    if not isinstance(raw_nodes, list):
+        return []
+
+    requested_nodes: list[str] = []
+    for raw_node in raw_nodes:
+        if not isinstance(raw_node, str):
+            return []
+        cleaned = raw_node.strip()
+        if not cleaned:
+            return []
+        requested_nodes.append(cleaned)
+
+    if not validate_ordered_target_nodes(requested_nodes):
+        return []
+    return requested_nodes
+
+
+def requires_draft_for_entry_point(entry_point: str, draft_solution: str | None) -> bool:
+    return entry_point in {"reviewer", "formatter"} and not draft_solution
 
 
 async def run_agent_workflow_async(
@@ -208,7 +235,6 @@ async def run_agent_workflow_async(
             try:
                 if task_record.history:
                     history_data = json.loads(task_record.history)
-                    print(f"[DEBUG main.py] task_id={task_id}, history_data keys={list(history_data.keys())}, question_content={history_data.get('question_content')}")
                     agent_configs = {
                         "solver": history_data.get("solver_config", {}),
                         "reviewer": history_data.get("reviewer_config", {}),
@@ -273,9 +299,9 @@ async def run_agent_workflow_async(
                 "agent_configs": agent_configs,
                 "target_nodes": effective_target_nodes,
                 "workflow_template_id": workflow_template_id,
-                "question_text": history_data.get("question_content"),
+                "question_text": history_data.get("question_text")
+                or history_data.get("question_content"),
             }
-            print(f"[DEBUG main.py] task_id={task_id}, history_data keys={list(history_data.keys())}, question_content={history_data.get('question_content')}")
         graph_app = graph_apps[start_node]
 
         # 3. 运行图引擎
@@ -545,35 +571,32 @@ async def create_task(
             or runtime_settings.get("active_template_id")
         )
         normalized_image_urls = normalize_image_urls(req.image_urls, req.image_url)
-        if not normalized_image_urls:
+        normalized_question_text = (req.question_text or "").strip()
+        if not normalized_image_urls and not normalized_question_text:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="image_url 或 image_urls 至少提供一个有效值。",
+                detail="image_url、image_urls、question_text 至少提供一个有效值。",
             )
         resume_node = req.entry_point or "solver"
-        normalized_nodes = normalize_target_nodes(req.target_nodes)
+        requested_nodes = validate_requested_target_nodes(req.target_nodes)
 
         if req.target_nodes is not None:
-            if not normalized_nodes:
+            if not requested_nodes:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="target_nodes is invalid or empty.",
                 )
-            if not validate_contiguous_nodes(normalized_nodes):
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="target_nodes must be a contiguous workflow chain.",
-                )
-            if resume_node not in normalized_nodes:
+            if resume_node not in requested_nodes:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="entry_point must be included in target_nodes.",
                 )
-            if resume_node != normalized_nodes[0]:
+            if resume_node != requested_nodes[0]:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"entry_point must be the first node in target_nodes: {normalized_nodes[0]}.",
+                    detail=f"entry_point must be the first node in target_nodes: {requested_nodes[0]}.",
                 )
+            normalized_nodes = normalize_target_nodes(requested_nodes)
             target_nodes = normalized_nodes
         elif resume_node in VALID_RESUME_NODES and resume_node != "solver":
             start_index = WORKFLOW_ORDER.index(resume_node)
@@ -581,17 +604,19 @@ async def create_task(
         else:
             target_nodes = None
 
-        if not req.draft_solution:
-            req.draft_solution = "见图片"
-
         effective_draft_solution = req.draft_solution
-        if effective_draft_solution is None:
-            effective_draft_solution = model_defaults.get("draft_solution")
+        if effective_draft_solution is not None:
+            effective_draft_solution = effective_draft_solution.strip() or None
+        if requires_draft_for_entry_point(resume_node, effective_draft_solution):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="draft_solution is required when entry_point is reviewer or formatter.",
+            )
 
         new_task = Task(
             task_id=new_task_id,
             thread_id=new_thread_id,
-            image_url=normalized_image_urls[0],
+            image_url=normalized_image_urls[0] if normalized_image_urls else "",
             state=TaskStatus.QUEUED.value,
             history=json.dumps(
                 {
@@ -601,6 +626,8 @@ async def create_task(
                     "formatter_config": (formatter_config_payload),
                     "workflow_template_id": workflow_template_id,
                     "draft_solution": effective_draft_solution,
+                    "question_text": normalized_question_text or None,
+                    "question_content": normalized_question_text or None,
                 },
                 ensure_ascii=False,
             ),
@@ -777,38 +804,33 @@ def submit_manual_review(
 
     target_nodes: list[str] | None = None
     if req.action == "skip_review":
-        if not current_history.get("draft_solution"):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Draft solution is required when skipping review.",
-            )
-        resume_node = "formatter"
-        target_nodes = ["formatter"]
-        current_history["failed_node"] = "reviewer"
+        if current_history.get("draft_solution"):
+            resume_node = "formatter"
+            target_nodes = ["formatter"]
+            current_history["failed_node"] = "reviewer"
+        else:
+            resume_node = "solver"
+            target_nodes = ["solver", "formatter"]
+            current_history["failed_node"] = "reviewer"
     elif req.action == "custom_run":
         if not req.entry_point:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="entry_point is required when action=custom_run.",
             )
-        normalized_nodes = normalize_target_nodes(req.target_nodes)
-        if not normalized_nodes:
+        requested_nodes = validate_requested_target_nodes(req.target_nodes)
+        if not requested_nodes:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="target_nodes is required when action=custom_run.",
             )
-        if not validate_contiguous_nodes(normalized_nodes):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="target_nodes must be a contiguous workflow chain.",
-            )
-        if req.entry_point not in normalized_nodes:
+        if req.entry_point not in requested_nodes:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="entry_point must be included in target_nodes.",
             )
 
-        expected_entry = normalized_nodes[0]
+        expected_entry = requested_nodes[0]
         if req.entry_point != expected_entry:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -824,6 +846,7 @@ def submit_manual_review(
             )
 
         resume_node = req.entry_point
+        normalized_nodes = normalize_target_nodes(requested_nodes)
         target_nodes = normalized_nodes
         current_history["target_nodes"] = normalized_nodes
     else:
@@ -1612,4 +1635,6 @@ def admin_list_logs(task_id: str, db: Session = Depends(get_db)):
 # 在所有 API 路由之后挂载，确保 /api/* 优先匹配
 frontend_dist_path = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 if os.path.exists(frontend_dist_path):
-    app.mount("/", StaticFiles(directory=frontend_dist_path, html=True), name="frontend")
+    app.mount(
+        "/", StaticFiles(directory=frontend_dist_path, html=True), name="frontend"
+    )

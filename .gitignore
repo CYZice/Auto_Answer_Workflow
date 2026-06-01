@@ -32,6 +32,8 @@ build/
 *.swp
 .DS_Store
 *.log
+*.tar
+*.tar.gz
 
 backend/automation_logs
 backend/app/config/model_defaults.local.yaml

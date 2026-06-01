@@ -1,0 +1,17 @@
+solver_config:
+  model_name: gpt-5.4-high
+  api_key: sk-0iLJQ0ElEPacSiA30fqjjGbbCqPV246Jkhd9J0bRtFyUhlPD
+  base_url: https://yunwu.ai/v1
+  max_tokens: 4096
+reviewer_config:
+  model_name: gpt-5.4-high
+  api_key: sk-0iLJQ0ElEPacSiA30fqjjGbbCqPV246Jkhd9J0bRtFyUhlPD
+  base_url: https://yunwu.ai/v1
+  max_tokens: 2048
+formatter_config:
+  model_name: gpt-5.4-high
+  api_key: sk-0iLJQ0ElEPacSiA30fqjjGbbCqPV246Jkhd9J0bRtFyUhlPD
+  base_url: https://yunwu.ai/v1
+  max_tokens: 1024
+workflow_template_id: workflow_a
+draft_solution: null

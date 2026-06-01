@@ -43,6 +43,9 @@ class TaskCreateRequest(BaseModel):
     image_urls: Optional[List[str]] = Field(
         default=None, description="题目图片列表（单题多图）"
     )
+    question_text: Optional[str] = Field(
+        default=None, description="题目文本输入，可与图片并存，也可单独作为解题输入"
+    )
     solver_config: Optional[ModelConfig] = Field(
         default=None, description="Solver(解题)节点的大模型配置"
     )
@@ -59,7 +62,7 @@ class TaskCreateRequest(BaseModel):
         default="solver", description="自定义执行入口节点"
     )
     target_nodes: Optional[List[Literal["solver", "reviewer", "formatter"]]] = Field(
-        default=None, description="本次执行的节点集合，必须是有序连续子链"
+        default=None, description="本次执行的节点集合，必须符合工作流顺序"
     )
     draft_solution: Optional[str] = Field(
         default=None, description="当跳过Solver时，初始注入的草稿内容"
@@ -72,8 +75,9 @@ class TaskCreateRequest(BaseModel):
             isinstance(self.image_urls, list)
             and any(isinstance(item, str) and item.strip() for item in self.image_urls)
         )
-        if not has_single and not has_multi:
-            raise ValueError("image_url 或 image_urls 至少提供一个。")
+        has_question_text = bool((self.question_text or "").strip())
+        if not has_single and not has_multi and not has_question_text:
+            raise ValueError("image_url、image_urls、question_text 至少提供一个。")
         return self
 
 
@@ -91,7 +95,7 @@ class ManualSubmitRequest(BaseModel):
         default=None, description="自定义执行入口节点"
     )
     target_nodes: Optional[List[Literal["solver", "reviewer", "formatter"]]] = Field(
-        default=None, description="本次执行的节点集合，必须是有序连续子链"
+        default=None, description="本次执行的节点集合，必须符合工作流顺序"
     )
     solver_config: Optional[ModelConfig] = Field(
         default=None, description="重试时使用的 Solver 模型配置"

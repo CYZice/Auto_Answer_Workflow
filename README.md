@@ -70,6 +70,52 @@ npm install
 npm run dev
 ```
 
+### 5. Docker / 服务器部署（新增）
+项目根目录现已提供与线上一致的容器化文件：
+
+- `Dockerfile`
+- `docker-compose.yml`
+- `Makefile`
+- `scripts/build_image.sh`
+- `scripts/save_image.sh`
+- `scripts/upload_image.sh`
+- `scripts/deploy_remote.sh`
+
+关键点：
+
+- 镜像内已安装 `pandoc`，用于 DOCX 导出。
+- 本地 compose 与线上 `zyb_agent` 容器环境保持一致。
+
+本地构建与启动：
+
+```bash
+docker build -t zyb_agent:latest .
+APP_PORT=35828 docker compose up -d
+```
+
+导出镜像包：
+
+```bash
+make build
+make save
+```
+
+上传并部署到服务器：
+
+```bash
+SSH_PASSWORD='你的服务器密码' make upload
+SSH_PASSWORD='你的服务器密码' make deploy
+```
+
+等价脚本方式：
+
+```bash
+./scripts/build_image.sh
+./scripts/save_image.sh zyb_agent.tar.gz
+SSH_PASSWORD='你的服务器密码' ./scripts/upload_image.sh zyb_agent.tar.gz
+SSH_PASSWORD='你的服务器密码' ./scripts/deploy_remote.sh zyb_agent.tar.gz
+```
+
 ## 如何使用流水线？
 
 1. **访问看板**: 在浏览器中打开 `http://localhost:5173`。

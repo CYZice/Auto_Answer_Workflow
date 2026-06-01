@@ -6,6 +6,7 @@ MinerU API 路由
 
 import asyncio
 import json
+import logging
 import os
 import tempfile
 import uuid
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 import requests
-from fastapi import APIRouter, BackgroundTasks, UploadFile, File, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, UploadFile, File, HTTPException, Query, Header
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -25,9 +26,16 @@ from app.models.schemas import ModelConfig, TaskStatus
 from app.services.mineru_v4_service import get_mineru_v4_service, MineruV4Service
 
 router = APIRouter(prefix="/api/mineru", tags=["mineru"])
+logger = logging.getLogger(__name__)
 
 # v4 API 配置
 MINERU_V4_API_BASE = "https://mineru.net/api/v4"
+
+
+def _truncate_url(url: str, keep: int = 48) -> str:
+    if len(url) <= keep:
+        return url
+    return f"{url[:keep]}..."
 
 
 # === 请求/响应模型 ===
@@ -117,8 +125,18 @@ class PaperSolveResponse(BaseModel):
 # === 辅助函数 ===
 
 
-def get_v4_service() -> MineruV4Service:
+def get_v4_service(
+    api_token: Optional[str] = None,
+    api_base_url: Optional[str] = None,
+) -> MineruV4Service:
     """获取 MinerU v4 服务实例"""
+    normalized_token = (api_token or "").strip()
+    normalized_base_url = (api_base_url or "").strip()
+    if normalized_token or normalized_base_url:
+        return MineruV4Service(
+            api_token=normalized_token or None,
+            api_base_url=normalized_base_url or None,
+        )
     return get_mineru_v4_service()
 
 
@@ -192,17 +210,25 @@ def _create_question_task(
 
 @router.post("/parse/file", response_model=MineruParseResponse)
 async def parse_file(
-    file: UploadFile = File(..., description="试卷图片或 PDF 文件"),
+    file: UploadFile = File(..., description="document"),
+    x_mineru_api_token: Optional[str] = Header(default=None),
+    x_mineru_api_base_url: Optional[str] = Header(default=None),
 ):
     """
     后端代理上传文件到 OSS（解决浏览器跨域问题），返回 batch_id 供后续轮询
     """
-    service = get_v4_service()
+    service = get_v4_service(x_mineru_api_token, x_mineru_api_base_url)
 
     file_content = await file.read()
+    logger.info(
+        "[MinerU parse/file] start filename=%s size=%s api_base=%s",
+        file.filename or "document.pdf",
+        len(file_content),
+        service.api_base_url,
+    )
 
     # 1. 获取上传 URL
-    batch_url = f"{MINERU_V4_API_BASE}/file-urls/batch"
+    batch_url = f"{service.api_base_url}/file-urls/batch"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {service.api_token}",
@@ -212,25 +238,65 @@ async def parse_file(
         "model_version": "vlm",
     }
 
+    logger.info(
+        "[MinerU parse/file] requesting upload url endpoint=%s payload=%s",
+        batch_url,
+        data,
+    )
     resp = requests.post(batch_url, headers=headers, json=data, timeout=30)
+    logger.info(
+        "[MinerU parse/file] upload url response status=%s body=%s",
+        resp.status_code,
+        resp.text,
+    )
     result = resp.json()
 
     if result.get("code") != 0:
+        logger.error(
+            "[MinerU parse/file] request upload url failed code=%s msg=%s",
+            result.get("code"),
+            result.get("msg"),
+        )
         raise HTTPException(
             status_code=500, detail=f"获取上传链接失败: {result.get('msg')}"
         )
 
     batch_id = result["data"]["batch_id"]
     upload_url = result["data"]["file_urls"][0]
+    logger.info(
+        "[MinerU parse/file] upload url ready batch_id=%s upload_url=%s",
+        batch_id,
+        _truncate_url(upload_url),
+    )
 
     # 2. 后端代理上传到 OSS（避免浏览器跨域限制）
+    logger.info(
+        "[MinerU parse/file] uploading file to signed url batch_id=%s size=%s",
+        batch_id,
+        len(file_content),
+    )
     upload_resp = requests.put(upload_url, data=file_content, timeout=120)
+    logger.info(
+        "[MinerU parse/file] upload finished batch_id=%s status=%s",
+        batch_id,
+        upload_resp.status_code,
+    )
     if upload_resp.status_code not in (200, 201):
+        logger.error(
+            "[MinerU parse/file] upload failed batch_id=%s status=%s body=%s",
+            batch_id,
+            upload_resp.status_code,
+            upload_resp.text,
+        )
         raise HTTPException(
             status_code=500, detail=f"文件上传失败, HTTP {upload_resp.status_code}"
         )
 
     # 3. 返回 batch_id，前端轮询 /parse/{batch_id} 获取结果
+    logger.info(
+        "[MinerU parse/file] upload complete; according to MinerU v4 /file-urls/batch doc this batch should auto-submit after upload. batch_id=%s",
+        batch_id,
+    )
     return MineruParseResponse(
         mineru_task_id=batch_id,
         status="pending",
@@ -241,14 +307,16 @@ async def parse_file(
 @router.post("/parse/{batch_id}/upload", response_model=MineruParseResponse)
 async def upload_file(
     batch_id: str,
-    file: UploadFile = File(..., description="试卷图片或 PDF 文件"),
+    file: UploadFile = File(..., description="document"),
+    x_mineru_api_token: Optional[str] = Header(default=None),
+    x_mineru_api_base_url: Optional[str] = Header(default=None),
 ):
     """上传文件并提交解析任务"""
-    service = get_v4_service()
+    service = get_v4_service(x_mineru_api_token, x_mineru_api_base_url)
 
     file_content = await file.read()
 
-    batch_url = f"{MINERU_V4_API_BASE}/file-urls/batch"
+    batch_url = f"{service.api_base_url}/file-urls/batch"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {service.api_token}",
@@ -275,7 +343,7 @@ async def upload_file(
         )
 
     # 轮询等待解析完成
-    result_url = f"{MINERU_V4_API_BASE}/extract-results/batch/{batch_id}"
+    result_url = f"{service.api_base_url}/extract-results/batch/{batch_id}"
 
     import time
 
@@ -308,9 +376,13 @@ async def upload_file(
 
 
 @router.post("/parse/url", response_model=MineruParseResponse)
-async def parse_url(request: MineruParseUrlRequest):
+async def parse_url(
+    request: MineruParseUrlRequest,
+    x_mineru_api_token: Optional[str] = Header(default=None),
+    x_mineru_api_base_url: Optional[str] = Header(default=None),
+):
     """URL 解析"""
-    service = get_v4_service()
+    service = get_v4_service(x_mineru_api_token, x_mineru_api_base_url)
 
     try:
         mineru_task_id = await service.parse_url(
@@ -328,15 +400,31 @@ async def parse_url(request: MineruParseUrlRequest):
 
 
 @router.get("/parse/{task_id}", response_model=MineruParseResultResponse)
-async def get_parse_result(task_id: str):
+async def get_parse_result(
+    task_id: str,
+    x_mineru_api_token: Optional[str] = Header(default=None),
+    x_mineru_api_base_url: Optional[str] = Header(default=None),
+):
     """查询解析结果（批量文件方式）"""
-    service = get_v4_service()
+    service = get_v4_service(x_mineru_api_token, x_mineru_api_base_url)
+    logger.info(
+        "[MinerU parse/result] polling batch_id=%s api_base=%s",
+        task_id,
+        service.api_base_url,
+    )
 
     try:
         result = await service.get_batch_result(task_id)
-        print(f"[DEBUG get_parse_result] task_id={task_id}, result.status={result.status}, result.full_zip_url={result.full_zip_url}, result.extract_progress={result.extract_progress}")
+        logger.info(
+            "[MinerU parse/result] batch_id=%s status=%s zip=%s progress=%s error=%s",
+            task_id,
+            result.status,
+            _truncate_url(result.full_zip_url) if result.full_zip_url else None,
+            result.extract_progress,
+            result.error_msg,
+        )
     except Exception as e:
-        print(f"[DEBUG get_parse_result] error: {e}")
+        logger.exception("[MinerU parse/result] poll failed batch_id=%s", task_id)
         raise HTTPException(status_code=500, detail=str(e))
 
     return MineruParseResultResponse(
@@ -353,9 +441,11 @@ async def wait_parse_completion(
     task_id: str,
     poll_interval: Optional[float] = Query(default=3.0),
     max_wait: Optional[float] = Query(default=600.0),
+    x_mineru_api_token: Optional[str] = Header(default=None),
+    x_mineru_api_base_url: Optional[str] = Header(default=None),
 ):
     """等待解析完成（批量文件方式）"""
-    service = get_v4_service()
+    service = get_v4_service(x_mineru_api_token, x_mineru_api_base_url)
 
     try:
         result = await service.wait_for_batch_completion(
@@ -393,6 +483,8 @@ async def solve_paper(
     mineru_task_id: str,
     request: PaperSolveRequest,
     background_tasks: BackgroundTasks,
+    x_mineru_api_token: Optional[str] = Header(default=None),
+    x_mineru_api_base_url: Optional[str] = Header(default=None),
 ):
     """
     解析试卷并自动开始解题
@@ -403,7 +495,7 @@ async def solve_paper(
     3. 为每道题创建独立任务（复用现有工作流）
     4. 用户在主界面可看到解题过程（与手动解题完全相同）
     """
-    service = get_v4_service()
+    service = get_v4_service(x_mineru_api_token, x_mineru_api_base_url)
 
     # 获取 MinerU 解析结果
     result = await service.wait_for_batch_completion(mineru_task_id, max_wait=600.0)
@@ -725,9 +817,13 @@ async def export_paper_docx(
 
 
 @router.get("/paper/{mineru_task_id}/questions")
-async def get_paper_questions(mineru_task_id: str):
+async def get_paper_questions(
+    mineru_task_id: str,
+    x_mineru_api_token: Optional[str] = Header(default=None),
+    x_mineru_api_base_url: Optional[str] = Header(default=None),
+):
     """获取试卷题目列表"""
-    service = get_v4_service()
+    service = get_v4_service(x_mineru_api_token, x_mineru_api_base_url)
 
     result = await service.wait_for_batch_completion(mineru_task_id, max_wait=600.0)
 

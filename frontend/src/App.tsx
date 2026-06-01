@@ -13,6 +13,19 @@ const api = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || '',
 })
 
+api.interceptors.request.use((config) => {
+  const mineruApiToken = (localStorage.getItem(MINERU_API_TOKEN_STORAGE_KEY) || '').trim()
+  const mineruApiBaseUrl = (localStorage.getItem(MINERU_API_BASE_URL_STORAGE_KEY) || '').trim()
+  config.headers = config.headers ?? {}
+  if (mineruApiToken) {
+    config.headers['X-Mineru-Api-Token'] = mineruApiToken
+  }
+  if (mineruApiBaseUrl) {
+    config.headers['X-Mineru-Api-Base-Url'] = mineruApiBaseUrl
+  }
+  return config
+})
+
 const RUNNING_TASK_STATES = ['queued', 'solving', 'reviewing', 'formatting']
 const EXCEPTION_TASK_STATES = ['failed', 'manual', 'cancelled']
 const SUBMITTED_TASKS_STORAGE_KEY = 'submitted_tasks'
@@ -22,6 +35,8 @@ const REVIEWER_CONFIG_STORAGE_KEY = 'reviewer_config'
 const FORMATTER_CONFIG_STORAGE_KEY = 'formatter_config'
 const SHARED_BASE_URL_STORAGE_KEY = 'shared_base_url'
 const SHARED_API_KEY_STORAGE_KEY = 'shared_api_key'
+const MINERU_API_BASE_URL_STORAGE_KEY = 'mineru_api_base_url'
+const MINERU_API_TOKEN_STORAGE_KEY = 'mineru_api_token'
 const WORKFLOW_TEMPLATE_ID_STORAGE_KEY = 'workflow_template_id'
 const INPUT_SELECTED_NODES_STORAGE_KEY = 'input_selected_nodes'
 const WORKFLOW_NODE_ORDER = ['solver', 'reviewer', 'formatter'] as const
@@ -175,6 +190,8 @@ interface SettingsSnapshot {
   formatterConfig: ModelConfig;
   sharedBaseUrl: string;
   sharedApiKey: string;
+  mineruApiBaseUrl: string;
+  mineruApiToken: string;
   activeTemplateId: string;
   requestTimeoutSeconds: number;
   maxRetries: number;
@@ -316,6 +333,12 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     const formatterSaved = readStoredJson<ModelConfig>(FORMATTER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 1024 })
     return (solverSaved.api_key || reviewerSaved.api_key || formatterSaved.api_key || '').trim()
   })
+  const [mineruApiBaseUrl, setMineruApiBaseUrl] = useState<string>(() => (
+    localStorage.getItem(MINERU_API_BASE_URL_STORAGE_KEY) || ''
+  ))
+  const [mineruApiToken, setMineruApiToken] = useState<string>(() => (
+    localStorage.getItem(MINERU_API_TOKEN_STORAGE_KEY) || ''
+  ))
   const [runtimeLoading, setRuntimeLoading] = useState(false)
   const [runtimeError, setRuntimeError] = useState<string | null>(null)
   const [activeTemplateId, setActiveTemplateId] = useState<string>(() => localStorage.getItem(WORKFLOW_TEMPLATE_ID_STORAGE_KEY) || 'workflow_a')
@@ -343,6 +366,8 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     formatterConfig,
     sharedBaseUrl,
     sharedApiKey,
+    mineruApiBaseUrl,
+    mineruApiToken,
     activeTemplateId,
     requestTimeoutSeconds,
     maxRetries,
@@ -421,8 +446,12 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       setFormatterUserPrompt(detail.prompts?.formatter?.user || '')
       const nextSharedBaseUrl = (localStorage.getItem(SHARED_BASE_URL_STORAGE_KEY) || solverConfig.base_url || reviewerConfig.base_url || formatterConfig.base_url || '').trim()
       const nextSharedApiKey = (localStorage.getItem(SHARED_API_KEY_STORAGE_KEY) || solverConfig.api_key || reviewerConfig.api_key || formatterConfig.api_key || '').trim()
+      const nextMineruApiBaseUrl = (localStorage.getItem(MINERU_API_BASE_URL_STORAGE_KEY) || '').trim()
+      const nextMineruApiToken = (localStorage.getItem(MINERU_API_TOKEN_STORAGE_KEY) || '').trim()
       setSharedBaseUrl(nextSharedBaseUrl)
       setSharedApiKey(nextSharedApiKey)
+      setMineruApiBaseUrl(nextMineruApiBaseUrl)
+      setMineruApiToken(nextMineruApiToken)
 
       const baseline = toSettingsSnapshotString({
         solverConfig,
@@ -430,6 +459,8 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         formatterConfig,
         sharedBaseUrl: nextSharedBaseUrl,
         sharedApiKey: nextSharedApiKey,
+        mineruApiBaseUrl: nextMineruApiBaseUrl,
+        mineruApiToken: nextMineruApiToken,
         activeTemplateId: pickedTemplateId,
         requestTimeoutSeconds: runtime.request_timeout_seconds || 300,
         maxRetries: runtime.max_retries ?? 2,
@@ -463,6 +494,8 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     localStorage.setItem(FORMATTER_CONFIG_STORAGE_KEY, JSON.stringify({ ...formatterConfig, base_url: '', api_key: '' }))
     localStorage.setItem(SHARED_BASE_URL_STORAGE_KEY, sharedBaseUrl.trim())
     localStorage.setItem(SHARED_API_KEY_STORAGE_KEY, sharedApiKey.trim())
+    localStorage.setItem(MINERU_API_BASE_URL_STORAGE_KEY, mineruApiBaseUrl.trim())
+    localStorage.setItem(MINERU_API_TOKEN_STORAGE_KEY, mineruApiToken.trim())
     localStorage.setItem(WORKFLOW_TEMPLATE_ID_STORAGE_KEY, activeTemplateId)
 
     try {
@@ -643,7 +676,12 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
 
   const { data: activeTasksFromDb } = useQuery({
     queryKey: ['dashboard-active-tasks'],
-    queryFn: () => api.get<AdminTask[]>('/api/tasks/active/list').then((res) => res.data),
+    queryFn: async () => {
+      const res = await api.get<AdminTask[] | { items?: AdminTask[] }>('/api/tasks/active/list')
+      if (Array.isArray(res.data)) return res.data
+      if (Array.isArray(res.data?.items)) return res.data.items
+      return []
+    },
     refetchInterval: 3000,
   })
 
@@ -652,7 +690,7 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     submittedTasks.forEach((task) => {
       if (task.taskId.trim().length > 0) ids.add(task.taskId)
     })
-      ; (activeTasksFromDb || []).forEach((task) => {
+      ; (Array.isArray(activeTasksFromDb) ? activeTasksFromDb : []).forEach((task) => {
         if (task?.task_id) ids.add(task.task_id)
       })
     return Array.from(ids)
@@ -1187,6 +1225,26 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
                   </div>
                 </div>
                 <div className="grid grid-cols-1 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">MinerU Base URL</label>
+                    <input
+                      type="text"
+                      value={mineruApiBaseUrl}
+                      onChange={(e) => setMineruApiBaseUrl(e.target.value)}
+                      placeholder="https://mineru.net/api/v4"
+                      className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-amber-500 outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">MinerU API Token</label>
+                    <input
+                      type="password"
+                      value={mineruApiToken}
+                      onChange={(e) => setMineruApiToken(e.target.value)}
+                      placeholder="mtk-..."
+                      className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-amber-500 outline-none"
+                    />
+                  </div>
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">共享 Base URL</label>
                     <input
@@ -3521,10 +3579,11 @@ interface PaperSolveStatusResponse {
   results: QuestionSolveStatus[];
 }
 
-type ParseStage = 'idle' | 'uploading' | 'waiting' | 'parsing' | 'done' | 'error';
+type ParseStage = 'idle' | 'uploading' | 'waiting' | 'parsing' | 'stopped' | 'done' | 'error';
 type SolveProgress = 'idle' | 'solving' | 'completed' | 'error';
 
 function SmartPaperParser({ onBack }: { onBack: () => void }) {
+  const parseSessionRef = useRef(0)
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [previewUrl, setPreviewUrl] = useState<string | null>(
     sessionStorage.getItem('smartParser_preview')
@@ -3595,7 +3654,7 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
 
   const rebuildGroupedQuestions = (nextQuestions: ParsedQuestion[]) => {
     return nextQuestions.reduce<Record<string, Array<{ number: number; content: string }>>>((acc, question) => {
-      const type = (question.type || '').trim() || '未分类'
+      const type = (question.type || '').trim() || 'Uncategorized'
       if (!acc[type]) {
         acc[type] = []
       }
@@ -3603,25 +3662,101 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
         number: question.number,
         content: question.content,
       })
+      acc[type].sort((a, b) => a.number - b.number)
       return acc
     }, {})
   }
 
-  const updateEditableQuestion = (number: number, patch: Partial<ParsedQuestion>) => {
+  const replaceEditableQuestions = (updater: (prev: ParsedQuestion[]) => ParsedQuestion[]) => {
     setEditableQuestions((prev) => {
-      const next = prev.map((question) => {
-        if (question.number !== number) return question
-        const nextType = patch.type !== undefined ? patch.type : question.type
-        const nextContent = patch.content !== undefined ? patch.content : question.content
-        return {
-          ...question,
-          ...patch,
-          type: nextType,
-          content: nextContent,
-        }
-      })
+      const next = updater(prev)
       setGroupedQuestions(rebuildGroupedQuestions(next))
       return next
+    })
+  }
+
+  const updateEditableQuestion = (number: number, patch: Partial<ParsedQuestion>) => {
+    replaceEditableQuestions((prev) => prev.map((question) => {
+      if (question.number !== number) return question
+      const nextType = patch.type !== undefined ? patch.type : question.type
+      const nextContent = patch.content !== undefined ? patch.content : question.content
+      return {
+        ...question,
+        ...patch,
+        type: nextType,
+        content: nextContent,
+      }
+    }))
+  }
+
+  const addEditableQuestion = () => {
+    replaceEditableQuestions((prev) => {
+      const nextNumber = prev.reduce((max, question) => Math.max(max, question.number), 0) + 1
+      return [...prev, { number: nextNumber, type: '', content: '', images: [] }]
+    })
+  }
+
+  const deleteEditableQuestion = (number: number) => {
+    replaceEditableQuestions((prev) => prev.filter((question) => question.number !== number))
+  }
+
+  const sortEditableQuestions = () => {
+    replaceEditableQuestions((prev) => [...prev].sort((a, b) => a.number - b.number))
+  }
+
+  const moveQuestionByOffset = (number: number, offset: -1 | 1) => {
+    replaceEditableQuestions((prev) => {
+      const sorted = [...prev].sort((a, b) => a.number - b.number)
+      const currentIndex = sorted.findIndex((question) => question.number === number)
+      const targetIndex = currentIndex + offset
+      if (currentIndex < 0 || targetIndex < 0 || targetIndex >= sorted.length) {
+        return prev
+      }
+      const currentQuestion = sorted[currentIndex]
+      const targetQuestion = sorted[targetIndex]
+      return prev.map((question) => {
+        if (question.number === currentQuestion.number) {
+          return { ...question, number: targetQuestion.number }
+        }
+        if (question.number === targetQuestion.number) {
+          return { ...question, number: currentQuestion.number }
+        }
+        return question
+      })
+    })
+  }
+
+  const moveImageToQuestion = (sourceNumber: number, imageUrl: string, targetNumber: number) => {
+    if (sourceNumber === targetNumber) return
+    replaceEditableQuestions((prev) => {
+      if (!prev.some((question) => question.number === targetNumber)) {
+        return prev
+      }
+      return prev.map((question) => {
+        if (question.number === sourceNumber) {
+          return {
+            ...question,
+            images: (question.images || []).filter((image) => image !== imageUrl),
+          }
+        }
+        if (question.number === targetNumber) {
+          const nextImages = question.images || []
+          if (nextImages.includes(imageUrl)) {
+            return question
+          }
+          return {
+            ...question,
+            images: [...nextImages, imageUrl],
+          }
+        }
+        return question
+      })
+    })
+  }
+
+  const removeQuestionImage = (number: number, imageUrl: string) => {
+    updateEditableQuestion(number, {
+      images: (editableQuestions.find((question) => question.number === number)?.images || []).filter((image) => image !== imageUrl),
     })
   }
 
@@ -3679,6 +3814,12 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  useEffect(() => {
+    return () => {
+      parseSessionRef.current += 1
+    }
+  }, [])
+
   const handleFileSelect = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (file) {
@@ -3699,8 +3840,17 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
     }
   }
 
+  const handleStopParse = () => {
+    parseSessionRef.current += 1
+    setParseStage('stopped')
+    setParseProgress(null)
+    setErrorMessage('Stopped manually')
+  }
+
   const handleParse = async () => {
     if (!selectedFile) return
+    const sessionId = parseSessionRef.current + 1
+    setErrorMessage('Stopped manually')
 
     setParseStage('uploading')
     setErrorMessage(null)
@@ -3715,6 +3865,7 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
         formData,
         { headers: { 'Content-Type': 'multipart/form-data' } }
       )
+      if (parseSessionRef.current !== sessionId) return
       const batch_id = parseRes.data.mineru_task_id
       setBatchId(batch_id)
 
@@ -3726,9 +3877,11 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
 
       while (Date.now() - startTime < maxWait) {
         await new Promise(resolve => setTimeout(resolve, 3000))
+        if (parseSessionRef.current !== sessionId) return
 
         try {
           const resultRes = await api.get<MineruParseResultResponse>(`/api/mineru/parse/${batch_id}`)
+          if (parseSessionRef.current !== sessionId) return
           const result = resultRes.data
 
           console.log('[DEBUG parse polling] batch_id:', batch_id, 'status:', result.status, 'extract_progress:', result.extract_progress)
@@ -3750,6 +3903,7 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
             try {
               console.log('[DEBUG parse polling] fetching questions from:', `/api/mineru/paper/${batch_id}/questions`)
               const questionsRes = await api.get<ParsedQuestionsResponse>(`/api/mineru/paper/${batch_id}/questions`)
+              if (parseSessionRef.current !== sessionId) return
               const parsedQuestions = questionsRes.data.questions || []
               console.log('[DEBUG parse polling] got questions:', parsedQuestions.length)
               setQuestions(parsedQuestions)
@@ -3777,6 +3931,7 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
 
       throw new Error('解析超时')
     } catch (err) {
+      if (parseSessionRef.current !== sessionId) return
       setErrorMessage(getErrorMessage(err, '解析失败'))
       setParseStage('error')
     }
@@ -4056,6 +4211,8 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
         return <span className="text-blue-600">解析中...</span>
       case 'done':
         return <span className="text-green-600">解析完成</span>
+      case 'stopped':
+        return <span className="text-amber-600">Stopped manually</span>
       case 'error':
         return <span className="text-red-600">解析失败</span>
     }
@@ -4069,7 +4226,7 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
           onClick={onBack}
           className="px-4 py-2 text-sm text-gray-600 hover:text-gray-800"
         >
-          返回工作台
+        return <span className="text-amber-600">Stopped manually</span>
         </button>
       </div>
 
@@ -4113,6 +4270,7 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
           <div className="mt-4 flex items-center gap-2">
             <div className={`w-3 h-3 rounded-full ${parseStage === 'idle' ? 'bg-gray-300' :
               parseStage === 'done' ? 'bg-green-500' :
+                parseStage === 'stopped' ? 'bg-amber-500' :
                 parseStage === 'error' ? 'bg-red-500' :
                   'bg-blue-500 animate-pulse'
               }`} />
@@ -4122,7 +4280,7 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
           <div className="mt-4 flex gap-2">
             <button
               onClick={handleParse}
-              disabled={!selectedFile || !['idle', 'done', 'error'].includes(parseStage)}
+              disabled={!selectedFile || !['idle', 'done', 'error', 'stopped'].includes(parseStage)}
               className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
             >
               {['uploading', 'waiting', 'parsing'].includes(parseStage) ? (
@@ -4131,6 +4289,14 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
                 <>开始解析</>
               )}
             </button>
+            {['uploading', 'waiting', 'parsing'].includes(parseStage) && (
+              <button
+                onClick={handleStopParse}
+                className="px-4 py-2 bg-amber-100 text-amber-700 rounded-lg hover:bg-amber-200 text-sm"
+              >
+                Stop parse
+              </button>
+            )}
           </div>
 
           {batchId && (
@@ -4161,6 +4327,22 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
             </div>
           )}
 
+          {questions.length > 0 && solveProgress === 'idle' && (
+            <div className="mb-3 flex flex-wrap gap-2">
+              <button
+                onClick={addEditableQuestion}
+                className="px-3 py-2 text-xs border border-gray-300 rounded hover:bg-gray-50"
+              >
+                Add question
+              </button>
+              <button
+                onClick={sortEditableQuestions}
+                className="px-3 py-2 text-xs border border-gray-300 rounded hover:bg-gray-50"
+              >
+                Sort by number
+              </button>
+            </div>
+          )}
           {questions.length > 0 && (
             <div className="space-y-4 max-h-[calc(100vh-320px)] overflow-y-auto">
               {Object.entries(groupedQuestions).map(([type, qs]) => (
@@ -4200,7 +4382,14 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
                               onChange={handleToggle}
                             />
                             <div className={`w-2 h-2 rounded-full ${statusColor}`} />
-                            <span className="font-medium">第{q.number}题</span>
+                            <span className="font-medium">Q{q.number}</span>
+                            {canEditBeforeSolve && (
+                              <div className="ml-auto flex items-center gap-1">
+                                <button type="button" onClick={() => moveQuestionByOffset(q.number, -1)} className="px-2 py-1 text-[11px] border rounded hover:bg-white">Up</button>
+                                <button type="button" onClick={() => moveQuestionByOffset(q.number, 1)} className="px-2 py-1 text-[11px] border rounded hover:bg-white">Down</button>
+                                <button type="button" onClick={() => deleteEditableQuestion(q.number)} className="px-2 py-1 text-[11px] border border-red-200 text-red-600 rounded hover:bg-red-50">Delete</button>
+                              </div>
+                            )}
                             {status && (
                               <span className="text-xs text-gray-500 ml-auto">
                                 {status.status === 'completed' ? '完成' :
@@ -4216,20 +4405,58 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
                           </div>
 
                           <div className="grid grid-cols-1 gap-2">
-                            <input
-                              value={editable?.type || ''}
-                              disabled={!canEditBeforeSolve}
-                              onChange={(event) => updateEditableQuestion(q.number, { type: event.target.value })}
-                              placeholder="题型（可编辑）"
-                              className="w-full rounded border border-gray-300 px-2 py-1 text-xs disabled:bg-gray-100"
-                            />
+                            <div className="grid grid-cols-3 gap-2">
+                              <input
+                                type="number"
+                                value={editable?.number ?? q.number}
+                                disabled={!canEditBeforeSolve}
+                                onChange={(event) => updateEditableQuestion(q.number, { number: parseInt(event.target.value || '0', 10) || q.number })}
+                                placeholder="No."
+                                className="w-full rounded border border-gray-300 px-2 py-1 text-xs disabled:bg-gray-100"
+                              />
+                              <input
+                                value={editable?.type || ''}
+                                disabled={!canEditBeforeSolve}
+                                onChange={(event) => updateEditableQuestion(q.number, { type: event.target.value })}
+                                placeholder="Type"
+                                className="col-span-2 w-full rounded border border-gray-300 px-2 py-1 text-xs disabled:bg-gray-100"
+                              />
+                            </div>
                             <textarea
                               value={editable?.content || ''}
                               disabled={!canEditBeforeSolve}
                               onChange={(event) => updateEditableQuestion(q.number, { content: event.target.value })}
-                              placeholder="题目文本（可编辑）"
+                              placeholder="Question text"
                               className="w-full min-h-16 rounded border border-gray-300 px-2 py-1 text-xs disabled:bg-gray-100"
                             />
+                            {(editable?.images || []).length > 0 && (
+                              <div className="space-y-2">
+                                <div className="text-[11px] text-gray-500">Image review</div>
+                                <div className="grid grid-cols-2 gap-2">
+                                  {(editable?.images || []).map((imageUrl, imageIndex) => (
+                                    <div key={`${q.number}-${imageIndex}`} className="rounded border border-gray-200 bg-white p-2 space-y-2">
+                                      <img src={imageUrl} alt={`question-${q.number}-${imageIndex + 1}`} className="h-24 w-full rounded object-contain bg-gray-50" />
+                                      {canEditBeforeSolve && (
+                                        <div className="flex flex-wrap gap-1">
+                                          <button type="button" onClick={() => {
+                                            const raw = window.prompt('Target question number', String(q.number + 1))
+                                            if (!raw) return
+                                            const targetNumber = parseInt(raw, 10)
+                                            if (Number.isNaN(targetNumber)) {
+                                              setErrorMessage('Target question number must be numeric')
+                                              return
+                                            }
+                                            setErrorMessage(null)
+                                            moveImageToQuestion(q.number, imageUrl, targetNumber)
+                                          }} className="px-2 py-1 text-[11px] border rounded hover:bg-gray-50">Move</button>
+                                          <button type="button" onClick={() => removeQuestionImage(q.number, imageUrl)} className="px-2 py-1 text-[11px] border border-red-200 text-red-600 rounded hover:bg-red-50">Remove</button>
+                                        </div>
+                                      )}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
                           </div>
                         </div>
                       )
@@ -4245,7 +4472,7 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
               <button
                 onClick={() => {
                   // 全选/取消全选：检查是否所有题目都被选中
-                  const allSelected = questions.every((q) => selectedTaskIds.includes(`number:${q.number}`))
+                  const allSelected = editableQuestions.every((q) => selectedTaskIds.includes(`number:${q.number}`))
                   if (allSelected) {
                     // 取消全选：移除所有 number:X 格式的勾选
                     setSelectedTaskIds((prev) => prev.filter((id) => !id.startsWith('number:')))
@@ -4253,13 +4480,13 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
                     // 全选：添加所有题号为勾选状态
                     setSelectedTaskIds((prev) => {
                       const withoutNumbers = prev.filter((id) => !id.startsWith('number:'))
-                      return [...withoutNumbers, ...questions.map((q) => `number:${q.number}`)]
+                      return [...withoutNumbers, ...editableQuestions.map((q) => `number:${q.number}`)]
                     })
                   }
                 }}
                 className="px-3 py-2 text-xs border border-gray-300 rounded hover:bg-gray-50"
               >
-                {questions.every((q) => selectedTaskIds.includes(`number:${q.number}`))
+                {editableQuestions.every((q) => selectedTaskIds.includes(`number:${q.number}`))
                   ? '取消全选'
                   : '全选'}
               </button>

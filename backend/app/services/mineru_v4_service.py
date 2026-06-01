@@ -5,6 +5,7 @@ MinerU 精准解析 API v4 服务
 需要 Token 认证，每天 2000 页高优先级额度
 """
 import asyncio
+import logging
 import os
 import tempfile
 import time
@@ -15,6 +16,7 @@ from typing import Optional
 import requests
 
 MINERU_V4_API_BASE = "https://mineru.net/api/v4"
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,7 @@ class MineruV4Service:
     def __init__(
         self,
         api_token: Optional[str] = None,
+        api_base_url: Optional[str] = None,
         poll_interval: float = 3.0,
         max_wait: float = 600.0,
     ):
@@ -50,6 +53,10 @@ class MineruV4Service:
         self.api_token = api_token or os.environ.get("MINERU_API_TOKEN", "")
         if not self.api_token:
             raise ValueError("MINERU_API_TOKEN 环境变量未设置")
+        self.api_base_url = (
+            (api_base_url or os.environ.get("MINERU_API_BASE_URL", "")).strip()
+            or MINERU_V4_API_BASE
+        )
         self.poll_interval = poll_interval
         self.max_wait = max_wait
 
@@ -76,7 +83,7 @@ class MineruV4Service:
             task_id
         """
         resp = requests.post(
-            f"{MINERU_V4_API_BASE}/extract/task",
+            f"{self.api_base_url}/extract/task",
             headers=self._get_headers(),
             json={"url": url, "model_version": model_version},
             timeout=30,
@@ -97,7 +104,7 @@ class MineruV4Service:
             MineruV4ParseResult
         """
         resp = requests.get(
-            f"{MINERU_V4_API_BASE}/extract/task/{task_id}",
+            f"{self.api_base_url}/extract/task/{task_id}",
             headers=self._get_headers(),
             timeout=30,
         )
@@ -125,17 +132,42 @@ class MineruV4Service:
         Returns:
             MineruV4ParseResult
         """
+        endpoint = f"{self.api_base_url}/extract-results/batch/{batch_id}"
+        logger.info(
+            "[MinerU v4] querying batch result endpoint=%s batch_id=%s",
+            endpoint,
+            batch_id,
+        )
         resp = requests.get(
-            f"{MINERU_V4_API_BASE}/extract-results/batch/{batch_id}",
+            endpoint,
             headers=self._get_headers(),
             timeout=30,
         )
+        logger.info(
+            "[MinerU v4] batch result http_status=%s batch_id=%s body=%s",
+            resp.status_code,
+            batch_id,
+            resp.text,
+        )
         result = resp.json()
         if result.get("code") != 0:
+            logger.error(
+                "[MinerU v4] batch result api error batch_id=%s code=%s msg=%s",
+                batch_id,
+                result.get("code"),
+                result.get("msg"),
+            )
             raise ValueError(f"MinerU v4 批量查询失败: {result.get('msg')}")
 
         data = result["data"]["extract_result"][0]
-        print(f"[DEBUG get_batch_result] batch_id={batch_id}, raw_data={data}")
+        logger.info(
+            "[MinerU v4] batch result parsed batch_id=%s state=%s progress=%s zip=%s error=%s",
+            batch_id,
+            data.get("state"),
+            data.get("extract_progress"),
+            data.get("full_zip_url"),
+            data.get("err_msg"),
+        )
         return MineruV4ParseResult(
             task_id=batch_id,
             status=data["state"],

@@ -1,11 +1,16 @@
-import sqlite3
 import logging
+import os
+import sqlite3
+from pathlib import Path
+
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 logger = logging.getLogger(__name__)
 
-SQLALCHEMY_DATABASE_URL = "sqlite:///./agent_tasks.db"
+DEFAULT_DB_PATH = Path(os.getenv("AGENT_DB_PATH", "/app/data/agent_tasks.db")).resolve()
+DEFAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+SQLALCHEMY_DATABASE_URL = f"sqlite:///{DEFAULT_DB_PATH.as_posix()}"
 
 def _fk_pragma_on_connect(dbapi_con, con_record):
     """

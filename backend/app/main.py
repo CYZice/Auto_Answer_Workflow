@@ -22,6 +22,8 @@ import zipfile
 import xml.etree.ElementTree as ET
 import subprocess
 import tempfile
+import shutil
+from pathlib import Path
 from dotenv import load_dotenv
 
 # 加载 .env 环境变量
@@ -77,6 +79,32 @@ graph_apps = {node: build_graph(node) for node in VALID_RESUME_NODES}
 PAPER_BUILDER_DRAFTS_PATH = os.path.join(
     os.path.dirname(__file__), "config", "paper_builder_drafts.json"
 )
+LEGACY_DB_PATH = Path("/app/agent_tasks.db")
+LEGACY_DB_WAL_PATH = Path("/app/agent_tasks.db-wal")
+LEGACY_DB_SHM_PATH = Path("/app/agent_tasks.db-shm")
+
+
+def migrate_legacy_sqlite_db() -> None:
+    current_db_url = str(engine.url)
+    if not current_db_url.startswith("sqlite:///"):
+        return
+
+    target_db_path = Path(current_db_url.replace("sqlite:///", "", 1))
+    target_db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if target_db_path.exists() or not LEGACY_DB_PATH.exists():
+        return
+
+    logger_text = f"[DB] Migrating legacy SQLite database from {LEGACY_DB_PATH} to {target_db_path}"
+    print(logger_text)
+    shutil.copy2(LEGACY_DB_PATH, target_db_path)
+
+    wal_target = Path(f"{target_db_path}-wal")
+    shm_target = Path(f"{target_db_path}-shm")
+    if LEGACY_DB_WAL_PATH.exists():
+        shutil.copy2(LEGACY_DB_WAL_PATH, wal_target)
+    if LEGACY_DB_SHM_PATH.exists():
+        shutil.copy2(LEGACY_DB_SHM_PATH, shm_target)
 
 
 def load_paper_builder_drafts_store() -> dict:
@@ -466,6 +494,7 @@ async def run_agent_workflow_async(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    migrate_legacy_sqlite_db()
     Base.metadata.create_all(bind=engine)
     ensure_task_preview_columns()
     yield

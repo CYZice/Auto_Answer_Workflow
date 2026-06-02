@@ -165,20 +165,22 @@ async def review_node(state: AgentState) -> AgentState:
         reviewer_config = agent_configs.get("reviewer") or {}
         reviewer_runtime_config = dict(reviewer_config)
         reviewer_runtime_config["streaming"] = False
+        llm = get_llm(reviewer_runtime_config)
         workflow_template_id = state.get("workflow_template_id")
 
         from app.agent.nodes.llm_client import (
-            get_llm,
             call_with_retry_and_fallback,
             get_runtime_request_settings,
         )
 
         def create_structured_llm(config):
-            llm = get_llm(config)
+            structured_llm = get_llm(config)
             try:
-                return llm.with_structured_output(ReviewDecision, include_raw=True)
+                return structured_llm.with_structured_output(
+                    ReviewDecision, include_raw=True
+                )
             except TypeError:
-                return llm.with_structured_output(ReviewDecision)
+                return structured_llm.with_structured_output(ReviewDecision)
 
         prompt_bundle = get_prompt_bundle("reviewer", workflow_template_id)
         sys_prompt = prompt_bundle.get("system") or (
@@ -316,6 +318,7 @@ async def review_node(state: AgentState) -> AgentState:
         from app.agent.nodes.llm_client import log_agent_interaction
         import asyncio
 
+        recovered = None
         if raw_response_text is None and llm is not None:
             try:
                 fallback_response = await llm.ainvoke(messages)
@@ -335,8 +338,24 @@ async def review_node(state: AgentState) -> AgentState:
                 review_tokens = coerce_token_count(
                     fallback_token_usage.get("total_tokens"), review_tokens
                 )
+                recovered = recover_decision_from_text(raw_response_text)
             except Exception as fallback_error:
                 raw_response_text = f"__RAW_RESPONSE_UNAVAILABLE__: {fallback_error}"
+        elif raw_response_text is not None:
+            recovered = recover_decision_from_text(raw_response_text)
+        if recovered is not None:
+            decision = "PASS" if recovered.is_pass else "FAIL"
+            feedback = recovered.feedback if not recovered.is_pass else None
+            print(
+                f"  [Reviewer Recovery] Decision: {decision}, Feedback: {feedback}"
+            )
+            return {
+                **state,
+                "review_decision": decision,
+                "review_feedback": feedback,
+                "total_tokens": coerce_token_count(state.get("total_tokens"), 0)
+                + coerce_token_count(review_tokens, 0),
+            }
         if raw_response_text is None:
             raw_response_text = "__RAW_RESPONSE_UNAVAILABLE__"
         asyncio.create_task(

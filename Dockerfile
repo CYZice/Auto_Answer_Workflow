@@ -16,7 +16,11 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # 安装 Word 渲染、PDF 文本坐标和页面截图依赖
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i \
+    -e 's|deb.debian.org/debian-security|mirrors.aliyun.com/debian-security|g' \
+    -e 's|deb.debian.org/debian|mirrors.aliyun.com/debian|g' \
+    /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
     curl \
     pandoc \
     libreoffice-writer \

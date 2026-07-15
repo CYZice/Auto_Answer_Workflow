@@ -99,7 +99,7 @@ APP_PORT=35828 docker compose up -d
 
 目标系统工作台只负责同步待接题、抢题、导入题图、启动普通解题工作流和展示完整最终答案。答案填写、识别录入、考点填写和最终提交均由你在目标系统网页中手动完成。
 
-`target_system_worker` 已移入 Docker Compose 的可选 `browser-delivery` profile，默认 `docker compose up -d` 不会启动它，也不会打开或操作目标系统浏览器。
+生产部署不包含 Chromium、VNC 或浏览器交付工作器。目标系统的答案填写、识别录入、考点填写和最终提交均在你的浏览器中手动完成。
 
 导出镜像包：
 
@@ -164,7 +164,7 @@ SSH_PASSWORD="<YOUR_PASSWORD>" ./scripts/deploy_remote.sh <REMOTE_COMMAND>
 
 注意事项：
 
-1. 新增浏览器自动化依赖后，首次需要执行 `python -m playwright install chromium`。
+1. 仅在本地运行目标系统校准脚本时，才需要自行安装 `playwright` 与 Chromium；生产服务不依赖浏览器运行时。
 2. `stop` 为硬中断，会取消当前运行中的后台任务并阻止后续步骤。
 3. `review_pending` 默认超时 10 分钟自动流转到 `skipped`。
 4. 默认启用 mock 浏览器模式：`AUTOMATION_USE_MOCK=1`。

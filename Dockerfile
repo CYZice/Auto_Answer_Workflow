@@ -22,11 +22,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-writer \
     poppler-utils \
     fonts-noto-cjk \
-    xvfb \
-    openbox \
-    x11vnc \
-    novnc \
-    websockify \
     && rm -rf /var/lib/apt/lists/*
 
 # 复制后端 requirements
@@ -35,7 +30,6 @@ COPY backend/requirements.txt .
 # 安装 Python 依赖
 RUN pip install --no-cache-dir --upgrade pip setuptools "wheel>=0.46.2"
 RUN pip install --no-cache-dir -r requirements.txt
-RUN playwright install --with-deps chromium
 
 # 安装 gunicorn + uvicorn workers
 RUN pip install --no-cache-dir gunicorn
@@ -45,8 +39,6 @@ COPY --from=frontend-builder /build/dist ./frontend/dist/
 
 # 复制后端代码
 COPY backend/ .
-COPY scripts/ ./scripts/
-RUN chmod +x ./scripts/start_target_system_desktop.sh
 
 # 创建 data 目录
 RUN mkdir -p /app/data

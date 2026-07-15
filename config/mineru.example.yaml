@@ -1,0 +1,4 @@
+# 复制为 mineru.local.private.yaml 后填写。该私有文件已被 Git 忽略。
+# 浏览器不会读取、保存或上传此 Token。
+api_token: ""
+api_base_url: "https://mineru.net/api/v4"

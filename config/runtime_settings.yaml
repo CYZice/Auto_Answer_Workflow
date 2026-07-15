@@ -1,0 +1,11 @@
+active_template_id: workflow_a
+request_timeout_seconds: 300
+max_retries: 2
+fallback:
+  global:
+  - gpt-5.4-medium
+  - gemini-3-flash-preview
+  nodes:
+    solver: []
+    reviewer: []
+    formatter: []

@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ARCHIVE_PATH="${1:-zyb_agent.tar.gz}"
-REMOTE_HOST="${REMOTE_HOST:-root@139.196.90.36}"
-REMOTE_DIR="${REMOTE_DIR:-/root/zybagent}"
-SSH_PASSWORD="${SSH_PASSWORD:?SSH_PASSWORD is required}"
+: "${SSH_HOST:?请设置 SSH_HOST}"
+: "${SSH_USER:?请设置 SSH_USER}"
+: "${SSH_PASSWORD:?请设置 SSH_PASSWORD}"
 
-sshpass -p "${SSH_PASSWORD}" scp -o StrictHostKeyChecking=accept-new \
-  "${ARCHIVE_PATH}" "${REMOTE_HOST}:${REMOTE_DIR}/$(basename "${ARCHIVE_PATH}")"
+if [[ $# -ne 2 ]]; then
+  echo "用法: $0 <本地镜像文件> <远端路径>" >&2
+  exit 2
+fi
+
+sshpass -p "${SSH_PASSWORD}" scp \
+  -o StrictHostKeyChecking=accept-new \
+  "$1" "${SSH_USER}@${SSH_HOST}:$2"

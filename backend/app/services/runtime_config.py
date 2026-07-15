@@ -1,15 +1,20 @@
 import copy
+import os
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from app.services.mineru_v4_service import public_mineru_settings, update_mineru_settings
 
-CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
+
+CONFIG_DIR = Path(os.getenv("CONFIG_DIR", str(Path(__file__).resolve().parent.parent / "config")))
 RUNTIME_SETTINGS_PATH = CONFIG_DIR / "runtime_settings.yaml"
 PROMPT_TEMPLATES_PATH = CONFIG_DIR / "prompt_templates.yaml"
 MODEL_DEFAULTS_PATH = CONFIG_DIR / "model_defaults.local.yaml"
+PRIVATE_MODEL_DEFAULTS_PATH = CONFIG_DIR / "model_defaults.local.private.yaml"
 
 DEFAULT_RUNTIME_SETTINGS = {
     "active_template_id": "workflow_a",
@@ -27,6 +32,24 @@ DEFAULT_RUNTIME_SETTINGS = {
 
 DEFAULT_PROMPT_TEMPLATES = {
     "templates": {
+        "errata_workflow": {
+            "name": "勘误工作流",
+            "description": "勘误生成、独立审查与 Word 写回格式",
+            "prompts": {
+                "evidence_analysis": {
+                    "system": "你是勘误证据核验员。输入是同一题块的全部文字片段和按原 DOCX 顺序附后的图片，不预先区分原题、原解析、原答案和勘误建议；请自行识别并判断。文字为空时以图片为准，不能在找不到现有答案或解析时写“原答案正确”。最终文本只允许使用 <mark> 标记修改片段。",
+                    "user": "{errata_context}",
+                },
+                "errata_adjudication": {
+                    "system": "你是勘误裁决员。输入是同一题块的全部文字片段和按原 DOCX 顺序附后的图片；请自行识别材料角色后判断草案。证据不足或存在未解释冲突时必须不通过，仅输出 is_pass 与 feedback。",
+                    "user": "{errata_context}",
+                },
+                "word_composition": {
+                    "system": "你是 Word 勘误写回编排器。保留已通过裁决的文本并校验 <mark> 标记格式。",
+                    "user": "{draft_solution}",
+                },
+            },
+        },
         "workflow_a": {
             "name": "默认工作流 A",
             "description": "现网默认解题流程提示词",
@@ -95,10 +118,20 @@ def _safe_read_yaml(path: Path, default_value: dict[str, Any]) -> dict[str, Any]
 
 
 def _safe_write_yaml(path: Path, payload: dict[str, Any]) -> None:
-    _ensure_file(path, payload)
-    path.write_text(
-        yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
 
 
 def normalize_fallback_list(value: Any) -> list[str]:
@@ -144,7 +177,10 @@ def normalize_model_config(value: Any, default_max_tokens: int) -> dict[str, Any
 
 def read_model_defaults() -> dict[str, Any]:
     with _LOCK:
-        raw = _safe_read_yaml(MODEL_DEFAULTS_PATH, DEFAULT_MODEL_DEFAULTS)
+        raw = _safe_read_yaml(
+            PRIVATE_MODEL_DEFAULTS_PATH if PRIVATE_MODEL_DEFAULTS_PATH.exists() else MODEL_DEFAULTS_PATH,
+            DEFAULT_MODEL_DEFAULTS,
+        )
 
     solver = normalize_model_config(raw.get("solver_config"), 4096)
     reviewer = normalize_model_config(raw.get("reviewer_config"), 2048)
@@ -160,6 +196,75 @@ def read_model_defaults() -> dict[str, Any]:
         "formatter_config": formatter,
         "workflow_template_id": workflow_template_id,
         "draft_solution": raw.get("draft_solution"),
+    }
+
+
+def _mask_api_key(value: str) -> str:
+    key = (value or "").strip()
+    if not key:
+        return ""
+    if len(key) <= 8:
+        return "*" * len(key)
+    return f"{key[:3]}{'*' * min(12, len(key) - 7)}{key[-4:]}"
+
+
+def public_model_defaults() -> dict[str, Any]:
+    defaults = read_model_defaults()
+    response: dict[str, Any] = {}
+    for node_name in ("solver", "reviewer", "formatter"):
+        key = f"{node_name}_config"
+        config = defaults[key]
+        api_key = config.get("api_key") or ""
+        response[key] = {
+            "model_name": config.get("model_name") or "",
+            "base_url": config.get("base_url") or "",
+            "max_tokens": config.get("max_tokens"),
+            "api_key_masked": _mask_api_key(api_key),
+            "api_key_configured": bool(api_key),
+        }
+    return response
+
+
+def update_model_defaults(payload: dict[str, Any]) -> dict[str, Any]:
+    current = read_model_defaults()
+    updated = copy.deepcopy(current)
+    for node_name, default_tokens in (
+        ("solver", 4096),
+        ("reviewer", 2048),
+        ("formatter", 1024),
+    ):
+        key = f"{node_name}_config"
+        node_payload = payload.get(key)
+        if not isinstance(node_payload, dict):
+            continue
+        next_config = dict(current[key])
+        for field in ("model_name", "base_url"):
+            if field in node_payload and node_payload[field] is not None:
+                next_config[field] = str(node_payload[field]).strip()
+        if node_payload.get("max_tokens") is not None:
+            next_config["max_tokens"] = normalize_positive_int(
+                node_payload["max_tokens"], default_tokens, minimum=1
+            )
+        if node_payload.get("clear_api_key") is True:
+            next_config["api_key"] = ""
+        elif str(node_payload.get("api_key") or "").strip():
+            next_config["api_key"] = str(node_payload["api_key"]).strip()
+        updated[key] = normalize_model_config(next_config, default_tokens)
+    updated["workflow_template_id"] = str(
+        payload.get("active_template_id")
+        or current.get("workflow_template_id")
+        or "workflow_a"
+    ).strip()
+    with _LOCK:
+        _safe_write_yaml(PRIVATE_MODEL_DEFAULTS_PATH, updated)
+    return public_model_defaults()
+
+
+def read_public_runtime_settings() -> dict[str, Any]:
+    return {
+        **read_runtime_settings(),
+        **public_model_defaults(),
+        "mineru_config": public_mineru_settings(),
     }
 
 
@@ -271,7 +376,11 @@ def update_runtime_settings(payload: dict[str, Any]) -> dict[str, Any]:
 
     with _LOCK:
         _safe_write_yaml(RUNTIME_SETTINGS_PATH, normalized)
-    return normalized
+    update_model_defaults({**payload, "active_template_id": active_template_id})
+    mineru_payload = payload.get("mineru_config")
+    if isinstance(mineru_payload, dict):
+        update_mineru_settings(mineru_payload)
+    return read_public_runtime_settings()
 
 
 def read_prompt_templates() -> dict[str, Any]:
@@ -285,6 +394,8 @@ def list_templates() -> list[dict[str, str]]:
     templates = read_prompt_templates().get("templates", {})
     items: list[dict[str, str]] = []
     for template_id, data in templates.items():
+        if template_id == "errata_workflow":
+            continue
         if not isinstance(data, dict):
             continue
         items.append(

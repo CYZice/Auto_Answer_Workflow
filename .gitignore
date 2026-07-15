@@ -42,3 +42,9 @@ data/target-system-calibration/
 data/target-system-browser-profile/
 data/target-system-delivery/
 data/target-system-vnc.pass
+data/agent_tasks.db*
+data/errata/
+data/mineru/
+data/target-system-calibration-browser-profile/
+data/target-system-calibration-runtime/
+ui-audit-current.png

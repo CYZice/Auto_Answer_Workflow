@@ -27,6 +27,7 @@ ACTIVE_DELIVERY_STATES = {"filling", "awaiting_user_submit", "fill_failed"}
 BROWSER_ACCESS_URL = os.getenv("TARGET_SYSTEM_BROWSER_ACCESS_URL", "").strip()
 sync_lock = asyncio.Lock()
 sync_status = {"state": "idle", "synced": 0, "imported": 0, "schools_done": 0, "schools_total": 0, "error": ""}
+target_workflow_tasks: set[asyncio.Task] = set()
 
 
 class RemoteSelectionRequest(BaseModel):
@@ -292,7 +293,7 @@ def select_remote_tasks(req: RemoteSelectionRequest):
 
 
 @router.post("/tasks/claim", status_code=202)
-async def claim_selected_tasks(req: RemoteSelectionRequest, background_tasks: BackgroundTasks):
+async def claim_selected_tasks(req: RemoteSelectionRequest):
     from app.main import run_agent_workflow_async
 
     requested = {item.strip() for item in req.remote_task_ids if item.strip()}
@@ -305,11 +306,12 @@ async def claim_selected_tasks(req: RemoteSelectionRequest, background_tasks: Ba
         for item in selected:
             if item.status not in {"discovered", "selected"}:
                 continue
+            remote_task_id = item.remote_task_id
             try:
-                await client.claim(item.remote_task_id)
-                detail = await client.detail(item.remote_task_id)
+                await client.claim(remote_task_id)
+                detail = await client.detail(remote_task_id)
                 image_urls = _find_image_urls(detail)
-                target_dir = DELIVERY_ROOT / "source" / item.remote_task_id
+                target_dir = DELIVERY_ROOT / "source" / remote_task_id
                 target_dir.mkdir(parents=True, exist_ok=True)
                 local_images: list[Path] = []
                 for index, image_url in enumerate(image_urls):
@@ -327,13 +329,13 @@ async def claim_selected_tasks(req: RemoteSelectionRequest, background_tasks: Ba
                     "workflow_type": "target_system",
                     "image_urls": data_urls,
                     "question_text": question_text,
-                    "target_system_remote_id": item.remote_task_id,
+                    "target_system_remote_id": remote_task_id,
                     "source_kind": "target_system",
                     "source_id": str(item.id),
                     "source_title": item.title,
-                    "source_item_label": item.remote_task_id,
+                    "source_item_label": remote_task_id,
                 }
-                db.add(Task(task_id=task_id, thread_id=task_id, image_url=data_urls[0] if data_urls else "", image_urls_json=json.dumps(data_urls, ensure_ascii=False), question_text=question_text or None, input_revision=1, workflow_type="automation", source_kind="target_system", source_id=str(item.id), source_item_id=item.remote_task_id, state="queued", retry_count=0, history=json.dumps(history, ensure_ascii=False)))
+                db.add(Task(task_id=task_id, thread_id=task_id, image_url=data_urls[0] if data_urls else "", image_urls_json=json.dumps(data_urls, ensure_ascii=False), question_text=question_text or None, input_revision=1, workflow_type="automation", source_kind="target_system", source_id=str(item.id), source_item_id=remote_task_id, state="queued", retry_count=0, history=json.dumps(history, ensure_ascii=False)))
                 item.source_json = json.dumps(detail, ensure_ascii=False)
                 item.title = _first_text(detail, ("title", "topic", "topic_text", "question", "content"))[:160] or item.title
                 item.image_paths_json = json.dumps([str(path) for path in local_images], ensure_ascii=False)
@@ -342,13 +344,24 @@ async def claim_selected_tasks(req: RemoteSelectionRequest, background_tasks: Ba
                 item.error_message = None
                 item.browser_screenshot_path = None
                 item.rendered_answer_path = None
+                db.commit()
+
+                workflow = asyncio.create_task(
+                    run_agent_workflow_async(task_id, "solver", ["solver", "reviewer", "formatter"]),
+                    name=f"target-system-{task_id}",
+                )
+                target_workflow_tasks.add(workflow)
+                workflow.add_done_callback(target_workflow_tasks.discard)
                 started.append(task_id)
             except Exception as exc:
-                item.status = "discovered"
-                item.error_message = f"抢题或导入失败：{str(exc)[:500]}"
-        db.commit()
-    for task_id in started:
-        background_tasks.add_task(run_agent_workflow_async, task_id, "solver", ["solver", "reviewer", "formatter"])
+                db.rollback()
+                failed_item = db.query(TargetSystemTask).filter(
+                    TargetSystemTask.remote_task_id == remote_task_id
+                ).first()
+                if failed_item:
+                    failed_item.status = "discovered"
+                    failed_item.error_message = f"抢题或导入失败：{str(exc)[:500]}"
+                    db.commit()
     return {"started_task_ids": started}
 
 

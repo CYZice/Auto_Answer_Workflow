@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 
 import pytest
@@ -5,6 +6,8 @@ from fastapi import HTTPException
 
 from app.api.target_system_routes import (
     ConfirmReviewRequest,
+    RemoteSelectionRequest,
+    claim_selected_tasks,
     confirm_review,
     current_delivery,
     extract_delivery_content,
@@ -14,7 +17,7 @@ from app.api.target_system_routes import (
     return_task_to_all,
 )
 from app.core.database import Base, SessionLocal, engine
-from app.main import ensure_target_system_columns
+from app.main import _sync_target_system_workflow_state, app, ensure_target_system_columns
 from app.models.domain import TargetSystemDeliveryLock, TargetSystemTask, Task
 
 
@@ -144,4 +147,78 @@ def test_confirm_review_requires_exam_point_and_current_delivery_hides_it_from_a
         db.query(TargetSystemDeliveryLock).delete()
         db.query(TargetSystemTask).filter(TargetSystemTask.id.in_([valid_id, invalid_id])).delete(synchronize_session=False)
         db.query(Task).filter(Task.task_id.in_([valid_task_id, invalid_task_id])).delete(synchronize_session=False)
+        db.commit()
+
+
+def test_target_system_completion_syncs_to_review_pending():
+    Base.metadata.create_all(bind=engine)
+    ensure_target_system_columns()
+    task_id = f"target_test_{uuid.uuid4().hex}"
+    with SessionLocal() as db:
+        _clear_test_rows(db)
+        item = TargetSystemTask(remote_task_id=f"remote_{uuid.uuid4().hex}", status="solving", workflow_task_id=task_id)
+        task = Task(task_id=task_id, thread_id=task_id, image_url="", state="completed", final_result="完整答案", source_kind="target_system", input_revision=1)
+        db.add_all([item, task])
+        db.flush()
+        _sync_target_system_workflow_state(db, task)
+        db.commit()
+        assert item.status == "review_pending"
+        assert item.error_message is None
+        db.delete(item)
+        db.delete(task)
+        db.commit()
+
+
+def test_active_routes_are_registered_before_task_id_route():
+    paths = [route.path for route in app.routes]
+    assert paths.index("/api/tasks/active") < paths.index("/api/tasks/{task_id}")
+    assert paths.index("/api/tasks/active/list") < paths.index("/api/tasks/{task_id}")
+
+
+def test_claim_starts_each_workflow_before_later_imports_finish(monkeypatch):
+    Base.metadata.create_all(bind=engine)
+    ensure_target_system_columns()
+    remote_ids = [f"remote_{uuid.uuid4().hex}", f"remote_{uuid.uuid4().hex}"]
+    events: list[str] = []
+    started: list[str] = []
+
+    class FakeTargetClient:
+        async def claim(self, remote_task_id):
+            events.append(f"claim:{remote_task_id}")
+
+        async def detail(self, remote_task_id):
+            await asyncio.sleep(0)
+            events.append(f"detail:{remote_task_id}")
+            return {"id": remote_task_id, "topic_text": "题干"}
+
+        async def download(self, _url):
+            return b""
+
+    async def fake_workflow(task_id, *_args):
+        started.append(task_id)
+        events.append(f"workflow:{task_id}")
+
+    monkeypatch.setattr("app.api.target_system_routes.TargetSystemClient", FakeTargetClient)
+    monkeypatch.setattr("app.main.run_agent_workflow_async", fake_workflow)
+
+    with SessionLocal() as db:
+        _clear_test_rows(db)
+        db.add_all([TargetSystemTask(remote_task_id=remote_id, status="selected") for remote_id in remote_ids])
+        db.commit()
+
+    async def run_claim():
+        result = await claim_selected_tasks(RemoteSelectionRequest(remote_task_ids=remote_ids))
+        await asyncio.sleep(0)
+        return result
+
+    result = asyncio.run(run_claim())
+    assert len(result["started_task_ids"]) == 2
+    assert len(started) == 2
+    first_workflow_index = next(index for index, event in enumerate(events) if event.startswith("workflow:"))
+    detail_indices = [index for index, event in enumerate(events) if event.startswith("detail:")]
+    assert first_workflow_index < max(detail_indices)
+
+    with SessionLocal() as db:
+        db.query(TargetSystemTask).filter(TargetSystemTask.remote_task_id.in_(remote_ids)).delete(synchronize_session=False)
+        db.query(Task).filter(Task.task_id.in_(result["started_task_ids"])).delete(synchronize_session=False)
         db.commit()

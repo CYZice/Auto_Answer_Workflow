@@ -566,6 +566,8 @@ async def run_agent_workflow_async(
                 )
                 task_record.error_code = final_state.get("error_msg")
 
+                _sync_target_system_workflow_state(db, task_record)
+
                 db.commit()
                 print(f"[{task_id}] Workflow finished with status: {task_record.state}")
 
@@ -590,7 +592,33 @@ async def run_agent_workflow_async(
                     task_record.history = json.dumps(history_data, ensure_ascii=False)
                     task_record.state = TaskStatus.FAILED.value
                     task_record.error_code = f"System Error: {str(e)}"
+                    _sync_target_system_workflow_state(db, task_record)
                     db.commit()
+
+
+def _sync_target_system_workflow_state(db: Session, task_record: Task) -> None:
+    """Keep the target-system review state aligned with its linked workflow."""
+    if task_record.source_kind != "target_system":
+        return
+
+    target_item = db.query(TargetSystemTask).filter(
+        TargetSystemTask.workflow_task_id == task_record.task_id
+    ).first()
+    if not target_item:
+        return
+
+    if task_record.state == TaskStatus.COMPLETED.value and (task_record.final_result or "").strip():
+        target_item.status = "review_pending"
+        target_item.error_message = None
+    elif task_record.state in {
+        TaskStatus.FAILED.value,
+        TaskStatus.MANUAL.value,
+        TaskStatus.PAUSED.value,
+        TaskStatus.TERMINATED.value,
+        TaskStatus.ABANDONED.value,
+        TaskStatus.CANCELLED.value,
+    }:
+        target_item.error_message = task_record.error_code or f"解题工作流已{task_record.state}"
 
 
 @asynccontextmanager
@@ -813,6 +841,24 @@ async def get_logs(task_id: str = None, db: Session = Depends(get_db)):
     return logs
 
 
+@app.get("/api/tasks/active", response_model=list[TaskDetailResponse])
+@app.get("/api/tasks/active/list", response_model=list[TaskDetailResponse])
+def list_active_tasks(db: Session = Depends(get_db)):
+    """Return every unfinished workflow, including target-system imports."""
+    return (
+        db.query(Task)
+        .filter(
+            Task.state != TaskStatus.COMPLETED.value,
+            or_(
+                Task.workflow_type != "errata",
+                Task.state != TaskStatus.MANUAL.value,
+            ),
+        )
+        .order_by(Task.updated_at.desc(), Task.created_at.desc())
+        .all()
+    )
+
+
 @app.get("/api/tasks/{task_id}", response_model=TaskDetailResponse)
 def get_task(task_id: str, db: Session = Depends(get_db)):
     """
@@ -951,27 +997,6 @@ def run_task_from_node(
     db.commit()
     background_tasks.add_task(run_agent_workflow_async, task_id, req.start_node, targets)
     return {"status": "accepted", "start_node": req.start_node, "target_nodes": targets}
-
-
-@app.get("/api/tasks/active", response_model=list[TaskDetailResponse])
-@app.get("/api/tasks/active/list", response_model=list[TaskDetailResponse])
-def list_active_tasks(db: Session = Depends(get_db)):
-    """
-    返回所有未完成任务，供主页面同步显示。
-    """
-    active_tasks = (
-        db.query(Task)
-        .filter(
-            Task.state != TaskStatus.COMPLETED.value,
-            or_(
-                Task.workflow_type != "errata",
-                Task.state != TaskStatus.MANUAL.value,
-            ),
-        )
-        .order_by(Task.updated_at.desc(), Task.created_at.desc())
-        .all()
-    )
-    return active_tasks
 
 
 @app.get("/api/task-inbox")

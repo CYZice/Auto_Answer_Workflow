@@ -271,7 +271,7 @@ const persistTaskForDashboard = (taskId: string) => {
 
 // --- Components ---
 
-function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
+function TaskDashboard({ onOpenAdmin, onOpenTargetSystem }: { onOpenAdmin: () => void; onOpenTargetSystem: () => void }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const [pendingInputImages, setPendingInputImages] = useState<string[]>([])
   const [inputQuestionText, setInputQuestionText] = useState('')
@@ -741,7 +741,9 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         const taskData = submittedTaskStatusQueries[index]?.data as AdminTask | undefined
         return {
           taskId,
-          state: taskData?.state || 'queued'
+          state: taskData?.state || 'queued',
+          sourceKind: taskData?.source_kind || null,
+          sourceItemId: taskData?.source_item_id || null,
         }
       }),
     [mergedTaskIds, submittedTaskStatusQueries]
@@ -1113,6 +1115,8 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
                 key={task.taskId}
                 taskId={task.taskId}
                 state={task.state}
+                sourceKind={task.sourceKind}
+                sourceItemId={task.sourceItemId}
                 isActive={activeTaskId === task.taskId}
                 onSelect={() => setActiveTaskId(task.taskId)}
               />
@@ -1122,6 +1126,8 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
                 key={task.taskId}
                 taskId={task.taskId}
                 state={task.state}
+                sourceKind={task.sourceKind}
+                sourceItemId={task.sourceItemId}
                 isActive={activeTaskId === task.taskId}
                 onSelect={() => setActiveTaskId(task.taskId)}
               />
@@ -1136,7 +1142,7 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       {activeTaskId && (
         <div>
           <h2 className="text-lg font-semibold mb-4 text-gray-700">任务详情</h2>
-          <TaskDetail taskId={activeTaskId} onPreview={setPreviewImage} />
+          <TaskDetail taskId={activeTaskId} onPreview={setPreviewImage} onOpenTargetSystem={onOpenTargetSystem} />
         </div>
       )}
 
@@ -1376,11 +1382,15 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
 function TaskSwitcherButton({
   taskId,
   state,
+  sourceKind,
+  sourceItemId,
   isActive,
   onSelect
 }: {
   taskId: string
   state: string
+  sourceKind: string | null
+  sourceItemId: string | null
   isActive: boolean
   onSelect: () => void
 }) {
@@ -1393,6 +1403,7 @@ function TaskSwitcherButton({
         }`}
     >
       <span>{taskId}</span>
+      {sourceKind === 'target_system' && <span className="ml-2 text-[10px] font-sans text-indigo-600">目标系统{sourceItemId ? ` · ${sourceItemId}` : ''}</span>}
       <TaskStatusBadge state={state} />
     </button>
   )
@@ -1417,7 +1428,7 @@ function TaskStatusBadge({ state }: { state: string }) {
   )
 }
 
-function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: string) => void }) {
+function TaskDetail({ taskId, onPreview, onOpenTargetSystem }: { taskId: string, onPreview: (url: string) => void, onOpenTargetSystem: () => void }) {
   const [draftInput, setDraftInput] = useState('')
   const [customDraftInput, setCustomDraftInput] = useState('')
   const [editedQuestionText, setEditedQuestionText] = useState('')
@@ -1679,14 +1690,17 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
       <div className="space-y-4 border-r pr-8">
         <div className="flex items-center justify-between">
           <h3 className="text-xl font-semibold">Task: <span className="text-sm font-mono text-gray-500">{task.task_id}</span></h3>
-          <span className={`px-3 py-1 rounded-full text-xs font-bold uppercase ${task.state === 'completed' ? 'bg-green-100 text-green-700' :
-            task.state === 'failed' ? 'bg-red-100 text-red-700' :
-              task.state === 'manual' ? 'bg-yellow-100 text-yellow-700' :
-                task.state === 'cancelled' ? 'bg-gray-200 text-gray-700' :
-                  'bg-blue-100 text-blue-700'
-            }`}>
-            {task.state}
-          </span>
+          <div className="flex items-center gap-2">
+            {task.source_kind === 'target_system' && <button onClick={onOpenTargetSystem} className="text-xs text-indigo-700 border border-indigo-200 rounded px-2 py-1 hover:bg-indigo-50">目标系统 · {task.source_item_id || '查看题目'}</button>}
+            <span className={`px-3 py-1 rounded-full text-xs font-bold uppercase ${task.state === 'completed' ? 'bg-green-100 text-green-700' :
+              task.state === 'failed' ? 'bg-red-100 text-red-700' :
+                task.state === 'manual' ? 'bg-yellow-100 text-yellow-700' :
+                  task.state === 'cancelled' ? 'bg-gray-200 text-gray-700' :
+                    'bg-blue-100 text-blue-700'
+              }`}>
+              {task.state}
+            </span>
+          </div>
         </div>
 
         <div className="grid grid-cols-2 gap-4 text-sm text-gray-600 bg-gray-50 p-4 rounded">
@@ -2538,6 +2552,7 @@ function AdminPanel({
                     >
                       <div className="text-xs font-mono text-gray-700 truncate">{task.task_id}</div>
                       <div className="text-xs text-gray-500 mt-1">{task.state} · retry {task.retry_count}</div>
+                      {task.source_kind === 'target_system' && <div className="text-[11px] text-indigo-700 mt-1">目标系统 · 远端题号 {task.source_item_id || '-'}</div>}
                       {isErrataTask(task) && <div className="text-[11px] text-amber-700 mt-1">勘误工作流 · 删除将同步移除文档映射</div>}
                       <div className="text-[11px] text-gray-400 mt-1 truncate">题目预览：{getTaskPreviewSnippet(task)}</div>
                     </button>
@@ -3696,7 +3711,7 @@ function App() {
         </div>
 
         {currentView === 'dashboard' && (
-          <TaskDashboard onOpenAdmin={() => setCurrentView('admin')} />
+          <TaskDashboard onOpenAdmin={() => setCurrentView('admin')} onOpenTargetSystem={() => setCurrentView('target-system')} />
         )}
         {currentView === 'inbox' && <TaskInbox onOpen={(item) => {
           const target = item.resume_target

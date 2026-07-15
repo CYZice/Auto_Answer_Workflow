@@ -18,7 +18,7 @@ def review_node_sync(task_id: str):
     with SessionLocal() as db:
         task = db.query(Task).filter(Task.task_id == task_id).first()
         if task:
-            if task.state == "cancelled":
+            if task.state in {"cancelled", "paused", "terminated", "abandoned"}:
                 return True
             task.state = "reviewing"
             db.commit()
@@ -298,6 +298,18 @@ async def review_node(state: AgentState) -> AgentState:
         safe_total_tokens = coerce_token_count(
             state.get("total_tokens"), 0
         ) + coerce_token_count(review_tokens, 0)
+        from app.services.task_artifacts import persist_task_artifact
+
+        await asyncio.to_thread(
+            persist_task_artifact,
+            state["task_id"],
+            "reviewer",
+            json.dumps(
+                {"decision": decision, "feedback": feedback}, ensure_ascii=False
+            ),
+            {"tokens": coerce_token_count(review_tokens, 0)},
+            state.get("input_revision", 1),
+        )
 
         return {
             **state,
@@ -348,6 +360,19 @@ async def review_node(state: AgentState) -> AgentState:
             feedback = recovered.feedback if not recovered.is_pass else None
             print(
                 f"  [Reviewer Recovery] Decision: {decision}, Feedback: {feedback}"
+            )
+            from app.services.task_artifacts import persist_task_artifact
+
+            await asyncio.to_thread(
+                persist_task_artifact,
+                state["task_id"],
+                "reviewer",
+                json.dumps(
+                    {"decision": decision, "feedback": feedback},
+                    ensure_ascii=False,
+                ),
+                {"tokens": coerce_token_count(review_tokens, 0)},
+                state.get("input_revision", 1),
             )
             return {
                 **state,

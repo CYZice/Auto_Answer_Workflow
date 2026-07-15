@@ -8,6 +8,7 @@ class AgentState(TypedDict):
     """
 
     task_id: str
+    input_revision: int
     image_url: str
     image_urls: list[str]
 
@@ -28,13 +29,13 @@ class AgentState(TypedDict):
     review_decision: Optional[str]  # PASS / FAIL
     review_feedback: Optional[str]  # Reviewer 给出的综合反馈（用于重试）
     final_result: Optional[str]  # 最终交付的 Markdown
+    formatted_solution: Optional[str]  # Formatter 产出的完整标准答案（勘误裁决输入）
+    errata_decision: Optional[dict]  # 勘误裁决的结构化结论
 
     # 策略控制数据
     retry_count: int  # 当前重试次数（第 2 次审查仍失败即 failed）
     error_msg: Optional[str]  # 系统错误信息
-    failed_node: Optional[
-        Literal["solver", "reviewer", "formatter"]
-    ]  # 失败节点，用于 resume 定位恢复入口
+    failed_node: Optional[str]  # 失败节点，用于 resume 定位恢复入口
     total_tokens: int  # 累计消耗的 Token
     target_nodes: Optional[list[str]]  # 本次执行允许的节点集合（用于自定义工作流截断）
 
@@ -44,3 +45,6 @@ class AgentState(TypedDict):
     ]  # 包含各个节点的模型配置，如 {"solver": {...}, "reviewer": {...}}
     workflow_template_id: Optional[str]  # 当前任务使用的提示词模板 ID
     question_text: Optional[str]  # MinerU 解析的题目文字（可选）
+    workflow_type: str
+    source_id: Optional[str]
+    source_item_id: Optional[str]

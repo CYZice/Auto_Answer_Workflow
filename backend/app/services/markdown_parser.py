@@ -146,9 +146,7 @@ class MarkdownParser:
 
     def parse(self, markdown: str) -> list[Question]:
         """
-        解析 Markdown 试卷，返回题目列表
-
-        简化逻辑：按大写数字分段，题型统一设为"未分类"
+        解析 MinerU Markdown，保留题型标题和数字题号。
 
         Args:
             markdown: MinerU 返回的 Markdown 内容
@@ -160,55 +158,65 @@ class MarkdownParser:
         questions: list[Question] = []
         current_content_lines: list[str] = []
         current_images: list[str] = []
-        question_count = 0
-        is_first_hash_line = True  # 跳过第一个 # 行（文档标题）
+        current_number: int | None = None
+        current_type = "未分类"
+        is_first_hash_line = True
 
         def flush_question():
-            """将当前累积的内容 flush 为一个题目"""
-            nonlocal questions, current_content_lines, current_images, question_count
+            """将当前累积内容写成一题。"""
+            nonlocal current_content_lines, current_images, current_number
             content = "\n".join(current_content_lines).strip()
-            if content:
-                question_count += 1
+            if content and current_number is not None:
                 questions.append(
                     Question(
-                        number=question_count,
-                        question_type="未分类",
+                        number=current_number,
+                        question_type=current_type,
                         content=content,
                         images=current_images.copy(),
                     )
                 )
                 current_content_lines = []
                 current_images = []
+                current_number = None
 
         for line in lines:
             stripped = line.strip()
 
-            # 跳过空行
             if not stripped:
                 continue
 
-            # 跳过第一个 # 行（文档标题）
+            if re.search(r"参考答案|答案及解析|^【解析】", stripped):
+                flush_question()
+                break
+
             if stripped.startswith("#"):
                 if is_first_hash_line:
                     is_first_hash_line = False
                     continue
-                # 其他 # 标题行，触发新题目，保留标题内容
-                flush_question()
-                # 去掉 # 标记，保留内容作为题目开头
-                content_without_hash = stripped.lstrip("#").strip()
-                if content_without_hash:
-                    current_content_lines.append(content_without_hash)
+                maybe_type, is_type = detect_question_type(stripped, current_type)
+                if is_type:
+                    flush_question()
+                    current_type = maybe_type
                 continue
 
-            # 检测大写数字+顿号开头的行，触发新题目
-            if re.match(CHINESE_NUMERAL_PATTERN, stripped):
+            maybe_type, is_type = detect_question_type(stripped, current_type)
+            if is_type:
                 flush_question()
-                current_content_lines.append(stripped)
+                current_type = maybe_type
                 continue
 
-            # 普通内容行，追加到当前题目
+            number, match_type, remainder = parse_question_number(stripped)
+            if number is not None and match_type in {"decimal", "plain_num", "chinese"}:
+                flush_question()
+                current_number = number
+                clean_remainder, images = extract_images(remainder)
+                if clean_remainder:
+                    current_content_lines.append(clean_remainder)
+                current_images.extend(images)
+                continue
+
             clean_line, imgs = extract_images(stripped)
-            if clean_line:
+            if clean_line and current_number is not None:
                 current_content_lines.append(clean_line)
             current_images.extend(imgs)
 

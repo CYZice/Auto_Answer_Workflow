@@ -10,7 +10,7 @@ def solve_node_sync(task_id: str):
     with SessionLocal() as db:
         task = db.query(Task).filter(Task.task_id == task_id).first()
         if task:
-            if task.state == "cancelled":
+            if task.state in {"cancelled", "paused", "terminated", "abandoned"}:
                 return True
             task.state = "solving"
             db.commit()
@@ -81,6 +81,16 @@ async def solve_node(state: AgentState) -> AgentState:
         safe_total_tokens = coerce_token_count(
             state.get("total_tokens"), 0
         ) + coerce_token_count(result.get("tokens"), 0)
+        from app.services.task_artifacts import persist_task_artifact
+
+        await asyncio.to_thread(
+            persist_task_artifact,
+            state["task_id"],
+            "solver",
+            draft,
+            {"tokens": coerce_token_count(result.get("tokens"), 0)},
+            state.get("input_revision", 1),
+        )
 
         return {
             **state,

@@ -23,6 +23,7 @@ class TargetSystemClient:
         self.config = config or read_target_config()
         self.base_url = self.config["base_url"].rstrip("/")
         self.token = ""
+        self.cookies: dict[str, str] = {}
         self.developer_id = 0
 
     async def login(self) -> None:
@@ -33,6 +34,9 @@ class TargetSystemClient:
         if response.status_code != 200 or payload.get("code") not in (0, 200) or not data.get("token"):
             raise RuntimeError("目标题目系统登录失败")
         self.token = str(data["token"])
+        self.cookies = {"token": self.token}
+        if data.get("uuid"):
+            self.cookies["uuid"] = str(data["uuid"])
         self.developer_id = int((data.get("info") or {}).get("developer_id") or 0)
 
     async def post(self, path: str, payload: dict[str, Any]) -> Any:
@@ -40,7 +44,7 @@ class TargetSystemClient:
             await self.login()
         headers = {"Authorization": self.token, "Content-Type": "application/json"}
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(f"{self.base_url}{path}", json=payload, headers=headers)
+            response = await client.post(f"{self.base_url}{path}", json=payload, headers=headers, cookies=self.cookies)
         body = response.json()
         if response.status_code != 200 or body.get("code") not in (0, 200):
             raise RuntimeError(str(body.get("message") or body.get("msg") or "远端请求失败"))
@@ -131,6 +135,6 @@ class TargetSystemClient:
             await self.login()
         headers = {"Authorization": self.token}
         async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-            response = await client.get(url, headers=headers)
+            response = await client.get(url, headers=headers, cookies=self.cookies)
         response.raise_for_status()
         return response.content

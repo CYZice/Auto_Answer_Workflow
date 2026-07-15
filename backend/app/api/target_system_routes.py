@@ -23,7 +23,7 @@ from app.services.target_system_client import TargetSystemClient
 
 
 router = APIRouter(prefix="/api/target-system", tags=["target-system"])
-DELIVERY_ROOT = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parents[3] / "data")) / "target-system-delivery"
+DELIVERY_ROOT = Path(os.getenv("DATA_DIR", "/app/data")) / "target-system-delivery"
 ACTIVE_DELIVERY_STATES = {"filling", "awaiting_user_submit", "fill_failed"}
 BROWSER_ACCESS_URL = os.getenv("TARGET_SYSTEM_BROWSER_ACCESS_URL", "").strip()
 sync_lock = asyncio.Lock()

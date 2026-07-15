@@ -21,6 +21,7 @@ services:
       - AUTOMATION_USE_MOCK=${AUTOMATION_USE_MOCK:-1}
       - AUTOMATION_TARGET_URL=${AUTOMATION_TARGET_URL:-}
       - CONFIG_DIR=/app/config
+      - DATA_DIR=/app/data
     ports:
       - "${APP_PORT:-35828}:38080"
     volumes:

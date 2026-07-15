@@ -7,6 +7,7 @@ from fastapi import HTTPException
 from app.api.target_system_routes import (
     ConfirmReviewRequest,
     RemoteSelectionRequest,
+    _find_image_urls,
     claim_selected_tasks,
     confirm_review,
     current_delivery,
@@ -167,6 +168,17 @@ def test_target_system_completion_syncs_to_review_pending():
         db.delete(item)
         db.delete(task)
         db.commit()
+
+
+def test_image_download_includes_rich_text_side_image():
+    detail = {
+        "topic_img": "https://cdn.example/question.png",
+        "topic_right": '<p><img src="https://cdn.example/diagram.png" alt="diagram" /></p>',
+    }
+    assert _find_image_urls(detail) == [
+        "https://cdn.example/question.png",
+        "https://cdn.example/diagram.png",
+    ]
 
 
 def test_active_routes_are_registered_before_task_id_route():

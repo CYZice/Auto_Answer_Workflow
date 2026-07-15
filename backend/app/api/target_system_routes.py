@@ -8,6 +8,7 @@ import mimetypes
 import os
 import uuid
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,29 @@ class ConfirmReviewRequest(BaseModel):
 
 class DeliveryErrorRequest(BaseModel):
     error_message: str = Field(min_length=1, max_length=2000)
+
+
+class _ImageSourceParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.urls: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "img":
+            return
+        for name, value in attrs:
+            if name.lower() == "src" and value and value.strip():
+                self.urls.append(value.strip())
+
+
+def _rich_text_image_urls(value: str) -> list[str]:
+    parser = _ImageSourceParser()
+    try:
+        parser.feed(value)
+        parser.close()
+    except Exception:
+        return []
+    return [url for url in parser.urls if url.startswith(("http://", "https://"))]
 
 
 def extract_delivery_content(task: Task) -> tuple[str, str]:
@@ -91,6 +115,7 @@ def _find_image_urls(value: Any, key_hint: str = "") -> list[str]:
             found.extend(_find_image_urls(item, key_hint))
     elif isinstance(value, str):
         candidate = value.strip()
+        found.extend(_rich_text_image_urls(candidate))
         is_image_key = any(token in key_hint for token in ("image", "img", "pic", "photo", "figure"))
         is_image_url = candidate.lower().split("?")[0].endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
         if candidate.startswith(("http://", "https://")) and (is_image_key or is_image_url):

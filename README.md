@@ -93,6 +93,14 @@ docker build -t zyb_agent:latest .
 APP_PORT=35828 docker compose up -d
 ```
 
+### 6. 目标系统接题与解题
+
+复制 `config/target_system.example.yaml` 为 `config/target_system.local.private.yaml`，填写账号和密码。私有文件、浏览器配置、题图和截图均不会进入 Git。
+
+目标系统工作台只负责同步待接题、抢题、导入题图、启动普通解题工作流和展示完整最终答案。答案填写、识别录入、考点填写和最终提交均由你在目标系统网页中手动完成。
+
+`target_system_worker` 已移入 Docker Compose 的可选 `browser-delivery` profile，默认 `docker compose up -d` 不会启动它，也不会打开或操作目标系统浏览器。
+
 导出镜像包：
 
 ```bash
@@ -103,8 +111,8 @@ make save
 上传并部署到服务器：
 
 ```bash
-SSH_PASSWORD='你的服务器密码' make upload
-SSH_PASSWORD='你的服务器密码' make deploy
+SSH_PASSWORD="<YOUR_PASSWORD>" make upload
+SSH_PASSWORD="<YOUR_PASSWORD>" make deploy
 ```
 
 等价脚本方式：
@@ -112,8 +120,8 @@ SSH_PASSWORD='你的服务器密码' make deploy
 ```bash
 ./scripts/build_image.sh
 ./scripts/save_image.sh zyb_agent.tar.gz
-SSH_PASSWORD='你的服务器密码' ./scripts/upload_image.sh zyb_agent.tar.gz
-SSH_PASSWORD='你的服务器密码' ./scripts/deploy_remote.sh zyb_agent.tar.gz
+SSH_PASSWORD="<YOUR_PASSWORD>" ./scripts/upload_image.sh zyb_agent.tar.gz <REMOTE_PATH>
+SSH_PASSWORD="<YOUR_PASSWORD>" ./scripts/deploy_remote.sh <REMOTE_COMMAND>
 ```
 
 ## 如何使用流水线？

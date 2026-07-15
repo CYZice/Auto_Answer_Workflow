@@ -9,7 +9,7 @@ from fastapi import (
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
+from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
 from contextlib import asynccontextmanager
 import uuid
@@ -30,7 +30,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from app.core.database import engine, Base, get_db, SessionLocal
-from app.models.domain import Task, AgentLog
+from app.models.domain import Task, AgentLog, TaskArtifact, TargetSystemDeliveryLock, TargetSystemTask, ErrataItem, ErrataJob
 from app.models.schemas import (
     TaskCreateRequest,
     TaskCreateResponse,
@@ -52,19 +52,38 @@ from app.models.schemas import (
     PaperBuilderDraftPayload,
     PaperBuilderDraftResponse,
     PaperBuilderDraftListResponse,
+    TaskInputUpdateRequest,
+    TaskRunRequest,
+    TaskArtifactResponse,
+    TaskOperationRequest,
 )
-from app.agent.graph import build_graph
+from app.agent.graph import build_errata_graph, build_graph
+from app.agent.nodes.reviewer import review_node
 from app.agent.nodes.llm_client import coerce_token_count
 from app.services.runtime_config import (
     create_template_from,
     get_template,
     list_templates,
     read_model_defaults,
+    read_public_runtime_settings,
     read_runtime_settings,
     update_runtime_settings,
     upsert_template,
 )
 from app.api.mineru_routes import router as mineru_router
+from app.api.errata_routes import router as errata_router
+from app.api.paper_routes import router as paper_router
+from app.api.target_system_routes import router as target_system_router
+from app.services.task_artifacts import latest_task_artifact
+from app.services.mineru_jobs import resume_pending_mineru_jobs
+from app.services.errata_service import (
+    _ensure_errata_task_column,
+    ensure_errata_tasks,
+    errata_solver_node,
+    errata_formatter_node,
+    errata_format_node,
+    errata_review_node,
+)
 
 # 全局并发信号量，控制同时进行的大模型推理任务数
 MAX_CONCURRENT_TASKS = 10
@@ -73,9 +92,36 @@ task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 # 全局流式事件总线，用于将后台工作流的流式输出分发给所有 SSE 客户端
 from app.core.events import task_events
 
-VALID_RESUME_NODES = {"solver", "reviewer", "formatter"}
-WORKFLOW_ORDER = ["solver", "reviewer", "formatter"]
-graph_apps = {node: build_graph(node) for node in VALID_RESUME_NODES}
+STANDARD_NODE_ORDER = ["solver", "reviewer", "formatter"]
+ERRATA_NODE_ORDER = [
+    "solver",
+    "reviewer",
+    "formatter",
+    "errata_adjudication",
+    "word_composition",
+]
+VALID_RESUME_NODES = set(STANDARD_NODE_ORDER) | set(ERRATA_NODE_ORDER)
+WORKFLOW_ORDER = STANDARD_NODE_ORDER
+graph_apps = {
+    ("standard", node): build_graph(node) for node in STANDARD_NODE_ORDER
+}
+
+
+def get_graph_app(workflow_type: str, start_node: str):
+    graph_kind = "errata" if workflow_type == "errata" else "standard"
+    key = (graph_kind, start_node)
+    if key not in graph_apps:
+        graph_apps[key] = build_errata_graph(
+            start_node,
+            nodes={
+                "solver": errata_solver_node,
+                "reviewer": review_node,
+                "formatter": errata_formatter_node,
+                "errata_adjudication": errata_review_node,
+                "word_composition": errata_format_node,
+            },
+        )
+    return graph_apps[key]
 PAPER_BUILDER_DRAFTS_PATH = os.path.join(
     os.path.dirname(__file__), "config", "paper_builder_drafts.json"
 )
@@ -173,11 +219,15 @@ def normalize_paper_builder_draft_record(draft_id: str, raw_value: dict) -> dict
     }
 
 
-def normalize_target_nodes(raw_nodes) -> list[str]:
+def workflow_node_order(workflow_type: str) -> list[str]:
+    return ERRATA_NODE_ORDER if workflow_type == "errata" else STANDARD_NODE_ORDER
+
+
+def normalize_target_nodes(raw_nodes, workflow_type: str = "standard") -> list[str]:
     if not isinstance(raw_nodes, list):
         return []
     normalized = []
-    for node in WORKFLOW_ORDER:
+    for node in workflow_node_order(workflow_type):
         if node in raw_nodes and node not in normalized:
             normalized.append(node)
     return normalized
@@ -203,19 +253,19 @@ def normalize_image_urls(
     return normalized
 
 
-def validate_ordered_target_nodes(nodes: list[str]) -> bool:
+def validate_ordered_target_nodes(nodes: list[str], workflow_type: str = "standard") -> bool:
     if not nodes:
         return False
     if len(set(nodes)) != len(nodes):
         return False
     try:
-        indices = [WORKFLOW_ORDER.index(node) for node in nodes]
+        indices = [workflow_node_order(workflow_type).index(node) for node in nodes]
     except ValueError:
         return False
     return all(indices[i] < indices[i + 1] for i in range(len(indices) - 1))
 
 
-def validate_requested_target_nodes(raw_nodes) -> list[str]:
+def validate_requested_target_nodes(raw_nodes, workflow_type: str = "standard") -> list[str]:
     if not isinstance(raw_nodes, list):
         return []
 
@@ -228,13 +278,13 @@ def validate_requested_target_nodes(raw_nodes) -> list[str]:
             return []
         requested_nodes.append(cleaned)
 
-    if not validate_ordered_target_nodes(requested_nodes):
+    if not validate_ordered_target_nodes(requested_nodes, workflow_type):
         return []
     return requested_nodes
 
 
 def requires_draft_for_entry_point(entry_point: str, draft_solution: str | None) -> bool:
-    return entry_point in {"reviewer", "formatter"} and not draft_solution
+    return entry_point in {"reviewer", "formatter", "errata_adjudication", "word_composition"} and not draft_solution
 
 
 async def run_agent_workflow_async(
@@ -255,27 +305,55 @@ async def run_agent_workflow_async(
             if not task_record:
                 print(f"[{task_id}] Error: Task not found in DB.")
                 return
+            workflow_input_revision = int(task_record.input_revision or 1)
+            workflow_type = task_record.workflow_type or "standard"
+            node_order = workflow_node_order(workflow_type)
 
-            # 2. 构造图引擎的初始状态
-            # 尝试从 history 中提取动态模型配置和可恢复数据
-            agent_configs = {}
+            # 2. 构造图引擎的初始状态。模型配置只从服务端全局配置读取。
+            model_defaults = read_model_defaults()
+            agent_configs = {
+                "solver": model_defaults.get("solver_config") or {},
+                "reviewer": model_defaults.get("reviewer_config") or {},
+                "formatter": model_defaults.get("formatter_config") or {},
+            }
             history_data = {}
             try:
                 if task_record.history:
                     history_data = json.loads(task_record.history)
-                    agent_configs = {
-                        "solver": history_data.get("solver_config", {}),
-                        "reviewer": history_data.get("reviewer_config", {}),
-                        "formatter": history_data.get("formatter_config", {}),
-                    }
             except Exception as e:
                 print(f"[DEBUG main.py] Failed to parse history: {e}")
                 history_data = {}
 
+            if start_node in {"reviewer", "formatter"} and not history_data.get("draft_solution"):
+                artifact = latest_task_artifact(
+                    task_id,
+                    "solver",
+                    int(task_record.input_revision or 1),
+                )
+                if artifact:
+                    history_data["draft_solution"] = artifact.content
+            if workflow_type == "errata" and start_node in {"errata_adjudication", "word_composition"}:
+                artifact = latest_task_artifact(
+                    task_id, "formatter", int(task_record.input_revision or 1)
+                )
+                if artifact:
+                    history_data["formatted_solution"] = artifact.content
+            if workflow_type == "errata" and start_node == "word_composition":
+                artifact = latest_task_artifact(
+                    task_id, "errata_adjudication", int(task_record.input_revision or 1)
+                )
+                if artifact:
+                    try:
+                        history_data["errata_decision"] = json.loads(artifact.content)
+                    except json.JSONDecodeError:
+                        history_data.pop("errata_decision", None)
+
             runtime_settings = read_runtime_settings()
-            workflow_template_id = history_data.get(
-                "workflow_template_id"
-            ) or runtime_settings.get("active_template_id")
+            workflow_template_id = (
+                "errata_workflow"
+                if workflow_type == "errata"
+                else runtime_settings.get("active_template_id")
+            )
 
             token_usage = {}
             try:
@@ -287,50 +365,61 @@ async def run_agent_workflow_async(
             except Exception:
                 token_usage = {}
 
-            if start_node not in VALID_RESUME_NODES:
-                start_node = "solver"
+            if start_node not in node_order:
+                start_node = node_order[0]
             effective_target_nodes = normalize_target_nodes(
                 target_nodes
                 if target_nodes is not None
-                else history_data.get("target_nodes")
+                else history_data.get("target_nodes"),
+                workflow_type,
             )
             if start_node in {"reviewer", "formatter"} and not history_data.get(
                 "draft_solution"
             ):
-                start_node = "solver"
+                start_node = node_order[0]
 
             if effective_target_nodes:
                 try:
-                    start_index = WORKFLOW_ORDER.index(start_node)
+                    start_index = node_order.index(start_node)
                     effective_target_nodes = [
                         node
                         for node in effective_target_nodes
-                        if WORKFLOW_ORDER.index(node) >= start_index
+                        if node_order.index(node) >= start_index
                     ]
                 except ValueError:
                     effective_target_nodes = []
 
+            try:
+                explicit_image_urls = json.loads(task_record.image_urls_json or "[]")
+            except Exception:
+                explicit_image_urls = []
             effective_image_urls = normalize_image_urls(
-                history_data.get("image_urls"), task_record.image_url
+                explicit_image_urls or history_data.get("image_urls"), task_record.image_url
             )
 
             initial_state = {
                 "task_id": task_record.task_id,
+                "input_revision": workflow_input_revision,
                 "image_url": effective_image_urls[0] if effective_image_urls else "",
                 "image_urls": effective_image_urls,
                 "status": task_record.state,
                 "retry_count": task_record.retry_count,
                 "draft_solution": history_data.get("draft_solution"),
+                "formatted_solution": history_data.get("formatted_solution"),
+                "errata_decision": history_data.get("errata_decision"),
                 "review_decision": history_data.get("review_decision"),
                 "review_feedback": history_data.get("review_feedback"),
                 "total_tokens": coerce_token_count(token_usage.get("total_tokens"), 0),
                 "agent_configs": agent_configs,
                 "target_nodes": effective_target_nodes,
                 "workflow_template_id": workflow_template_id,
-                "question_text": history_data.get("question_text")
+                "question_text": task_record.question_text or history_data.get("question_text")
                 or history_data.get("question_content"),
+                "workflow_type": workflow_type,
+                "source_id": task_record.source_id,
+                "source_item_id": task_record.source_item_id,
             }
-        graph_app = graph_apps[start_node]
+        graph_app = get_graph_app(workflow_type, start_node)
 
         # 3. 运行图引擎
         try:
@@ -340,7 +429,7 @@ async def run_agent_workflow_async(
                 initial_state, config=config, version="v2"
             ):
                 node = event.get("metadata", {}).get("langgraph_node")
-                if node in VALID_RESUME_NODES and node != last_announced_node:
+                if node in workflow_node_order(workflow_type) and node != last_announced_node:
                     task_events.publish(
                         task_id,
                         json.dumps(
@@ -371,6 +460,11 @@ async def run_agent_workflow_async(
                 task_record = db.query(Task).filter(Task.task_id == task_id).first()
                 if not task_record:
                     return
+                if int(task_record.input_revision or 1) != workflow_input_revision:
+                    task_record.state = TaskStatus.MANUAL.value
+                    task_record.error_code = "input_changed_during_run"
+                    db.commit()
+                    return
                 previous_state = task_record.state
                 final_status = final_state.get("status", "failed")
                 review_decision = final_state.get("review_decision")
@@ -387,14 +481,20 @@ async def run_agent_workflow_async(
                     TaskStatus.REVIEWING.value,
                     TaskStatus.FORMATTING.value,
                 }:
-                    final_status = (
-                        TaskStatus.FAILED.value
-                        if reached_review_failure_terminal
-                        else TaskStatus.COMPLETED.value
-                    )
+                    if reached_review_failure_terminal:
+                        final_status = TaskStatus.FAILED.value
+                    elif effective_target_nodes and node_order[-1] not in effective_target_nodes:
+                        final_status = TaskStatus.MANUAL.value
+                    else:
+                        final_status = TaskStatus.COMPLETED.value
 
-                # 如果在执行期间被标记为 cancelled，保持 cancelled 状态
-                if task_record.state != TaskStatus.CANCELLED.value:
+                # 如果在执行期间被人工暂停/终止，保持人工状态。
+                if task_record.state not in {
+                    TaskStatus.CANCELLED.value,
+                    TaskStatus.PAUSED.value,
+                    TaskStatus.TERMINATED.value,
+                    TaskStatus.ABANDONED.value,
+                }:
                     task_record.state = final_status
 
                 task_record.retry_count = final_state.get("retry_count", 0)
@@ -409,6 +509,10 @@ async def run_agent_workflow_async(
 
                 if final_state.get("draft_solution") is not None:
                     history_data["draft_solution"] = final_state.get("draft_solution")
+                if final_state.get("formatted_solution") is not None:
+                    history_data["formatted_solution"] = final_state.get("formatted_solution")
+                if final_state.get("errata_decision") is not None:
+                    history_data["errata_decision"] = final_state.get("errata_decision")
                 if final_state.get("review_decision") is not None:
                     history_data["review_decision"] = final_state.get("review_decision")
                 if final_state.get("review_feedback") is not None:
@@ -420,7 +524,7 @@ async def run_agent_workflow_async(
                 final_image_urls = normalize_image_urls(
                     final_state.get("image_urls"), task_record.image_url
                 )
-                if final_image_urls:
+                if final_image_urls and workflow_type != "errata":
                     history_data["image_urls"] = final_image_urls
                     task_record.image_url = final_image_urls[0]
                 if effective_target_nodes:
@@ -434,12 +538,12 @@ async def run_agent_workflow_async(
                 if (
                     not failed_node
                     and final_status == TaskStatus.FAILED.value
-                    and previous_state in VALID_RESUME_NODES
+                    and task_record.current_node in node_order
                 ):
-                    failed_node = previous_state
+                    failed_node = task_record.current_node
                 if (
                     final_status == TaskStatus.FAILED.value
-                    and failed_node in VALID_RESUME_NODES
+                    and failed_node in node_order
                 ):
                     history_data["failed_node"] = failed_node
                 else:
@@ -472,11 +576,8 @@ async def run_agent_workflow_async(
             with SessionLocal() as db:
                 task_record = db.query(Task).filter(Task.task_id == task_id).first()
                 if task_record:
-                    failed_node = (
-                        task_record.state
-                        if task_record.state in VALID_RESUME_NODES
-                        else "solver"
-                    )
+                    node_order = workflow_node_order(task_record.workflow_type or "standard")
+                    failed_node = task_record.current_node if task_record.current_node in node_order else node_order[0]
                     try:
                         history_data = (
                             json.loads(task_record.history)
@@ -497,6 +598,28 @@ async def lifespan(app: FastAPI):
     migrate_legacy_sqlite_db()
     Base.metadata.create_all(bind=engine)
     ensure_task_preview_columns()
+    _ensure_errata_task_column()
+    migrate_task_workflow_metadata()
+    ensure_target_system_columns()
+    with SessionLocal() as db:
+        db.query(Task).filter(Task.state.in_(["queued", "solving", "reviewing", "formatting"])).update(
+            {Task.state: TaskStatus.PAUSED.value, Task.error_code: "服务重启后已暂停，请手动继续"},
+            synchronize_session=False,
+        )
+        db.query(TargetSystemTask).filter(TargetSystemTask.status == "filling").update(
+            {TargetSystemTask.status: "fill_failed", TargetSystemTask.error_message: "服务重启后等待手动重试"},
+            synchronize_session=False,
+        )
+        lock = db.query(TargetSystemDeliveryLock).filter(TargetSystemDeliveryLock.id == 1).first()
+        if not lock:
+            lock = TargetSystemDeliveryLock(id=1)
+            db.add(lock)
+        if lock.target_task_id:
+            active = db.query(TargetSystemTask).filter(TargetSystemTask.id == lock.target_task_id).first()
+            if not active or active.status not in {"awaiting_user_submit", "fill_failed"}:
+                lock.target_task_id = None
+        db.commit()
+    await resume_pending_mineru_jobs()
     yield
 
 
@@ -504,6 +627,9 @@ app = FastAPI(
     title="智能题目解析 Agent 自动化流水线 API", version="1.0.0", lifespan=lifespan
 )
 app.include_router(mineru_router)
+app.include_router(errata_router)
+app.include_router(paper_router)
+app.include_router(target_system_router)
 
 # 配置 CORS，增加对大请求体（Base64图片）的支持
 app.add_middleware(
@@ -575,24 +701,6 @@ async def create_task(
     try:
         new_task_id = f"task_{uuid.uuid4().hex[:8]}"
         new_thread_id = f"thread_{uuid.uuid4().hex[:8]}"
-        model_defaults = read_model_defaults()
-
-        def resolve_model_config(config_model, default_key: str) -> dict:
-            if config_model is not None:
-                return config_model.model_dump()
-            default_value = model_defaults.get(default_key)
-            if isinstance(default_value, dict):
-                return default_value
-            return {}
-
-        solver_config_payload = resolve_model_config(req.solver_config, "solver_config")
-        reviewer_config_payload = resolve_model_config(
-            req.reviewer_config, "reviewer_config"
-        )
-        formatter_config_payload = resolve_model_config(
-            req.formatter_config, "formatter_config"
-        )
-
         runtime_settings = read_runtime_settings()
         workflow_template_id = (
             req.workflow_template_id
@@ -646,13 +754,14 @@ async def create_task(
             task_id=new_task_id,
             thread_id=new_thread_id,
             image_url=normalized_image_urls[0] if normalized_image_urls else "",
+            image_urls_json=json.dumps(normalized_image_urls, ensure_ascii=False),
+            question_text=normalized_question_text or None,
+            input_revision=1,
+            workflow_type="standard",
             state=TaskStatus.QUEUED.value,
             history=json.dumps(
                 {
                     "image_urls": normalized_image_urls,
-                    "solver_config": (solver_config_payload),
-                    "reviewer_config": (reviewer_config_payload),
-                    "formatter_config": (formatter_config_payload),
                     "workflow_template_id": workflow_template_id,
                     "draft_solution": effective_draft_solution,
                     "question_text": normalized_question_text or None,
@@ -718,6 +827,132 @@ def get_task(task_id: str, db: Session = Depends(get_db)):
     return task
 
 
+@app.get(
+    "/api/tasks/{task_id}/artifacts", response_model=list[TaskArtifactResponse]
+)
+def list_task_artifacts(task_id: str, db: Session = Depends(get_db)):
+    if not db.query(Task).filter(Task.task_id == task_id).first():
+        raise HTTPException(status_code=404, detail="Task not found.")
+    return (
+        db.query(TaskArtifact)
+        .filter(TaskArtifact.task_id == task_id)
+        .order_by(TaskArtifact.input_revision, TaskArtifact.id)
+        .all()
+    )
+
+
+@app.patch("/api/tasks/{task_id}/input", response_model=TaskDetailResponse)
+def update_task_input(
+    task_id: str,
+    req: TaskInputUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    task = db.query(Task).filter(Task.task_id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    current_images = task.image_urls
+    incoming_images = normalize_image_urls(req.image_urls)
+    incoming_text = (req.question_text or "").strip()
+    if req.mode == "replace":
+        next_images = incoming_images
+        next_text = incoming_text
+    else:
+        next_images = normalize_image_urls(current_images + incoming_images)
+        current_text = (task.question_text or "").strip()
+        next_text = "\n".join(part for part in [current_text, incoming_text] if part)
+    if not next_images and not next_text:
+        raise HTTPException(status_code=400, detail="更新后题目图片和文字不能同时为空。")
+    task.image_urls_json = json.dumps(next_images, ensure_ascii=False)
+    task.image_url = next_images[0] if next_images else ""
+    task.question_text = next_text or None
+    task.input_revision = int(task.input_revision or 1) + 1
+    task.state = TaskStatus.MANUAL.value
+    task.current_node = None
+    task.final_result = None
+    task.question_preview = None
+    task.answer_preview = None
+    task.error_code = None
+    try:
+        history = json.loads(task.history or "{}")
+    except Exception:
+        history = {}
+    history["image_urls"] = next_images
+    history["question_text"] = next_text or None
+    history.pop("draft_solution", None)
+    history.pop("review_decision", None)
+    history.pop("review_feedback", None)
+    task.history = json.dumps(history, ensure_ascii=False)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+@app.post("/api/tasks/{task_id}/run", status_code=202)
+def run_task_from_node(
+    task_id: str,
+    req: TaskRunRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    task = db.query(Task).filter(Task.task_id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    if task.state in {
+        TaskStatus.QUEUED.value,
+        TaskStatus.SOLVING.value,
+        TaskStatus.REVIEWING.value,
+        TaskStatus.FORMATTING.value,
+    }:
+        raise HTTPException(status_code=409, detail="任务正在运行，请先等待当前节点结束。")
+    node_order = workflow_node_order(task.workflow_type or "standard")
+    targets = (
+        validate_requested_target_nodes(req.target_nodes, task.workflow_type or "standard")
+        if req.target_nodes
+        else node_order[node_order.index(req.start_node):] if req.start_node in node_order else []
+    )
+    if not targets or targets[0] != req.start_node:
+        raise HTTPException(status_code=400, detail="target_nodes 必须按顺序且以 start_node 开始。")
+    if req.start_node in {"reviewer", "formatter", "errata_adjudication", "word_composition"}:
+        predecessor = (
+            "formatter"
+            if task.workflow_type == "errata" and req.start_node in {"errata_adjudication", "word_composition"}
+            else "solver"
+        )
+        artifact = latest_task_artifact(task_id, predecessor, int(task.input_revision or 1))
+        if not artifact:
+            raise HTTPException(status_code=409, detail=f"当前输入版本没有 {predecessor} 产物，不能从该节点启动。")
+        try:
+            history = json.loads(task.history or "{}")
+        except Exception:
+            history = {}
+        if predecessor == "formatter":
+            history["formatted_solution"] = artifact.content
+        else:
+            history["draft_solution"] = artifact.content
+        task.history = json.dumps(history, ensure_ascii=False)
+    if task.workflow_type == "errata" and req.start_node == "word_composition":
+        review_artifact = latest_task_artifact(
+            task_id, "errata_adjudication", int(task.input_revision or 1)
+        )
+        if not review_artifact:
+            raise HTTPException(status_code=409, detail="勘误 Word 写回编排只能使用裁决通过的产物。")
+        try:
+            review_data = json.loads(review_artifact.content)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=409, detail="勘误裁决产物格式无效。") from exc
+        if review_data.get("original_answer_verdict") == "insufficient_evidence":
+            raise HTTPException(status_code=409, detail="证据不足，不能自动生成 Word 勘误文本。")
+    task.state = TaskStatus.QUEUED.value
+    task.error_code = None
+    if req.start_node != node_order[-1]:
+        task.final_result = None
+        task.question_preview = None
+        task.answer_preview = None
+    db.commit()
+    background_tasks.add_task(run_agent_workflow_async, task_id, req.start_node, targets)
+    return {"status": "accepted", "start_node": req.start_node, "target_nodes": targets}
+
+
 @app.get("/api/tasks/active", response_model=list[TaskDetailResponse])
 @app.get("/api/tasks/active/list", response_model=list[TaskDetailResponse])
 def list_active_tasks(db: Session = Depends(get_db)):
@@ -726,11 +961,93 @@ def list_active_tasks(db: Session = Depends(get_db)):
     """
     active_tasks = (
         db.query(Task)
-        .filter(Task.state != TaskStatus.COMPLETED.value)
+        .filter(
+            Task.state != TaskStatus.COMPLETED.value,
+            or_(
+                Task.workflow_type != "errata",
+                Task.state != TaskStatus.MANUAL.value,
+            ),
+        )
         .order_by(Task.updated_at.desc(), Task.created_at.desc())
         .all()
     )
     return active_tasks
+
+
+@app.get("/api/task-inbox")
+def list_task_inbox(
+    workflow_type: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    keyword: str | None = Query(default=None),
+    needs_attention: bool = Query(default=False),
+    limit: int = Query(default=200, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    """统一返回可恢复任务；工作流和来源筛选使用 Task 显式字段。"""
+    rows = db.query(Task).order_by(Task.updated_at.desc(), Task.created_at.desc()).limit(limit).all()
+    task_ids = [task.task_id for task in rows]
+    errata_map = {item.task_id: item for item in db.query(ErrataItem).filter(ErrataItem.task_id.in_(task_ids)).all() if item.task_id}
+    errata_job_ids = {item.job_id for item in errata_map.values()}
+    errata_jobs = {job.job_id: job for job in db.query(ErrataJob).filter(ErrataJob.job_id.in_(errata_job_ids)).all()} if errata_job_ids else {}
+    items = []
+    for task in rows:
+        try:
+            meta = json.loads(task.history or "{}")
+        except Exception:
+            meta = {}
+        kind = task.workflow_type or "standard"
+        legacy_errata = errata_map.get(task.task_id)
+        if kind == "errata" and legacy_errata:
+            job = errata_jobs.get(legacy_errata.job_id)
+            attachment_urls = []
+            for relative_path in json.loads(legacy_errata.evidence_json or "[]"):
+                parts = Path(relative_path).parts
+                if len(parts) >= 2 and parts[0] in {"render", "evidence"}:
+                    attachment_urls.append(f"/api/errata/jobs/{legacy_errata.job_id}/evidence/{parts[0]}/{Path(relative_path).name}")
+            meta = {
+                **meta,
+                "source_kind": "errata",
+                "source_id": legacy_errata.job_id,
+                "source_title": job.original_filename if job else "勘误任务",
+                "source_item_label": legacy_errata.source_ref or f"题块 {legacy_errata.item_index}",
+                "errata_item_id": legacy_errata.item_id,
+                "attachment_urls": attachment_urls,
+            }
+        source_title = str(meta.get("source_title") or "普通解题")
+        source_item_label = str(meta.get("source_item_label") or task.task_id)
+        searchable = " ".join([task.task_id, task.question_text or "", source_title, source_item_label]).lower()
+        requested_workflow = {
+            "normal": "standard",
+            "paper": "full_paper",
+            "target_system": "automation",
+        }.get(workflow_type or "", workflow_type)
+        if requested_workflow and kind != requested_workflow:
+            continue
+        if state and task.state != state:
+            continue
+        if keyword and keyword.lower() not in searchable:
+            continue
+        if needs_attention and task.state not in {"manual", "failed", "paused", "terminated", "abandoned"}:
+            continue
+        items.append({
+            "task_id": task.task_id,
+            "workflow_type": kind,
+            "state": task.state,
+            "source_kind": task.source_kind or meta.get("source_kind") or kind,
+            "source_id": task.source_id or meta.get("source_id"),
+            "source_title": source_title,
+            "source_item_label": source_item_label,
+            "attachment_urls": meta.get("attachment_urls") or task.image_urls,
+            "resume_target": {
+                "view": "errata" if kind == "errata" else "paper-docx" if kind == "full_paper" else "target-system" if kind == "automation" else "admin",
+                "source_id": task.source_id or meta.get("source_id"),
+                "item_id": task.source_item_id or meta.get("errata_item_id") or meta.get("paper_question_id"),
+            },
+            "error_code": task.error_code,
+            "updated_at": task.updated_at,
+            "created_at": task.created_at,
+        })
+    return {"total": len(items), "items": items}
 
 
 @app.get("/api/tasks/{task_id}/stream")
@@ -752,6 +1069,9 @@ async def stream_task(task_id: str):
             TaskStatus.FAILED.value,
             TaskStatus.MANUAL.value,
             TaskStatus.CANCELLED.value,
+            TaskStatus.PAUSED.value,
+            TaskStatus.TERMINATED.value,
+            TaskStatus.ABANDONED.value,
         ]:
             yield f"data: {json.dumps({'event': 'end'})}\n\n"
             return
@@ -795,6 +1115,9 @@ def submit_manual_review(
             TaskStatus.FAILED.value,
             TaskStatus.COMPLETED.value,
             TaskStatus.CANCELLED.value,
+            TaskStatus.PAUSED.value,
+            TaskStatus.TERMINATED.value,
+            TaskStatus.ABANDONED.value,
         }
     else:
         allowed_states = {TaskStatus.MANUAL.value, TaskStatus.FAILED.value}
@@ -820,19 +1143,25 @@ def submit_manual_review(
         current_history = json.loads(task.history) if task.history else {}
     except Exception:
         current_history = {}
+    workflow_type = task.workflow_type or "standard"
+    node_order = workflow_node_order(workflow_type)
+    draft_artifact_node = "solver"
+    if not current_history.get("draft_solution"):
+        solver_artifact = latest_task_artifact(
+            task_id, draft_artifact_node, int(task.input_revision or 1)
+        )
+        if solver_artifact:
+            current_history["draft_solution"] = solver_artifact.content
     if req.draft_solution is not None:
         current_history["draft_solution"] = req.draft_solution
-    if req.solver_config is not None:
-        current_history["solver_config"] = req.solver_config.model_dump()
-    if req.reviewer_config is not None:
-        current_history["reviewer_config"] = req.reviewer_config.model_dump()
-    if req.formatter_config is not None:
-        current_history["formatter_config"] = req.formatter_config.model_dump()
-    if req.workflow_template_id is not None:
-        current_history["workflow_template_id"] = req.workflow_template_id
 
     target_nodes: list[str] | None = None
     if req.action == "skip_review":
+        if workflow_type == "errata":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="勘误工作流不能跳过勘误裁决节点。",
+            )
         if current_history.get("draft_solution"):
             resume_node = "formatter"
             target_nodes = ["formatter"]
@@ -847,7 +1176,7 @@ def submit_manual_review(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="entry_point is required when action=custom_run.",
             )
-        requested_nodes = validate_requested_target_nodes(req.target_nodes)
+        requested_nodes = validate_requested_target_nodes(req.target_nodes, workflow_type)
         if not requested_nodes:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -866,26 +1195,22 @@ def submit_manual_review(
                 detail=f"entry_point must be the first node in target_nodes: {expected_entry}.",
             )
 
-        if req.entry_point in {"reviewer", "formatter"} and not current_history.get(
-            "draft_solution"
-        ):
+        if requires_draft_for_entry_point(req.entry_point, current_history.get("draft_solution")):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="draft_solution is required when entry_point is reviewer or formatter.",
             )
 
         resume_node = req.entry_point
-        normalized_nodes = normalize_target_nodes(requested_nodes)
+        normalized_nodes = normalize_target_nodes(requested_nodes, workflow_type)
         target_nodes = normalized_nodes
         current_history["target_nodes"] = normalized_nodes
     else:
-        resume_node = current_history.get("failed_node", "solver")
-        if resume_node not in VALID_RESUME_NODES:
-            resume_node = "solver"
-        if resume_node in {"reviewer", "formatter"} and not current_history.get(
-            "draft_solution"
-        ):
-            resume_node = "solver"
+        resume_node = current_history.get("failed_node", node_order[0])
+        if resume_node not in node_order:
+            resume_node = node_order[0]
+        if requires_draft_for_entry_point(resume_node, current_history.get("draft_solution")):
+            resume_node = node_order[0]
         current_history.pop("target_nodes", None)
     task.history = json.dumps(current_history, ensure_ascii=False)
 
@@ -927,9 +1252,29 @@ def cancel_task(task_id: str, db: Session = Depends(get_db)):
     return {"status": "success", "message": "Task marked as cancelled."}
 
 
+@app.post("/api/tasks/{task_id}/operation", response_model=TaskDetailResponse)
+def operate_task(task_id: str, req: TaskOperationRequest, db: Session = Depends(get_db)):
+    task = db.query(Task).filter(Task.task_id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    if task.state == TaskStatus.COMPLETED.value:
+        raise HTTPException(status_code=409, detail="已完成任务不能执行该操作。")
+    state_by_action = {
+        "pause": TaskStatus.PAUSED.value,
+        "terminate": TaskStatus.TERMINATED.value,
+        "abandon": TaskStatus.ABANDONED.value,
+    }
+    label_by_action = {"pause": "暂停", "terminate": "终止", "abandon": "放弃"}
+    task.state = state_by_action[req.action]
+    task.error_code = f"用户已{label_by_action[req.action]}任务。"
+    db.commit()
+    db.refresh(task)
+    return task
+
+
 @app.get("/api/settings/runtime", response_model=RuntimeSettingsResponse)
 def get_runtime_settings():
-    return read_runtime_settings()
+    return read_public_runtime_settings()
 
 
 @app.put("/api/settings/runtime", response_model=RuntimeSettingsResponse)
@@ -962,6 +1307,18 @@ def get_paper_builder_draft(draft_id: str):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="draft_id 不能为空。",
         )
+    try:
+        is_errata_task = json.loads(task.history or "{}").get("workflow_type") == "errata"
+    except Exception:
+        is_errata_task = False
+    if is_errata_task:
+        from app.services.errata_service import run_errata_task
+
+        task.state = TaskStatus.QUEUED.value
+        task.error_code = None
+        db.commit()
+        background_tasks.add_task(run_errata_task, task_id)
+        return {"status": "success", "message": "勘误任务已继续。"}
 
     store = load_paper_builder_drafts_store()
     drafts = store.get("drafts") or {}
@@ -1054,6 +1411,8 @@ def update_template(template_id: str, req: PromptTemplatePayload):
 def admin_list_tasks(
     task_id: str | None = Query(default=None),
     state: TaskStatus | None = Query(default=None),
+    workflow_type: str | None = Query(default=None),
+    source_id: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=200),
     db: Session = Depends(get_db),
@@ -1063,6 +1422,10 @@ def admin_list_tasks(
         query = query.filter(Task.task_id.like(f"%{task_id}%"))
     if state:
         query = query.filter(Task.state == state.value)
+    if workflow_type:
+        query = query.filter(Task.workflow_type == workflow_type)
+    if source_id:
+        query = query.filter(Task.source_id == source_id)
 
     total = query.count()
     items = (
@@ -1624,7 +1987,11 @@ def admin_delete_task(task_id: str, db: Session = Depends(get_db)):
             status_code=status.HTTP_404_NOT_FOUND, detail="Task not found."
         )
 
+    db.query(ErrataItem).filter(ErrataItem.task_id == task_id).delete(
+        synchronize_session=False
+    )
     db.query(AgentLog).filter(AgentLog.task_id == task_id).delete()
+    db.query(TaskArtifact).filter(TaskArtifact.task_id == task_id).delete()
     db.delete(task)
     db.commit()
     return {"status": "success", "message": f"Task {task_id} deleted."}
@@ -1642,8 +2009,144 @@ def ensure_task_preview_columns() -> None:
                 conn.execute(text("ALTER TABLE tasks ADD COLUMN question_preview TEXT"))
             if "answer_preview" not in columns:
                 conn.execute(text("ALTER TABLE tasks ADD COLUMN answer_preview TEXT"))
+            if "question_text" not in columns:
+                conn.execute(text("ALTER TABLE tasks ADD COLUMN question_text TEXT"))
+            if "image_urls_json" not in columns:
+                conn.execute(text("ALTER TABLE tasks ADD COLUMN image_urls_json TEXT"))
+            if "input_revision" not in columns:
+                conn.execute(text("ALTER TABLE tasks ADD COLUMN input_revision INTEGER NOT NULL DEFAULT 1"))
+            if "current_node" not in columns:
+                conn.execute(text("ALTER TABLE tasks ADD COLUMN current_node VARCHAR"))
+            if "workflow_type" not in columns:
+                conn.execute(text("ALTER TABLE tasks ADD COLUMN workflow_type VARCHAR NOT NULL DEFAULT 'standard'"))
+            if "source_kind" not in columns:
+                conn.execute(text("ALTER TABLE tasks ADD COLUMN source_kind VARCHAR"))
+            if "source_id" not in columns:
+                conn.execute(text("ALTER TABLE tasks ADD COLUMN source_id VARCHAR"))
+            if "source_item_id" not in columns:
+                conn.execute(text("ALTER TABLE tasks ADD COLUMN source_item_id VARCHAR"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_workflow_type ON tasks (workflow_type)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_source_kind ON tasks (source_kind)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_source_id ON tasks (source_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_source_item_id ON tasks (source_item_id)"))
+            errata_columns = {
+                row[1]
+                for row in conn.execute(text("PRAGMA table_info(errata_jobs)")).fetchall()
+            }
+            if errata_columns:
+                if "mineru_status" not in errata_columns:
+                    conn.execute(text("ALTER TABLE errata_jobs ADD COLUMN mineru_status VARCHAR DEFAULT 'not_requested'"))
+                if "mineru_markdown" not in errata_columns:
+                    conn.execute(text("ALTER TABLE errata_jobs ADD COLUMN mineru_markdown TEXT"))
+                if "custom_anchors" not in errata_columns:
+                    conn.execute(text("ALTER TABLE errata_jobs ADD COLUMN custom_anchors TEXT"))
+            item_columns = {
+                row[1]
+                for row in conn.execute(text("PRAGMA table_info(errata_items)")).fetchall()
+            }
+            if item_columns:
+                if "mineru_text" not in item_columns:
+                    conn.execute(text("ALTER TABLE errata_items ADD COLUMN mineru_text TEXT"))
+                if "review_status" not in item_columns:
+                    conn.execute(text("ALTER TABLE errata_items ADD COLUMN review_status VARCHAR DEFAULT 'pending'"))
+                if "review_feedback" not in item_columns:
+                    conn.execute(text("ALTER TABLE errata_items ADD COLUMN review_feedback TEXT"))
+                if "task_id" not in item_columns:
+                    conn.execute(text("ALTER TABLE errata_items ADD COLUMN task_id VARCHAR"))
+            paper_columns = {
+                row[1]
+                for row in conn.execute(text("PRAGMA table_info(paper_projects)")).fetchall()
+            }
+            if paper_columns:
+                if "mineru_status" not in paper_columns:
+                    conn.execute(text("ALTER TABLE paper_projects ADD COLUMN mineru_status VARCHAR DEFAULT 'not_requested'"))
+                if "mineru_markdown" not in paper_columns:
+                    conn.execute(text("ALTER TABLE paper_projects ADD COLUMN mineru_markdown TEXT"))
     except Exception as exc:
         print(f"[DB] Failed to ensure preview columns: {exc}")
+
+
+def migrate_task_workflow_metadata() -> None:
+    """一次性把 history 中的工作流来源迁到 Task 显式字段。"""
+    migration_id = "task_workflow_metadata_v1"
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS app_migrations "
+                    "(migration_id VARCHAR PRIMARY KEY, applied_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
+                )
+            )
+            applied = conn.execute(
+                text("SELECT 1 FROM app_migrations WHERE migration_id = :migration_id"),
+                {"migration_id": migration_id},
+            ).first()
+        if applied:
+            return
+
+        workflow_map = {
+            "normal": "standard",
+            "standard": "standard",
+            "errata": "errata",
+            "paper": "full_paper",
+            "full_paper": "full_paper",
+            "target_system": "automation",
+            "automation": "automation",
+        }
+        with SessionLocal() as db:
+            for task in db.query(Task).all():
+                try:
+                    history = json.loads(task.history or "{}")
+                except Exception:
+                    history = {}
+                task.workflow_type = workflow_map.get(
+                    str(history.get("workflow_type") or task.workflow_type or "standard"),
+                    "standard",
+                )
+                task.source_kind = task.source_kind or history.get("source_kind")
+                task.source_id = task.source_id or (
+                    str(history.get("source_id")) if history.get("source_id") is not None else None
+                )
+                source_item = (
+                    history.get("errata_item_id")
+                    or history.get("paper_question_id")
+                    or history.get("target_system_remote_id")
+                )
+                task.source_item_id = task.source_item_id or (
+                    str(source_item) if source_item is not None else None
+                )
+            for job_id, in db.query(ErrataJob.job_id).all():
+                ensure_errata_tasks(db, job_id, create_missing=True)
+            db.execute(
+                text("INSERT INTO app_migrations (migration_id) VALUES (:migration_id)"),
+                {"migration_id": migration_id},
+            )
+            db.commit()
+    except Exception as exc:
+        print(f"[DB] Failed to migrate task workflow metadata: {exc}")
+
+
+def ensure_target_system_columns() -> None:
+    """为已有 SQLite 数据库补齐串行交付字段。"""
+    try:
+        with engine.begin() as conn:
+            columns = {
+                row[1]
+                for row in conn.execute(text("PRAGMA table_info(target_system_tasks)")).fetchall()
+            }
+            additions = {
+                "delivery_order": "INTEGER",
+                "delivery_locked_at": "DATETIME",
+                "filled_at": "DATETIME",
+                "delivered_at": "DATETIME",
+                "browser_screenshot_path": "TEXT",
+                "rendered_answer_path": "TEXT",
+            }
+            for name, sql_type in additions.items():
+                if columns and name not in columns:
+                    conn.execute(text(f"ALTER TABLE target_system_tasks ADD COLUMN {name} {sql_type}"))
+    except Exception as exc:
+        print(f"[DB] Failed to ensure target system columns: {exc}")
 
 
 @app.get("/api/admin/logs", response_model=AdminLogListResponse)

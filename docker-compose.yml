@@ -18,6 +18,7 @@ services:
       - LLM_BASE_URL=${LLM_BASE_URL:-https://api.openai.com/v1}
       - LLM_MODEL_NAME=${LLM_MODEL_NAME:-gpt-4o-mini}
       - CONFIG_DIR=/app/config
+      - TARGET_SYSTEM_BROWSER_ACCESS_URL=${TARGET_SYSTEM_BROWSER_ACCESS_URL:-}
     ports:
       - "${APP_PORT:-35828}:38080"
     volumes:
@@ -28,3 +29,25 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+  target_system_worker:
+    image: ${IMAGE_NAME:-zyb_agent:latest}
+    profiles: ["browser-delivery"]
+    restart: unless-stopped
+    working_dir: /app
+    command: ["sh", "scripts/start_target_system_desktop.sh"]
+    environment:
+      - TZ=Asia/Shanghai
+      - PYTHONUNBUFFERED=1
+      - CONFIG_DIR=/app/config
+      - TARGET_SYSTEM_WORKER_API=http://zyb_agent:38080
+      - TARGET_SYSTEM_WORKER_HEADLESS=0
+      - TARGET_SYSTEM_VNC_PASSWORD=${TARGET_SYSTEM_VNC_PASSWORD}
+      - TARGET_SYSTEM_BROWSER_ACCESS_URL=${TARGET_SYSTEM_BROWSER_ACCESS_URL:-}
+      - DISPLAY=:99
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+    depends_on:
+      - zyb_agent
+    ports:
+      - "${TARGET_SYSTEM_VNC_PORT:-6080}:6080"

@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/target-system-api-contract.schema.json",
+  "title": "脱敏目标系统 API 契约",
+  "type": "object",
+  "required": ["authentication", "response_envelope", "endpoints"],
+  "properties": {
+    "authentication": {
+      "type": "object",
+      "properties": {"header": {"const": "Authorization"}, "format": {"const": "unknown"}},
+      "required": ["header", "format"]
+    },
+    "response_envelope": {
+      "type": "object",
+      "properties": {
+        "code": {"type": "integer"},
+        "message": {"type": ["string", "null"]},
+        "msg": {"type": ["string", "null"]},
+        "data": {}
+      },
+      "required": ["code", "data"]
+    },
+    "endpoints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["method", "path", "auth", "request_fields", "response_fields", "observed_http_status", "evidence", "verification"],
+        "properties": {
+          "method": {"const": "POST"},
+          "path": {"type": "string", "pattern": "^/admin/"},
+          "auth": {"enum": ["none", "Authorization"]},
+          "request_fields": {"type": "object", "additionalProperties": {"type": "object", "required": ["type", "nullable"], "properties": {"type": {"type": "string"}, "nullable": {"enum": [true, false, "unknown"]}}}},
+          "response_fields": {"type": "object"},
+          "observed_http_status": {"type": "array", "items": {"type": "integer"}},
+          "evidence": {"type": "array", "items": {"type": "string"}},
+          "verification": {"enum": ["抓包观测", "抓包观测+代码读取", "代码推测"]}
+        }
+      },
+      "default": [
+        {"method":"POST","path":"/admin/login","auth":"none","request_fields":{"username":{"type":"string","nullable":false},"password":{"type":"string","nullable":false}},"response_fields":{"data.token":{"type":"string"},"data.info.developer_id":{"type":"integer"},"data.info.nickname":{"type":"string"}},"observed_http_status":[200],"evidence":["captured_traffic","historical_client"],"verification":"抓包观测+代码读取"},
+        {"method":"POST","path":"/admin/info","auth":"Authorization","request_fields":{},"response_fields":{},"observed_http_status":[200],"evidence":["captured_traffic"],"verification":"抓包观测"},
+        {"method":"POST","path":"/admin/school/list","auth":"Authorization","request_fields":{"is_business":{"type":"integer","nullable":"unknown"},"schoolIds":{"type":"array","nullable":"unknown"}},"response_fields":{"data.list":{"type":"array"}},"observed_http_status":[200],"evidence":["captured_traffic","historical_client"],"verification":"抓包观测+代码读取"},
+        {"method":"POST","path":"/admin/college/list","auth":"Authorization","request_fields":{"school_id":{"type":"integer","nullable":false}},"response_fields":{},"observed_http_status":[200],"evidence":["captured_traffic"],"verification":"抓包观测"},
+        {"method":"POST","path":"/admin/grade/list","auth":"Authorization","request_fields":{},"response_fields":{},"observed_http_status":[200],"evidence":["captured_traffic"],"verification":"抓包观测"},
+        {"method":"POST","path":"/admin/research/aiTopicList","auth":"Authorization","request_fields":{"school_id":{"type":"integer","nullable":"unknown"},"subject_ids":{"type":"array","nullable":"unknown"},"status":{"type":"integer","nullable":"unknown"},"contain_img":{"type":"integer","nullable":"unknown"},"developer_id":{"type":"integer","nullable":"unknown"},"judge_admin_id":{"type":"string","nullable":"unknown"},"page":{"type":"integer","nullable":false},"pagesize":{"type":"integer","nullable":false},"check_developer_id":{"type":"integer","nullable":"unknown"},"check_time":{"type":"integer","nullable":"unknown"},"check_unlock":{"type":"integer","nullable":"unknown"},"is_unlock":{"type":"integer","nullable":"unknown"},"selfCate":{"type":"integer","nullable":"unknown"},"submit_time":{"type":"integer","nullable":"unknown"}},"response_fields":{"data.list":{"type":"array"}},"observed_http_status":[200],"evidence":["captured_traffic","historical_client"],"verification":"抓包观测+代码读取"},
+        {"method":"POST","path":"/admin/research/aiTopicInfo","auth":"Authorization","request_fields":{"id":{"type":"integer","nullable":false}},"response_fields":{"data":{"type":"object"}},"observed_http_status":[200],"evidence":["captured_traffic"],"verification":"抓包观测"},
+        {"method":"POST","path":"/admin/research/startDevAiTopic","auth":"Authorization","request_fields":{"id":{"type":"integer","nullable":false}},"response_fields":{},"observed_http_status":[200],"evidence":["captured_traffic"],"verification":"抓包观测"},
+        {"method":"POST","path":"/admin/research/cancelDevAiTopic","auth":"Authorization","request_fields":{"id":{"type":"integer","nullable":false}},"response_fields":{},"observed_http_status":[],"evidence":["historical_client"],"verification":"代码推测"},
+        {"method":"POST","path":"/admin/openai/imgToText","auth":"Authorization","request_fields":{"file":{"type":"binary","nullable":"unknown"}},"response_fields":{"data.text":{"type":"string"}},"observed_http_status":[200],"evidence":["captured_traffic","historical_client"],"verification":"抓包观测+代码读取"},
+        {"method":"POST","path":"/admin/research/saveAiTopic","auth":"Authorization","request_fields":{"id":{"type":"integer","nullable":false},"topic":{"type":"string","nullable":"unknown"},"topic_text":{"type":"string","nullable":"unknown"},"answer":{"type":"string","nullable":"unknown"},"answer_text":{"type":"string","nullable":"unknown"},"topic_right":{"type":"string","nullable":"unknown"},"exam_point":{"type":"string","nullable":"unknown"},"status":{"type":"integer","nullable":"unknown"},"is_unlock":{"type":"integer","nullable":"unknown"},"isDevSubmit":{"type":"integer","nullable":"unknown"}},"response_fields":{},"observed_http_status":[200],"evidence":["captured_traffic"],"verification":"抓包观测"},
+        {"method":"POST","path":"/admin/goods/myErrataByDev","auth":"Authorization","request_fields":{"is_unlock":{"type":"integer","nullable":"unknown"}},"response_fields":{},"observed_http_status":[200],"evidence":["captured_traffic"],"verification":"抓包观测"},
+        {"method":"POST","path":"/admin/task/user","auth":"Authorization","request_fields":{"is_settle":{"type":"integer","nullable":"unknown"},"is_unlock":{"type":"integer","nullable":"unknown"},"status":{"type":"integer","nullable":"unknown"}},"response_fields":{},"observed_http_status":[200],"evidence":["captured_traffic"],"verification":"抓包观测"},
+        {"method":"POST","path":"/admin/task/index","auth":"Authorization","request_fields":{},"response_fields":{},"observed_http_status":[200],"evidence":["captured_traffic"],"verification":"抓包观测"},
+        {"method":"POST","path":"/admin/developer/withdrawLog","auth":"Authorization","request_fields":{"developer_id":{"type":"integer","nullable":"unknown"},"type":{"type":"integer","nullable":"unknown"},"types":{"type":"array","nullable":"unknown"}},"response_fields":{},"observed_http_status":[200],"evidence":["captured_traffic"],"verification":"抓包观测"}
+      ]
+    }
+  }
+}

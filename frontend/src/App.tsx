@@ -1,29 +1,19 @@
 import { QueryClient, QueryClientProvider, useMutation, useQueries, useQuery } from '@tanstack/react-query'
 import axios from 'axios'
 import 'katex/dist/katex.min.css'
-import { ChevronDown, ChevronUp, Database, Download, Image as ImageIcon, Maximize2, Play, Plus, Save, Settings, Trash2, X } from 'lucide-react'
-import { ChangeEvent, ClipboardEvent, DragEvent, MouseEvent, useEffect, useMemo, useRef, useState } from 'react'
+import { ChevronDown, ChevronUp, Database, Download, Image as ImageIcon, ListTodo, Maximize2, Play, Plus, Save, Search, Settings, Trash2, X } from 'lucide-react'
+import { ChangeEvent, DragEvent, MouseEvent, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import rehypeKatex from 'rehype-katex'
 import remarkMath from 'remark-math'
+import ErrataWorkbench from './ErrataWorkbench'
+import PaperDocxWorkbench from './PaperDocxWorkbench'
+import TargetSystemWorkbench from './TargetSystemWorkbench'
 
 const queryClient = new QueryClient()
 
 const api = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || '',
-})
-
-api.interceptors.request.use((config) => {
-  const mineruApiToken = (localStorage.getItem(MINERU_API_TOKEN_STORAGE_KEY) || '').trim()
-  const mineruApiBaseUrl = (localStorage.getItem(MINERU_API_BASE_URL_STORAGE_KEY) || '').trim()
-  config.headers = config.headers ?? {}
-  if (mineruApiToken) {
-    config.headers['X-Mineru-Api-Token'] = mineruApiToken
-  }
-  if (mineruApiBaseUrl) {
-    config.headers['X-Mineru-Api-Base-Url'] = mineruApiBaseUrl
-  }
-  return config
 })
 
 const RUNNING_TASK_STATES = ['queued', 'solving', 'reviewing', 'formatting']
@@ -35,10 +25,9 @@ const REVIEWER_CONFIG_STORAGE_KEY = 'reviewer_config'
 const FORMATTER_CONFIG_STORAGE_KEY = 'formatter_config'
 const SHARED_BASE_URL_STORAGE_KEY = 'shared_base_url'
 const SHARED_API_KEY_STORAGE_KEY = 'shared_api_key'
-const MINERU_API_BASE_URL_STORAGE_KEY = 'mineru_api_base_url'
-const MINERU_API_TOKEN_STORAGE_KEY = 'mineru_api_token'
 const WORKFLOW_TEMPLATE_ID_STORAGE_KEY = 'workflow_template_id'
 const INPUT_SELECTED_NODES_STORAGE_KEY = 'input_selected_nodes'
+const INPUT_ANSWER_MODE_STORAGE_KEY = 'input_answer_mode'
 const WORKFLOW_NODE_ORDER = ['solver', 'reviewer', 'formatter'] as const
 const PAPER_BUILDER_LOCAL_DRAFT_KEY = 'paper_builder_local_draft_v1'
 const PAPER_BUILDER_REMOTE_DRAFT_ID = 'default'
@@ -95,17 +84,32 @@ interface AdminTask {
   thread_id: string;
   image_url: string;
   image_urls?: string[];
+  question_text?: string | null;
+  workflow_type?: string;
+  source_kind?: string | null;
+  source_id?: string | null;
+  source_item_id?: string | null;
   state: string;
   retry_count: number;
   history?: string | null;
   final_result?: string | null;
   question_preview?: string | null;
   answer_preview?: string | null;
+  input_revision?: number;
   token_usage?: string | null;
   error_code?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
   manual_operator?: string | null;
+}
+
+interface TaskArtifact {
+  id: number;
+  task_id: string;
+  node_name: WorkflowNode;
+  input_revision: number;
+  content: string;
+  created_at?: string | null;
 }
 
 interface AdminTaskListResponse {
@@ -149,11 +153,12 @@ interface AdminLogListResponse {
   items: AdminLogItem[];
 }
 
-interface RetryModelConfigs {
-  solver_config: ModelConfig;
-  reviewer_config: ModelConfig;
-  formatter_config: ModelConfig;
-  workflow_template_id: string;
+interface RuntimeModelConfig {
+  model_name: string;
+  base_url: string;
+  max_tokens: number;
+  api_key_masked: string;
+  api_key_configured: boolean;
 }
 
 interface RuntimeSettingsResponse {
@@ -167,6 +172,14 @@ interface RuntimeSettingsResponse {
       reviewer: string[];
       formatter: string[];
     };
+  };
+  solver_config: RuntimeModelConfig;
+  reviewer_config: RuntimeModelConfig;
+  formatter_config: RuntimeModelConfig;
+  mineru_config: {
+    base_url: string;
+    api_token_masked: string;
+    api_token_configured: boolean;
   };
 }
 
@@ -190,8 +203,10 @@ interface SettingsSnapshot {
   formatterConfig: ModelConfig;
   sharedBaseUrl: string;
   sharedApiKey: string;
+  clearSharedApiKey: boolean;
   mineruApiBaseUrl: string;
   mineruApiToken: string;
+  clearMineruApiToken: boolean;
   activeTemplateId: string;
   requestTimeoutSeconds: number;
   maxRetries: number;
@@ -235,24 +250,7 @@ const mergeModelConfigWithShared = (
   }
 }
 
-const getLatestRetryConfigs = (): RetryModelConfigs => ({
-  solver_config: mergeModelConfigWithShared(
-    readStoredJson<ModelConfig>(SOLVER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 4096 }),
-    localStorage.getItem(SHARED_BASE_URL_STORAGE_KEY) || '',
-    localStorage.getItem(SHARED_API_KEY_STORAGE_KEY) || ''
-  ),
-  reviewer_config: mergeModelConfigWithShared(
-    readStoredJson<ModelConfig>(REVIEWER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 2048 }),
-    localStorage.getItem(SHARED_BASE_URL_STORAGE_KEY) || '',
-    localStorage.getItem(SHARED_API_KEY_STORAGE_KEY) || ''
-  ),
-  formatter_config: mergeModelConfigWithShared(
-    readStoredJson<ModelConfig>(FORMATTER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 1024 }),
-    localStorage.getItem(SHARED_BASE_URL_STORAGE_KEY) || '',
-    localStorage.getItem(SHARED_API_KEY_STORAGE_KEY) || ''
-  ),
-  workflow_template_id: localStorage.getItem(WORKFLOW_TEMPLATE_ID_STORAGE_KEY) || 'workflow_a'
-})
+const getLatestRetryConfigs = (): Record<string, never> => ({})
 
 const persistTaskForDashboard = (taskId: string) => {
   const submittedTasks = readStoredJson<SubmittedTask[]>(SUBMITTED_TASKS_STORAGE_KEY, [])
@@ -277,7 +275,7 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const [pendingInputImages, setPendingInputImages] = useState<string[]>([])
   const [inputQuestionText, setInputQuestionText] = useState('')
-  const [inputSkipReview, setInputSkipReview] = useState(false)
+  const [inputSkipReview, setInputSkipReview] = useState(() => localStorage.getItem(INPUT_ANSWER_MODE_STORAGE_KEY) === 'quick')
   const [inputSelectedNodes, setInputSelectedNodes] = useState<WorkflowNode[]>(() => {
     const saved = readStoredJson<WorkflowNode[]>(INPUT_SELECTED_NODES_STORAGE_KEY, [...WORKFLOW_NODE_ORDER])
     if (!Array.isArray(saved)) return [...WORKFLOW_NODE_ORDER]
@@ -333,12 +331,12 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     const formatterSaved = readStoredJson<ModelConfig>(FORMATTER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 1024 })
     return (solverSaved.api_key || reviewerSaved.api_key || formatterSaved.api_key || '').trim()
   })
-  const [mineruApiBaseUrl, setMineruApiBaseUrl] = useState<string>(() => (
-    localStorage.getItem(MINERU_API_BASE_URL_STORAGE_KEY) || ''
-  ))
-  const [mineruApiToken, setMineruApiToken] = useState<string>(() => (
-    localStorage.getItem(MINERU_API_TOKEN_STORAGE_KEY) || ''
-  ))
+  const [sharedApiKeyMasked, setSharedApiKeyMasked] = useState('')
+  const [clearSharedApiKey, setClearSharedApiKey] = useState(false)
+  const [mineruApiBaseUrl, setMineruApiBaseUrl] = useState<string>('')
+  const [mineruApiToken, setMineruApiToken] = useState<string>('')
+  const [mineruApiTokenMasked, setMineruApiTokenMasked] = useState('')
+  const [clearMineruApiToken, setClearMineruApiToken] = useState(false)
   const [runtimeLoading, setRuntimeLoading] = useState(false)
   const [runtimeError, setRuntimeError] = useState<string | null>(null)
   const [activeTemplateId, setActiveTemplateId] = useState<string>(() => localStorage.getItem(WORKFLOW_TEMPLATE_ID_STORAGE_KEY) || 'workflow_a')
@@ -366,8 +364,10 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     formatterConfig,
     sharedBaseUrl,
     sharedApiKey,
+    clearSharedApiKey,
     mineruApiBaseUrl,
     mineruApiToken,
+    clearMineruApiToken,
     activeTemplateId,
     requestTimeoutSeconds,
     maxRetries,
@@ -424,6 +424,15 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       setFormatterFallbackText(listToText(runtime.fallback?.nodes?.formatter || []))
       setRequestTimeoutSeconds(runtime.request_timeout_seconds || 300)
       setMaxRetries(runtime.max_retries ?? 2)
+      const legacySolver = readStoredJson<ModelConfig>(SOLVER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 4096 })
+      const legacyReviewer = readStoredJson<ModelConfig>(REVIEWER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 2048 })
+      const legacyFormatter = readStoredJson<ModelConfig>(FORMATTER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 1024 })
+      const nextSolverConfig: ModelConfig = { model_name: runtime.solver_config?.model_name || legacySolver.model_name || '', api_key: '', base_url: '', max_tokens: runtime.solver_config?.max_tokens || legacySolver.max_tokens || 4096 }
+      const nextReviewerConfig: ModelConfig = { model_name: runtime.reviewer_config?.model_name || legacyReviewer.model_name || '', api_key: '', base_url: '', max_tokens: runtime.reviewer_config?.max_tokens || legacyReviewer.max_tokens || 2048 }
+      const nextFormatterConfig: ModelConfig = { model_name: runtime.formatter_config?.model_name || legacyFormatter.model_name || '', api_key: '', base_url: '', max_tokens: runtime.formatter_config?.max_tokens || legacyFormatter.max_tokens || 1024 }
+      setSolverConfig(nextSolverConfig)
+      setReviewerConfig(nextReviewerConfig)
+      setFormatterConfig(nextFormatterConfig)
 
       const normalizedTemplates = Array.isArray(templates) ? templates : []
       setTemplateItems(normalizedTemplates)
@@ -444,23 +453,30 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       setReviewerUserPrompt(detail.prompts?.reviewer?.user || '')
       setFormatterSystemPrompt(detail.prompts?.formatter?.system || '')
       setFormatterUserPrompt(detail.prompts?.formatter?.user || '')
-      const nextSharedBaseUrl = (localStorage.getItem(SHARED_BASE_URL_STORAGE_KEY) || solverConfig.base_url || reviewerConfig.base_url || formatterConfig.base_url || '').trim()
-      const nextSharedApiKey = (localStorage.getItem(SHARED_API_KEY_STORAGE_KEY) || solverConfig.api_key || reviewerConfig.api_key || formatterConfig.api_key || '').trim()
-      const nextMineruApiBaseUrl = (localStorage.getItem(MINERU_API_BASE_URL_STORAGE_KEY) || '').trim()
-      const nextMineruApiToken = (localStorage.getItem(MINERU_API_TOKEN_STORAGE_KEY) || '').trim()
+      const nextSharedBaseUrl = (runtime.solver_config?.base_url || runtime.reviewer_config?.base_url || runtime.formatter_config?.base_url || localStorage.getItem(SHARED_BASE_URL_STORAGE_KEY) || '').trim()
+      const serverHasApiKey = Boolean(runtime.solver_config?.api_key_configured || runtime.reviewer_config?.api_key_configured || runtime.formatter_config?.api_key_configured)
+      const nextSharedApiKey = serverHasApiKey ? '' : (localStorage.getItem(SHARED_API_KEY_STORAGE_KEY) || legacySolver.api_key || legacyReviewer.api_key || legacyFormatter.api_key || '').trim()
+      const nextMineruApiBaseUrl = (runtime.mineru_config?.base_url || '').trim()
+      const nextMineruApiToken = ''
       setSharedBaseUrl(nextSharedBaseUrl)
       setSharedApiKey(nextSharedApiKey)
+      setSharedApiKeyMasked(runtime.solver_config?.api_key_masked || runtime.reviewer_config?.api_key_masked || runtime.formatter_config?.api_key_masked || '')
+      setClearSharedApiKey(false)
       setMineruApiBaseUrl(nextMineruApiBaseUrl)
       setMineruApiToken(nextMineruApiToken)
+      setMineruApiTokenMasked(runtime.mineru_config?.api_token_masked || '')
+      setClearMineruApiToken(false)
 
       const baseline = toSettingsSnapshotString({
-        solverConfig,
-        reviewerConfig,
-        formatterConfig,
+        solverConfig: nextSolverConfig,
+        reviewerConfig: nextReviewerConfig,
+        formatterConfig: nextFormatterConfig,
         sharedBaseUrl: nextSharedBaseUrl,
         sharedApiKey: nextSharedApiKey,
+        clearSharedApiKey: false,
         mineruApiBaseUrl: nextMineruApiBaseUrl,
         mineruApiToken: nextMineruApiToken,
+        clearMineruApiToken: false,
         activeTemplateId: pickedTemplateId,
         requestTimeoutSeconds: runtime.request_timeout_seconds || 300,
         maxRetries: runtime.max_retries ?? 2,
@@ -486,18 +502,8 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     }
   }
 
-  // 保存设置到 localStorage
   const saveSettings = async () => {
     setSettingsSaving(true)
-    localStorage.setItem(SOLVER_CONFIG_STORAGE_KEY, JSON.stringify({ ...solverConfig, base_url: '', api_key: '' }))
-    localStorage.setItem(REVIEWER_CONFIG_STORAGE_KEY, JSON.stringify({ ...reviewerConfig, base_url: '', api_key: '' }))
-    localStorage.setItem(FORMATTER_CONFIG_STORAGE_KEY, JSON.stringify({ ...formatterConfig, base_url: '', api_key: '' }))
-    localStorage.setItem(SHARED_BASE_URL_STORAGE_KEY, sharedBaseUrl.trim())
-    localStorage.setItem(SHARED_API_KEY_STORAGE_KEY, sharedApiKey.trim())
-    localStorage.setItem(MINERU_API_BASE_URL_STORAGE_KEY, mineruApiBaseUrl.trim())
-    localStorage.setItem(MINERU_API_TOKEN_STORAGE_KEY, mineruApiToken.trim())
-    localStorage.setItem(WORKFLOW_TEMPLATE_ID_STORAGE_KEY, activeTemplateId)
-
     try {
       await api.put('/api/settings/runtime', {
         active_template_id: activeTemplateId,
@@ -510,7 +516,11 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
             reviewer: textToList(reviewerFallbackText),
             formatter: textToList(formatterFallbackText)
           }
-        }
+        },
+        solver_config: { ...mergeModelConfigWithShared(solverConfig, sharedBaseUrl, sharedApiKey), clear_api_key: clearSharedApiKey },
+        reviewer_config: { ...mergeModelConfigWithShared(reviewerConfig, sharedBaseUrl, sharedApiKey), clear_api_key: clearSharedApiKey },
+        formatter_config: { ...mergeModelConfigWithShared(formatterConfig, sharedBaseUrl, sharedApiKey), clear_api_key: clearSharedApiKey },
+        mineru_config: { base_url: mineruApiBaseUrl, api_token: mineruApiToken, clear_api_token: clearMineruApiToken }
       })
 
       await api.put(`/api/templates/${activeTemplateId}`, {
@@ -526,6 +536,10 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       setErrorMessage(getErrorMessage(error, '保存设置失败'))
       setSettingsSaving(false)
       return
+    }
+
+    for (const key of [SOLVER_CONFIG_STORAGE_KEY, REVIEWER_CONFIG_STORAGE_KEY, FORMATTER_CONFIG_STORAGE_KEY, SHARED_BASE_URL_STORAGE_KEY, SHARED_API_KEY_STORAGE_KEY, WORKFLOW_TEMPLATE_ID_STORAGE_KEY]) {
+      localStorage.removeItem(key)
     }
 
     setSettingsBaseline(currentSettingsSnapshot)
@@ -591,21 +605,39 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   }
 
   // 处理剪贴板粘贴图片
-  const handlePaste = (e: ClipboardEvent<HTMLDivElement>) => {
-    const items = e.clipboardData.items;
+  const handlePasteImage = (clipboardData: DataTransfer | null) => {
+    if (!clipboardData) {
+      return false
+    }
+    const items = clipboardData.items
     let hasImage = false
     for (let i = 0; i < items.length; i++) {
       if (items[i].type.indexOf('image') !== -1) {
         hasImage = true
-        const file = items[i].getAsFile();
-        if (!file) continue;
+        const file = items[i].getAsFile()
+        if (!file) continue
         void loadInputImageFile(file)
       }
     }
-    if (!hasImage) {
-      setErrorMessage('剪贴板中未检测到图片。')
+    return hasImage
+  }
+
+  useEffect(() => {
+    const handleWindowPaste = (event: globalThis.ClipboardEvent) => {
+      const target = event.target
+      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
+        return
+      }
+      const hasImage = handlePasteImage(event.clipboardData)
+      if (hasImage) {
+        event.preventDefault()
+        setErrorMessage(null)
+      }
     }
-  };
+
+    window.addEventListener('paste', handleWindowPaste)
+    return () => window.removeEventListener('paste', handleWindowPaste)
+  }, [])
 
   const handlePickLocalImage = () => {
     fileInputRef.current?.click()
@@ -643,10 +675,6 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     }) => api.post('/api/tasks', {
       image_urls: payload.imageUrls,
       question_text: payload.questionText || null,
-      solver_config: withSharedConnection(solverConfig),
-      reviewer_config: withSharedConnection(reviewerConfig),
-      formatter_config: withSharedConnection(formatterConfig),
-      workflow_template_id: activeTemplateId,
       entry_point: payload.entryPoint,
       target_nodes: payload.targetNodes
     }).then(res => res.data),
@@ -737,10 +765,6 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         acc.push(task.taskId)
         return acc
       }
-      const taskState = (queryState?.data as AdminTask | undefined)?.state
-      if (taskState === 'completed') {
-        acc.push(task.taskId)
-      }
       return acc
     }, [])
 
@@ -778,6 +802,10 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       // 忽略持久化失败，避免影响主流程交互
     }
   }, [inputSelectedNodes])
+
+  useEffect(() => {
+    localStorage.setItem(INPUT_ANSWER_MODE_STORAGE_KEY, inputSkipReview ? 'quick' : 'strict')
+  }, [inputSkipReview])
 
   useEffect(() => {
     if (activeTaskId) {
@@ -843,14 +871,8 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     return parsed
   }
 
-  const withSharedConnection = (config: ModelConfig): ModelConfig => mergeModelConfigWithShared(
-    config,
-    sharedBaseUrl,
-    sharedApiKey
-  )
-
   return (
-    <div className="max-w-7xl mx-auto p-8 space-y-8" onPaste={handlePaste}>
+    <div className="max-w-7xl mx-auto p-8 space-y-8">
       {/* 错误提示框 */}
       {errorMessage && (
         <div className="bg-red-50 border-l-4 border-red-500 p-4 rounded shadow-sm flex justify-between items-start">
@@ -939,16 +961,6 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           </div>
         </div>
 
-        <div className="space-y-2">
-          <label className="text-sm font-medium text-gray-700">题目文本输入</label>
-          <textarea
-            className="w-full min-h-32 p-3 border rounded-lg text-sm font-mono bg-white focus:ring-2 focus:ring-blue-500 outline-none"
-            value={inputQuestionText}
-            onChange={(e) => setInputQuestionText(e.target.value)}
-            placeholder="可直接输入题目文本；可与图片同时提交，也可只提交文本。"
-          />
-        </div>
-
         {pendingInputImages.length > 0 ? (
           <div className="space-y-4">
             <div className="flex items-center justify-between text-xs text-gray-600">
@@ -988,20 +1000,41 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         ) : (
           <div className="h-36 border-2 border-dashed border-gray-300 rounded-lg flex flex-col items-center justify-center text-gray-400 bg-gray-50">
             <Plus size={24} className="mb-2" />
-            <span className="text-sm">支持 Ctrl+V 粘贴，或点击上方“本地选图”上传一张或多张题目截图</span>
-            <span className="text-xs mt-1">也可以不传图片，直接在上方文本框输入题目后提交</span>
+            <span className="text-sm">支持直接 Ctrl+V 粘贴图片，或点击上方“本地选图”上传一张或多张题目截图</span>
+            <span className="text-xs mt-1">无需先点击文本框；也可以不传图片，直接在下方输入题目后提交</span>
           </div>
         )}
 
+        <div className="space-y-2">
+          <label className="text-sm font-medium text-gray-700">题目文本输入</label>
+          <textarea
+            rows={2}
+            className="w-full p-3 border rounded-lg text-sm font-mono bg-white focus:ring-2 focus:ring-blue-500 outline-none resize-y"
+            value={inputQuestionText}
+            onChange={(e) => setInputQuestionText(e.target.value)}
+            placeholder="可直接输入题目文本；可与图片同时提交，也可只提交文本。"
+          />
+        </div>
+
         <div className="sticky bottom-0 z-10 -mx-6 px-6 py-4 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] bg-white/95 backdrop-blur border-t border-gray-200 space-y-3">
-          <label className="inline-flex items-center gap-2 text-sm text-gray-700">
-            <input
-              type="checkbox"
-              checked={inputSkipReview}
-              onChange={(e) => setInputSkipReview(e.target.checked)}
-            />
-            <span>跳过 Review，直接从 Solver 进入 Formatter</span>
-          </label>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-sm font-medium text-gray-700 mr-1">出答案模式</span>
+            <button
+              type="button"
+              onClick={() => setInputSkipReview(true)}
+              className={`px-3 py-1.5 rounded border text-sm ${inputSkipReview ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-700 border-gray-200'}`}
+            >
+              快速出答案
+            </button>
+            <button
+              type="button"
+              onClick={() => setInputSkipReview(false)}
+              className={`px-3 py-1.5 rounded border text-sm ${!inputSkipReview ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-700 border-gray-200'}`}
+            >
+              严格出答案
+            </button>
+            <span className="text-xs text-gray-500">{inputSkipReview ? '解题后直接排版' : '解题后经 AI 校验再排版'}</span>
+          </div>
           <div className="flex flex-wrap items-center gap-2">
             {WORKFLOW_NODE_ORDER.map((node, idx) => (
               <div key={node} className="flex items-center gap-2">
@@ -1013,7 +1046,7 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
                     disabled={inputSkipReview}
                   />
                   <span className="font-medium">
-                    {node === 'solver' ? 'Solver 解题' : node === 'reviewer' ? 'Reviewer 审查' : 'Formatter 排版'}
+                    {node === 'solver' ? 'Solver 解题' : node === 'reviewer' ? 'AI 校验' : 'Formatter 排版'}
                   </span>
                 </label>
                 {idx < WORKFLOW_NODE_ORDER.length - 1 && <span className="text-gray-400">-&gt;</span>}
@@ -1225,25 +1258,19 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
                   </div>
                 </div>
                 <div className="grid grid-cols-1 gap-4">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">MinerU Base URL</label>
-                    <input
-                      type="text"
-                      value={mineruApiBaseUrl}
-                      onChange={(e) => setMineruApiBaseUrl(e.target.value)}
-                      placeholder="https://mineru.net/api/v4"
-                      className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-amber-500 outline-none"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">MinerU API Token</label>
-                    <input
-                      type="password"
-                      value={mineruApiToken}
-                      onChange={(e) => setMineruApiToken(e.target.value)}
-                      placeholder="mtk-..."
-                      className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-amber-500 outline-none"
-                    />
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 p-3">
+                    <h4 className="text-sm font-semibold text-amber-800">MinerU 解析配置</h4>
+                    <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">MinerU Base URL</label>
+                        <input type="url" value={mineruApiBaseUrl} onChange={(e) => setMineruApiBaseUrl(e.target.value)} placeholder="https://mineru.net/api/v4" className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-amber-500 outline-none" />
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">MinerU Token <span className="text-xs text-gray-400 font-normal">(留空保留服务器 Token)</span></label>
+                        <input type="password" value={mineruApiToken} onChange={(e) => setMineruApiToken(e.target.value)} placeholder={mineruApiTokenMasked || 'Token'} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-amber-500 outline-none" />
+                        <label className="mt-2 flex items-center gap-2 text-xs text-rose-700"><input type="checkbox" checked={clearMineruApiToken} onChange={(e) => setClearMineruApiToken(e.target.checked)} />清除服务器已保存的 MinerU Token</label>
+                      </div>
+                    </div>
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">共享 Base URL</label>
@@ -1255,14 +1282,18 @@ function TaskDashboard({ onOpenAdmin }: { onOpenAdmin: () => void }) {
                     />
                   </div>
                   <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">共享 API Key <span className="text-xs text-gray-400 font-normal">(留空则使用后端默认配置)</span></label>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">共享 API Key <span className="text-xs text-gray-400 font-normal">(留空保留服务器密钥)</span></label>
                     <input
                       type="password"
                       value={sharedApiKey}
                       onChange={(e) => setSharedApiKey(e.target.value)}
-                      placeholder="sk-..."
+                      placeholder={sharedApiKeyMasked || 'sk-...'}
                       className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-amber-500 outline-none"
                     />
+                    <label className="mt-2 flex items-center gap-2 text-xs text-rose-700">
+                      <input type="checkbox" checked={clearSharedApiKey} onChange={(e) => setClearSharedApiKey(e.target.checked)} />
+                      清除服务器已保存的 API Key
+                    </label>
                   </div>
                 </div>
                 <div className="space-y-4">
@@ -1389,6 +1420,9 @@ function TaskStatusBadge({ state }: { state: string }) {
 function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: string) => void }) {
   const [draftInput, setDraftInput] = useState('')
   const [customDraftInput, setCustomDraftInput] = useState('')
+  const [editedQuestionText, setEditedQuestionText] = useState('')
+  const [pendingAttachmentImages, setPendingAttachmentImages] = useState<string[]>([])
+  const attachmentInputRef = useRef<HTMLInputElement | null>(null)
   const [selectedNodes, setSelectedNodes] = useState<WorkflowNode[]>([...WORKFLOW_NODE_ORDER])
   const [streamedContent, setStreamedContent] = useState('')
   const [currentNode, setCurrentNode] = useState('')
@@ -1414,9 +1448,17 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
     queryFn: () => api.get(`/api/tasks/${taskId}`).then(res => res.data),
     refetchInterval: (query) => {
       const state = query.state.data?.state;
-      if (state === 'completed' || state === 'failed' || state === 'manual' || state === 'cancelled') return false;
+      if (['completed', 'failed', 'manual', 'cancelled', 'paused', 'terminated', 'abandoned'].includes(state)) return false;
       return 2000;
     },
+  })
+
+  const { data: taskArtifacts = [] } = useQuery({
+    queryKey: ['task-artifacts', taskId],
+    queryFn: () => api.get<TaskArtifact[]>(`/api/tasks/${taskId}/artifacts`).then(res => res.data),
+    refetchInterval: () => (
+      task?.state && !['completed', 'failed', 'manual', 'cancelled', 'paused', 'terminated', 'abandoned'].includes(task.state) ? 2000 : false
+    ),
   })
 
   // 当切换任务时，清空流式输出的旧数据
@@ -1448,8 +1490,12 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
     }
   }, [task]);
 
+  useEffect(() => {
+    if (task) setEditedQuestionText(task.question_text || '')
+  }, [taskId, task?.question_text]);
+
   // Use React's useEffect to handle SSE connection
-  const isTaskEnded = task?.state === 'completed' || task?.state === 'failed' || task?.state === 'manual' || task?.state === 'cancelled';
+  const isTaskEnded = Boolean(task?.state && ['completed', 'failed', 'manual', 'cancelled', 'paused', 'terminated', 'abandoned'].includes(task.state));
 
   useEffect(() => {
     let interval: ReturnType<typeof setInterval>;
@@ -1529,6 +1575,20 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
     }
   })
 
+  const inputMutation = useMutation({
+    mutationFn: ({ questionText, images, mode }: { questionText: string, images: string[], mode: 'append' | 'replace' }) => api.patch(`/api/tasks/${taskId}/input`, { question_text: questionText, image_urls: images, mode }).then(res => res.data),
+    onSuccess: () => {
+      setPendingAttachmentImages([])
+      queryClient.invalidateQueries({ queryKey: ['task', taskId] })
+      queryClient.invalidateQueries({ queryKey: ['task-artifacts', taskId] })
+    }
+  })
+
+  const operationMutation = useMutation({
+    mutationFn: (action: 'pause' | 'terminate' | 'abandon') => api.post(`/api/tasks/${taskId}/operation`, { action }).then(res => res.data),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['task', taskId] })
+  })
+
   if (isLoading) return <div className="text-gray-500 p-8 text-center bg-white rounded-xl border shadow-sm">Loading task data...</div>
   if (!task) return null
 
@@ -1584,12 +1644,34 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
     })
   }
 
-  const isTerminalState = ['completed', 'failed', 'manual', 'cancelled'].includes(task.state)
+  const isTerminalState = ['completed', 'failed', 'manual', 'cancelled', 'paused', 'terminated', 'abandoned'].includes(task.state)
   const taskImageUrls = normalizeImageUrls(task.image_urls, task.image_url)
   const historyDraftSolution = typeof history.draft_solution === 'string' ? history.draft_solution : ''
   const historyReviewFeedback = typeof history.review_feedback === 'string' ? history.review_feedback : ''
   const totalTokens = typeof tokens.total_tokens === 'number' ? tokens.total_tokens : 0
-  const shouldShowTaskError = Boolean(task.error_code) && ['failed', 'manual', 'cancelled'].includes(task.state)
+  const shouldShowTaskError = Boolean(task.error_code) && ['failed', 'manual', 'cancelled', 'paused', 'terminated', 'abandoned'].includes(task.state)
+  const latestArtifactByNode = (node: WorkflowNode) => taskArtifacts
+    .filter((artifact) => artifact.node_name === node && artifact.input_revision === (task.input_revision || 1))
+    .sort((left, right) => right.id - left.id)[0]
+  const latestStaleArtifactByNode = (node: WorkflowNode) => taskArtifacts
+    .filter((artifact) => artifact.node_name === node && artifact.input_revision !== (task.input_revision || 1))
+    .sort((left, right) => right.id - left.id)[0]
+  const loadAttachments = async (files: FileList | null) => {
+    const values = await Promise.all(Array.from(files || []).filter((file) => file.type.startsWith('image/')).map((file) => new Promise<string>((resolve, reject) => {
+      const reader = new FileReader(); reader.onload = () => typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('图片读取失败')); reader.onerror = () => reject(new Error('图片读取失败')); reader.readAsDataURL(file)
+    })))
+    setPendingAttachmentImages((current) => [...current, ...values.filter((value) => !current.includes(value))])
+  }
+  const exportAnswerPng = () => {
+    const canvas = document.createElement('canvas'); const context = canvas.getContext('2d'); if (!context) return
+    const width = 1200; const padding = 64; const lineHeight = 46; const source = (task.final_result || '').replace(/[#*_`]/g, '')
+    context.font = '28px Microsoft YaHei, sans-serif'; const lines: string[] = []
+    source.split('\n').forEach((paragraph: string) => { let line = ''; for (const char of paragraph || ' ') { if (context.measureText(line + char).width > width - padding * 2) { lines.push(line); line = char } else line += char } lines.push(line) })
+    canvas.width = width; canvas.height = Math.max(220, padding * 2 + lines.length * lineHeight); const draw = canvas.getContext('2d')!
+    draw.fillStyle = '#fff'; draw.fillRect(0, 0, canvas.width, canvas.height); draw.fillStyle = '#111'; draw.font = '28px Microsoft YaHei, sans-serif'; draw.textBaseline = 'top'
+    lines.forEach((line, index) => draw.fillText(line, padding, padding + index * lineHeight))
+    const anchor = document.createElement('a'); anchor.href = canvas.toDataURL('image/png'); anchor.download = `${task.task_id}-answer.png`; anchor.click()
+  }
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 bg-white p-6 rounded-xl shadow-sm border">
@@ -1634,6 +1716,23 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
           图片数量: {taskImageUrls.length}
         </div>
 
+        <div className="border rounded-lg p-3 space-y-3 bg-gray-50">
+          <div className="flex items-center justify-between"><h4 className="text-sm font-medium">编辑输入 / 追加附件</h4><span className="text-xs text-gray-500">保存后旧节点结果会标记过期</span></div>
+          <textarea value={editedQuestionText} onChange={(event) => setEditedQuestionText(event.target.value)} placeholder="题干文字，可直接修正或补充" className="w-full min-h-24 rounded border p-2 text-sm bg-white" />
+          <input ref={attachmentInputRef} type="file" accept="image/*" multiple className="hidden" onChange={(event) => void loadAttachments(event.target.files)} />
+          <div className="flex flex-wrap gap-2">
+            <button onClick={() => attachmentInputRef.current?.click()} className="px-2 py-1.5 text-xs rounded border bg-white">追加图片</button>
+            {pendingAttachmentImages.map((image, index) => <button key={`${image.slice(0, 18)}-${index}`} onClick={() => setPendingAttachmentImages((items) => items.filter((_, itemIndex) => itemIndex !== index))} className="px-2 py-1 text-xs rounded bg-white border text-red-600">移除图片 {index + 1}</button>)}
+            <button onClick={() => inputMutation.mutate({ questionText: editedQuestionText, images: [...taskImageUrls, ...pendingAttachmentImages], mode: 'replace' })} disabled={inputMutation.isPending || (!editedQuestionText.trim() && taskImageUrls.length + pendingAttachmentImages.length === 0)} className="ml-auto px-3 py-1.5 text-xs rounded bg-indigo-600 text-white disabled:opacity-50">保存新输入版本</button>
+          </div>
+        </div>
+
+        {task.state !== 'completed' && <div className="flex gap-2 text-xs">
+          <button onClick={() => operationMutation.mutate('pause')} className="px-2 py-1.5 rounded border text-amber-700">暂停</button>
+          <button onClick={() => operationMutation.mutate('terminate')} className="px-2 py-1.5 rounded border text-red-700">终止</button>
+          <button onClick={() => operationMutation.mutate('abandon')} className="px-2 py-1.5 rounded border text-gray-700">放弃</button>
+        </div>}
+
         {shouldShowTaskError && (
           <div className="bg-red-50 text-red-700 p-4 rounded text-sm font-mono border border-red-100">
             <strong>Error:</strong> {task.error_code}
@@ -1643,6 +1742,35 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
 
       {/* Right: Agent Outputs & Interventions */}
       <div className="space-y-6">
+        <div className="border rounded-lg divide-y bg-white">
+          <div className="px-4 py-3 flex items-center justify-between">
+            <h3 className="font-semibold text-gray-800">节点结果预览</h3>
+            <span className="text-xs text-gray-500">当前输入版本 {task.input_revision || 1}</span>
+          </div>
+          {WORKFLOW_NODE_ORDER.map((node) => {
+            const artifact = latestArtifactByNode(node)
+            const staleArtifact = latestStaleArtifactByNode(node)
+            const label = node === 'solver' ? 'Solver 解题草稿' : node === 'reviewer' ? 'AI 校验' : 'Formatter 最终排版'
+            return (
+              <details key={node} className="group" open={node === 'formatter' && Boolean(artifact)}>
+                <summary className="cursor-pointer list-none px-4 py-3 flex items-center justify-between hover:bg-gray-50">
+                  <span className="text-sm font-medium text-gray-700">{label}</span>
+                  <span className="text-xs text-gray-500">{artifact ? `v${artifact.input_revision}` : staleArtifact ? `旧版 v${staleArtifact.input_revision}（已过期）` : '尚无产物'}</span>
+                </summary>
+                <div className="px-4 pb-4">
+                  {artifact ? (
+                    <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded border bg-gray-50 p-3 text-xs leading-6 text-gray-800">{artifact.content}</pre>
+                  ) : staleArtifact ? (
+                    <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded border border-dashed bg-amber-50 p-3 text-xs leading-6 text-gray-600">该结果来自输入 v{staleArtifact.input_revision}，已过期，只供参考。{`\n\n`}{staleArtifact.content}</pre>
+                  ) : (
+                    <p className="text-xs text-gray-400">该节点尚未完成，或当前输入版本没有可用产物。</p>
+                  )}
+                </div>
+              </details>
+            )
+          })}
+        </div>
+
         {isTerminalState && (
           <div className="space-y-4 border rounded-lg p-4 bg-blue-50/40 border-blue-100">
             <div>
@@ -1660,7 +1788,7 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
                       onChange={() => toggleNodeSelection(node)}
                     />
                     <span className="font-medium">
-                      {node === 'solver' ? 'Solver 解题' : node === 'reviewer' ? 'Reviewer 审查' : 'Formatter 排版'}
+                      {node === 'solver' ? 'Solver 解题' : node === 'reviewer' ? 'AI 校验' : 'Formatter 排版'}
                     </span>
                   </label>
                   {idx < WORKFLOW_NODE_ORDER.length - 1 && <span className="text-gray-400">-&gt;</span>}
@@ -1711,7 +1839,7 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
               Manual Intervention Required
             </h3>
             <div className="text-sm text-gray-700 bg-red-50 p-3 rounded border border-red-100">
-              <span className="font-bold">Reviewer Feedback:</span> {historyReviewFeedback || 'System Error'}
+              <span className="font-bold">AI 校验反馈：</span> {historyReviewFeedback || '系统错误'}
             </div>
             <textarea
               className="w-full h-[280px] p-4 border rounded font-mono text-sm bg-gray-50 focus:bg-white focus:ring-2 focus:ring-blue-500 outline-none resize-none"
@@ -1724,42 +1852,42 @@ function TaskDetail({ taskId, onPreview }: { taskId: string, onPreview: (url: st
                 onClick={() => manualMutation.mutate({ action: 'resume', draft: draftInput || historyDraftSolution })}
                 className="bg-green-600 text-white px-6 py-2.5 rounded font-medium hover:bg-green-700 transition-colors shadow-sm"
               >
-                Approve & Resume
+                确认并继续
               </button>
               <button
                 onClick={() => manualMutation.mutate({ action: 'skip_review', draft: draftInput || historyDraftSolution })}
                 className="bg-blue-600 text-white px-6 py-2.5 rounded font-medium hover:bg-blue-700 transition-colors shadow-sm"
               >
-                Skip Review & Format
+                跳过 AI 校验并排版
               </button>
               <button
                 onClick={() => manualMutation.mutate({ action: 'fail' })}
                 className="bg-white border border-red-200 text-red-600 px-6 py-2.5 rounded font-medium hover:bg-red-50 transition-colors shadow-sm"
               >
-                Mark as Failed
+                标记失败
               </button>
             </div>
           </div>
         ) : task.state === 'completed' ? (
           <div className="space-y-4 h-full flex flex-col">
-            <h3 className="font-semibold text-green-600 flex items-center gap-2 shrink-0">
+            <div className="flex items-center justify-between shrink-0"><h3 className="font-semibold text-green-600 flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-green-600 inline-block"></span>
               Final Output
-            </h3>
+            </h3><div className="flex gap-2"><button onClick={() => void navigator.clipboard.writeText(task.final_result || '')} className="px-2 py-1 text-xs border rounded hover:bg-gray-50">一键复制</button><button onClick={exportAnswerPng} className="px-2 py-1 text-xs border rounded hover:bg-gray-50">导出答案 PNG</button></div></div>
             <div className="prose prose-sm max-w-none border p-6 rounded-lg bg-gray-50 overflow-y-auto flex-grow max-h-[400px]">
               <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
                 {task.final_result || ''}
               </ReactMarkdown>
             </div>
           </div>
-        ) : task.state === 'cancelled' ? (
+        ) : ['cancelled', 'paused', 'terminated', 'abandoned'].includes(task.state) ? (
           <div className="space-y-4 h-full flex flex-col">
             <h3 className="font-semibold text-gray-700 flex items-center gap-2 shrink-0">
               <span className="w-2 h-2 rounded-full bg-gray-500 inline-block"></span>
               Workflow Cancelled
             </h3>
             <div className="text-sm text-gray-700 bg-gray-50 p-4 rounded border border-gray-200">
-              <p className="font-medium">该任务已停止并以取消状态结束。</p>
+              <p className="font-medium">该任务已停止，等待你选择修改输入或从指定节点继续。</p>
               <p className="mt-2 font-mono text-xs">{task.error_code || 'Manually cancelled.'}</p>
             </div>
             <div className="flex-grow overflow-y-auto bg-white p-4 rounded border text-sm font-mono whitespace-pre-wrap shadow-inner text-gray-800 max-h-[400px]">
@@ -1828,6 +1956,8 @@ function AdminPanel({
   const [isCustomRunPanelOpen, setIsCustomRunPanelOpen] = useState(false)
   const [customRunNodes, setCustomRunNodes] = useState<WorkflowNode[]>([...WORKFLOW_NODE_ORDER])
   const [customRunDraft, setCustomRunDraft] = useState('')
+
+  const isErrataTask = (task: AdminTask | undefined) => task?.workflow_type === 'errata'
 
   const { data: listData, isLoading: listLoading } = useQuery({
     queryKey: ['admin-tasks', searchTaskId, stateFilter],
@@ -1984,7 +2114,7 @@ function AdminPanel({
     mutationFn: async () => {
       if (!selectedTaskId || !selectedTask) throw new Error('请先选择任务')
 
-      const allowedStates = ['manual', 'failed', 'completed', 'cancelled']
+      const allowedStates = ['manual', 'failed', 'completed', 'cancelled', 'paused', 'terminated', 'abandoned']
       if (!allowedStates.includes(selectedTask.state)) {
         throw new Error('仅 manual/failed/completed/cancelled 任务可自定义执行')
       }
@@ -2045,12 +2175,13 @@ function AdminPanel({
       return
     }
 
-    const confirmed = window.confirm(`确认删除已勾选的 ${selectedExportIds.length} 条任务吗？`)
+    const deletableIds = selectedExportIds
+    const confirmed = window.confirm(`确认永久删除 ${deletableIds.length} 条任务及其关联数据吗？`)
     if (!confirmed) return
 
     setIsBatchDeleting(true)
     try {
-      const results = await Promise.allSettled(selectedExportIds.map((taskId) => api.delete(`/api/admin/tasks/${taskId}`)))
+      const results = await Promise.allSettled(deletableIds.map((taskId) => api.delete(`/api/admin/tasks/${taskId}`)))
       const successCount = results.filter((result) => result.status === 'fulfilled').length
       const failedCount = results.length - successCount
 
@@ -2059,8 +2190,11 @@ function AdminPanel({
         queryClient.invalidateQueries({ queryKey: ['admin-task-detail'] })
         queryClient.invalidateQueries({ queryKey: ['admin-logs'] })
 
-        setSelectedExportIds((prev) => prev.filter((_, index) => results[index]?.status !== 'fulfilled'))
-        if (selectedTaskId && selectedExportIds.includes(selectedTaskId)) {
+        setSelectedExportIds((prev) => prev.filter((taskId) => {
+          const index = deletableIds.indexOf(taskId)
+          return index < 0 || results[index]?.status !== 'fulfilled'
+        }))
+        if (selectedTaskId && deletableIds.includes(selectedTaskId)) {
           setSelectedTaskId(null)
         }
       }
@@ -2078,7 +2212,7 @@ function AdminPanel({
   }
 
   const canRetrySelectedTask = !!selectedTask && ['manual', 'failed'].includes(selectedTask.state)
-  const canCustomRunSelectedTask = !!selectedTask && ['manual', 'failed', 'completed', 'cancelled'].includes(selectedTask.state)
+  const canCustomRunSelectedTask = !!selectedTask && ['manual', 'failed', 'completed', 'cancelled', 'paused', 'terminated', 'abandoned'].includes(selectedTask.state)
 
   const orderedCustomRunNodes = WORKFLOW_NODE_ORDER.filter((node) => customRunNodes.includes(node))
   const customRunEntryPoint = orderedCustomRunNodes.length > 0 ? orderedCustomRunNodes[0] : undefined
@@ -2152,6 +2286,7 @@ function AdminPanel({
       .map((taskId) => taskMap.get(taskId))
       .filter((task): task is AdminTask => !!task)
   }, [listData, selectedExportIds])
+  const selectedDeletableCount = selectedExportTasks.length
 
   const reorderExportIds = (dragId: string, targetId: string) => {
     if (dragId === targetId) return
@@ -2333,11 +2468,11 @@ function AdminPanel({
                 </button>
                 <button
                   onClick={() => void handleBatchDelete()}
-                  disabled={isBatchDeleting || selectedExportIds.length === 0}
+                  disabled={isBatchDeleting || selectedDeletableCount === 0}
                   className="inline-flex items-center gap-1 text-xs px-2.5 py-1 text-red-600 border border-red-200 rounded disabled:opacity-50 hover:bg-red-50"
                 >
                   <Trash2 size={12} />
-                  {isBatchDeleting ? '删除中...' : `批量删除(${selectedExportIds.length})`}
+                  {isBatchDeleting ? '删除中...' : `批量永久删除(${selectedDeletableCount})`}
                 </button>
                 <div className="flex bg-indigo-600 rounded">
                   <button
@@ -2403,6 +2538,7 @@ function AdminPanel({
                     >
                       <div className="text-xs font-mono text-gray-700 truncate">{task.task_id}</div>
                       <div className="text-xs text-gray-500 mt-1">{task.state} · retry {task.retry_count}</div>
+                      {isErrataTask(task) && <div className="text-[11px] text-amber-700 mt-1">勘误工作流 · 删除将同步移除文档映射</div>}
                       <div className="text-[11px] text-gray-400 mt-1 truncate">题目预览：{getTaskPreviewSnippet(task)}</div>
                     </button>
                   </div>
@@ -3477,9 +3613,36 @@ function PaperBuilder({
   )
 }
 
+type InboxTask = { task_id: string; workflow_type: string; state: string; source_title: string; source_item_label: string; attachment_urls: string[]; error_code?: string | null; updated_at?: string | null; resume_target: { view: string; source_id?: string | null; item_id?: string | number | null } }
+
+function TaskInbox({ onOpen }: { onOpen: (item: InboxTask) => void }) {
+  const [workflow, setWorkflow] = useState('')
+  const [state, setState] = useState('')
+  const [keyword, setKeyword] = useState('')
+  const [attentionOnly, setAttentionOnly] = useState(true)
+  const { data, isLoading, refetch } = useQuery({
+    queryKey: ['task-inbox', workflow, state, keyword, attentionOnly],
+    queryFn: () => api.get<{ items: InboxTask[] }>('/api/task-inbox', { params: { workflow_type: workflow || undefined, state: state || undefined, keyword: keyword || undefined, needs_attention: attentionOnly } }).then((res) => res.data),
+    refetchInterval: 4000,
+  })
+  const items = data?.items || []
+  return <main className="mx-auto max-w-7xl px-8 py-6">
+    <header className="flex flex-wrap items-end justify-between gap-4 border-b border-slate-200 pb-5"><div><p className="text-xs font-semibold tracking-wider text-indigo-600">TASK INBOX</p><h1 className="mt-1 text-2xl font-semibold text-slate-950">待处理任务</h1><p className="mt-1 text-sm text-slate-500">从这里恢复人工处理，进入对应专用工作台。</p></div><button onClick={() => void refetch()} className="rounded border border-slate-300 px-3 py-2 text-sm">刷新</button></header>
+    <div className="mt-5 flex flex-wrap gap-3 border-b border-slate-200 pb-4"><label className="relative"><Search className="pointer-events-none absolute left-2 top-2 h-4 w-4 text-slate-400" /><input value={keyword} onChange={(event) => setKeyword(event.target.value)} placeholder="搜索来源、题号或任务" className="w-64 rounded border border-slate-300 py-2 pl-8 pr-3 text-sm" /></label><select value={workflow} onChange={(event) => setWorkflow(event.target.value)} className="rounded border border-slate-300 px-3 py-2 text-sm"><option value="">全部工作流</option><option value="normal">普通解题</option><option value="errata">勘误</option><option value="paper">整卷</option><option value="target_system">目标系统</option></select><select value={state} onChange={(event) => setState(event.target.value)} className="rounded border border-slate-300 px-3 py-2 text-sm"><option value="">全部状态</option><option value="manual">待人工</option><option value="failed">失败</option><option value="paused">已暂停</option><option value="queued">排队中</option></select><label className="flex items-center gap-2 py-2 text-sm"><input type="checkbox" checked={attentionOnly} onChange={(event) => setAttentionOnly(event.target.checked)} />仅待处理</label></div>
+    <div className="mt-2 divide-y divide-slate-200">{isLoading && <p className="py-8 text-sm text-slate-500">正在加载任务…</p>}{!isLoading && !items.length && <p className="py-8 text-sm text-slate-500">当前筛选下没有待处理任务。</p>}{items.map((item) => <button key={item.task_id} onClick={() => onOpen(item)} className="grid w-full grid-cols-[minmax(0,1fr)_130px_120px_150px] gap-4 py-4 text-left hover:bg-slate-50"><div className="min-w-0"><div className="flex items-center gap-2"><span className="text-sm font-semibold text-slate-900">{item.source_title}</span><span className="text-xs text-indigo-700">{item.workflow_type}</span>{item.attachment_urls?.length > 0 && <ImageIcon className="h-3.5 w-3.5 text-slate-400" />}</div><p className="mt-1 truncate text-sm text-slate-600">{item.source_item_label}</p>{item.error_code && <p className="mt-1 truncate text-xs text-rose-600">{item.error_code}</p>}</div><span className="self-center text-sm text-slate-700">{item.state}</span><span className="self-center text-xs text-slate-500">{item.updated_at ? new Date(item.updated_at).toLocaleString() : '-'}</span><span className="self-center text-right text-sm font-medium text-indigo-700">继续处理</span></button>)}</div>
+  </main>
+}
+
 function App() {
-  const [currentView, setCurrentView] = useState<'dashboard' | 'admin' | 'builder' | 'smart-parser'>('dashboard')
+  const [currentView, setCurrentView] = useState<'dashboard' | 'inbox' | 'admin' | 'builder' | 'smart-parser' | 'errata' | 'paper-docx' | 'target-system'>('dashboard')
   const [adminFocusTaskId, setAdminFocusTaskId] = useState<string | null>(null)
+  const [errataFocusItemId, setErrataFocusItemId] = useState<string | null>(null)
+  const [paperFocusQuestionId, setPaperFocusQuestionId] = useState<number | null>(null)
+  const targetRenderTaskId = new URLSearchParams(window.location.search).get('target-render-task')
+
+  if (targetRenderTaskId) {
+    return <QueryClientProvider client={queryClient}><TargetAnswerRender taskId={targetRenderTaskId} /></QueryClientProvider>
+  }
 
   return (
     <QueryClientProvider client={queryClient}>
@@ -3492,6 +3655,7 @@ function App() {
             >
               工作台
             </button>
+            <button onClick={() => setCurrentView('inbox')} className={`px-3 py-1.5 text-sm rounded-lg ${currentView === 'inbox' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}><ListTodo className="mr-1 inline h-4 w-4" />待处理</button>
             <button
               onClick={() => setCurrentView('admin')}
               className={`px-3 py-1.5 text-sm rounded-lg ${currentView === 'admin' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}
@@ -3510,12 +3674,36 @@ function App() {
             >
               智能解析
             </button>
+            <button
+              onClick={() => setCurrentView('paper-docx')}
+              className={`px-3 py-1.5 text-sm rounded-lg ${currentView === 'paper-docx' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}
+            >
+              整卷答案
+            </button>
+            <button
+              onClick={() => setCurrentView('errata')}
+              className={`px-3 py-1.5 text-sm rounded-lg ${currentView === 'errata' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}
+            >
+              勘误工作台
+            </button>
+            <button
+              onClick={() => setCurrentView('target-system')}
+              className={`px-3 py-1.5 text-sm rounded-lg ${currentView === 'target-system' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}
+            >
+              目标系统
+            </button>
           </div>
         </div>
 
         {currentView === 'dashboard' && (
           <TaskDashboard onOpenAdmin={() => setCurrentView('admin')} />
         )}
+        {currentView === 'inbox' && <TaskInbox onOpen={(item) => {
+          const target = item.resume_target
+          if (target.view === 'errata') { if (target.source_id) localStorage.setItem('zyb.active_errata_job_id', target.source_id); if (target.item_id) localStorage.setItem('zyb.active_errata_item_id', String(target.item_id)); setErrataFocusItemId(String(target.item_id || '')); setCurrentView('errata'); return }
+          if (target.view === 'paper-docx') { if (target.source_id) localStorage.setItem('zyb.active_paper_id', target.source_id); setPaperFocusQuestionId(Number(target.item_id) || null); setCurrentView('paper-docx'); return }
+          setAdminFocusTaskId(item.task_id); setCurrentView(target.view === 'target-system' ? 'target-system' : 'admin')
+        }} />}
         {currentView === 'admin' && (
           <AdminPanel
             initialTaskId={adminFocusTaskId}
@@ -3533,9 +3721,23 @@ function App() {
         {currentView === 'smart-parser' && (
           <SmartPaperParser onBack={() => setCurrentView('dashboard')} />
         )}
+        {currentView === 'paper-docx' && <PaperDocxWorkbench focusQuestionId={paperFocusQuestionId} />}
+        {currentView === 'errata' && <ErrataWorkbench focusItemId={errataFocusItemId} />}
+        {currentView === 'target-system' && <TargetSystemWorkbench onOpenTask={(taskId) => { setAdminFocusTaskId(taskId); setCurrentView('admin') }} />}
       </div>
     </QueryClientProvider>
   )
+}
+
+function TargetAnswerRender({ taskId }: { taskId: string }) {
+  const { data: task, isLoading, error } = useQuery({
+    queryKey: ['target-answer-render', taskId],
+    queryFn: () => api.get<AdminTask>(`/api/admin/tasks/${encodeURIComponent(taskId)}`).then((response) => response.data),
+  })
+  if (isLoading) return <main className="p-8 text-sm">正在加载答案…</main>
+  if (error || !task) return <main className="p-8 text-sm text-red-600">无法加载答案。</main>
+  const source = task.answer_preview || task.final_result || ''
+  return <main className="min-h-screen bg-white p-12 text-left text-gray-900"><article data-testid="target-answer-render" className="mx-auto max-w-5xl border border-gray-200 bg-white p-8 text-xl leading-9"><ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>{source}</ReactMarkdown></article></main>
 }
 
 // === 智能解析试卷组件 ===
@@ -3987,7 +4189,6 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
     setQuestionStatuses({})
     setSelectedTaskIds([])
     try {
-      const runtimeConfigs = getLatestRetryConfigs()
       const res = await api.post<{
         paper_task_id: string;
         question_count: number;
@@ -3998,10 +4199,6 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
         {
           original_images: originalImages,
           questions_override: normalizedQuestions,
-          solver_config: runtimeConfigs.solver_config,
-          reviewer_config: runtimeConfigs.reviewer_config,
-          formatter_config: runtimeConfigs.formatter_config,
-          workflow_template_id: runtimeConfigs.workflow_template_id,
         }
       )
       setSolveResult({

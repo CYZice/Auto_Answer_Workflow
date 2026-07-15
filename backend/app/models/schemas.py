@@ -23,6 +23,10 @@ class TaskStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    PAUSED = "paused"
+    TERMINATED = "terminated"
+    ABANDONED = "abandoned"
+    REVIEW_PENDING = "review_pending"
 
 
 class ModelConfig(BaseModel):
@@ -34,6 +38,38 @@ class ModelConfig(BaseModel):
     )
     base_url: Optional[str] = Field(default=None, description="API Base URL")
     max_tokens: Optional[int] = Field(default=4096, description="最大生成 Token 数")
+
+
+class RuntimeModelConfigResponse(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
+    model_name: str = ""
+    base_url: str = ""
+    max_tokens: int = Field(default=4096, ge=1)
+    api_key_masked: str = ""
+    api_key_configured: bool = False
+
+
+class RuntimeModelConfigUpdate(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
+    model_name: Optional[str] = None
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    max_tokens: Optional[int] = Field(default=None, ge=1)
+    clear_api_key: bool = False
+
+
+class RuntimeMineruConfigResponse(BaseModel):
+    base_url: str = ""
+    api_token_masked: str = ""
+    api_token_configured: bool = False
+
+
+class RuntimeMineruConfigUpdate(BaseModel):
+    api_token: Optional[str] = None
+    base_url: Optional[str] = None
+    clear_api_token: bool = False
 
 
 class TaskCreateRequest(BaseModel):
@@ -58,10 +94,10 @@ class TaskCreateRequest(BaseModel):
     workflow_template_id: Optional[str] = Field(
         default=None, description="本次任务使用的提示词模板 ID"
     )
-    entry_point: Optional[Literal["solver", "reviewer", "formatter"]] = Field(
+    entry_point: Optional[Literal["solver", "reviewer", "formatter", "errata_adjudication", "word_composition"]] = Field(
         default="solver", description="自定义执行入口节点"
     )
-    target_nodes: Optional[List[Literal["solver", "reviewer", "formatter"]]] = Field(
+    target_nodes: Optional[List[Literal["solver", "reviewer", "formatter", "errata_adjudication", "word_composition"]]] = Field(
         default=None, description="本次执行的节点集合，必须符合工作流顺序"
     )
     draft_solution: Optional[str] = Field(
@@ -91,10 +127,10 @@ class ManualSubmitRequest(BaseModel):
         description="resume表示按失败节点恢复，skip_review表示跳过审查直接进入排版，fail表示放弃，custom_run表示按自定义节点执行"
     )
     draft_solution: Optional[str] = Field(None, description="人工修正后的解题内容")
-    entry_point: Optional[Literal["solver", "reviewer", "formatter"]] = Field(
+    entry_point: Optional[Literal["solver", "reviewer", "formatter", "errata_adjudication", "word_composition"]] = Field(
         default=None, description="自定义执行入口节点"
     )
-    target_nodes: Optional[List[Literal["solver", "reviewer", "formatter"]]] = Field(
+    target_nodes: Optional[List[Literal["solver", "reviewer", "formatter", "errata_adjudication", "word_composition"]]] = Field(
         default=None, description="本次执行的节点集合，必须符合工作流顺序"
     )
     solver_config: Optional[ModelConfig] = Field(
@@ -129,6 +165,10 @@ class RuntimeSettingsResponse(BaseModel):
     fallback: FallbackConfig
     request_timeout_seconds: int = Field(default=300, ge=1)
     max_retries: int = Field(default=2, ge=0)
+    solver_config: RuntimeModelConfigResponse
+    reviewer_config: RuntimeModelConfigResponse
+    formatter_config: RuntimeModelConfigResponse
+    mineru_config: RuntimeMineruConfigResponse
 
 
 class RuntimeSettingsUpdateRequest(BaseModel):
@@ -136,6 +176,10 @@ class RuntimeSettingsUpdateRequest(BaseModel):
     fallback: Optional[FallbackConfig] = None
     request_timeout_seconds: Optional[int] = Field(default=None, ge=1)
     max_retries: Optional[int] = Field(default=None, ge=0)
+    solver_config: Optional[RuntimeModelConfigUpdate] = None
+    reviewer_config: Optional[RuntimeModelConfigUpdate] = None
+    formatter_config: Optional[RuntimeModelConfigUpdate] = None
+    mineru_config: Optional[RuntimeMineruConfigUpdate] = None
 
 
 class PromptNodeBundle(BaseModel):
@@ -171,6 +215,13 @@ class TaskDetailResponse(BaseModel):
     thread_id: str
     image_url: str
     image_urls: List[str] = Field(default_factory=list)
+    question_text: Optional[str] = None
+    input_revision: int = 1
+    current_node: Optional[str] = None
+    workflow_type: str = "standard"
+    source_kind: Optional[str] = None
+    source_id: Optional[str] = None
+    source_item_id: Optional[str] = None
     state: TaskStatus
     retry_count: int
     history: Optional[str] = None
@@ -184,6 +235,34 @@ class TaskDetailResponse(BaseModel):
 
     class Config:
         from_attributes = True  # 允许直接从 SQLAlchemy 模型读取数据
+
+
+class TaskInputUpdateRequest(BaseModel):
+    question_text: Optional[str] = None
+    image_urls: List[str] = Field(default_factory=list)
+    mode: Literal["append", "replace"] = "append"
+
+
+class TaskRunRequest(BaseModel):
+    start_node: Literal["solver", "reviewer", "formatter", "errata_adjudication", "word_composition"] = "solver"
+    target_nodes: Optional[List[Literal["solver", "reviewer", "formatter", "errata_adjudication", "word_composition"]]] = None
+
+
+class TaskOperationRequest(BaseModel):
+    action: Literal["pause", "terminate", "abandon"]
+
+
+class TaskArtifactResponse(BaseModel):
+    id: int
+    task_id: str
+    node_name: str
+    input_revision: int
+    content: str
+    metadata_json: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
 
 
 class AdminTaskListResponse(BaseModel):

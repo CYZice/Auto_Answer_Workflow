@@ -37,3 +37,8 @@ build/
 
 backend/automation_logs
 backend/app/config/model_defaults.local.yaml
+config/*.private.yaml
+data/target-system-calibration/
+data/target-system-browser-profile/
+data/target-system-delivery/
+data/target-system-vnc.pass

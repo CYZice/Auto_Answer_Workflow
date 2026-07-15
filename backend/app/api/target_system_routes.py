@@ -109,6 +109,8 @@ def _find_image_urls(value: Any, key_hint: str = "") -> list[str]:
     found: list[str] = []
     if isinstance(value, dict):
         for key, item in value.items():
+            if str(key).lower() in {"logs", "log", "history", "audit"}:
+                continue
             found.extend(_find_image_urls(item, str(key).lower()))
     elif isinstance(value, list):
         for item in value:

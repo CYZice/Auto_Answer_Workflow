@@ -174,6 +174,7 @@ def test_image_download_includes_rich_text_side_image():
     detail = {
         "topic_img": "https://cdn.example/question.png",
         "topic_right": '<p><img src="https://cdn.example/diagram.png" alt="diagram" /></p>',
+        "logs": [{"old": '<img src="https://cdn.example/outdated-diagram.png" />'}],
     }
     assert _find_image_urls(detail) == [
         "https://cdn.example/question.png",

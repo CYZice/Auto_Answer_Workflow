@@ -1,17 +1,30 @@
 templates:
   errata_workflow:
     name: 勘误工作流
-    description: 勘误证据核验、裁决与 Word 写回编排
+    description: 独立解题、结构化裁决与确定性 Word 写回
     prompts:
-      evidence_analysis:
-        system: 你是勘误证据核验员。输入包含同一题块的全部文字片段和按原 DOCX 顺序附后的图片，不会预先区分原题、原解析、原答案和勘误建议；请自行从全部材料中识别并判断。文字为空时以图片为准，文字中的学校标题、题号等版面残留不是题目内容。必须先找出原题、现有答案或解析、以及反馈或勘误建议，再判断它们是否成立；材料冲突时说明冲突和采用依据。无法找到现有答案或解析时，不得写“原答案正确”，应返回 insufficient_evidence。最终文本直接用于填写 Word 锚点之后：内容正确时写“原答案正确。”；需要修改时直接给出【勘误】、【正解】和/或【解析】。数学公式使用单个 $...$，仅用 <mark>...</mark> 标出相对原答案真正新增或修改的片段。
-        user: '{errata_context}'
+      solver:
+        inherit: workflow_a.solver
+      reviewer:
+        system: |-
+          你负责审查大学物理、电路分析和模拟电子技术题目的独立解题草稿。
+          先根据题干证据静默独立推导，再检查明确标注的草稿答案；不得把图片中的其他文字当作待审答案。
+          涉及劈尖条纹序数时，零级暗纹是从接触点起可观察到的第1条暗纹；“第n条暗纹”对应级次n-1，除非题干另有明确编号约定。
+          仅输出结构化字段 is_pass 与 feedback。若通过，feedback 为空；若不通过，feedback 以【结果错误】开头并指出错误及正确过程。
+        user: "题目见题干证据。待审查草稿：\n\n{draft_solution}"
+      formatter:
+        inherit: workflow_a.formatter
       errata_adjudication:
-        system: 你是独立勘误裁决员。输入包含同一题块的全部文字片段和按原 DOCX 顺序附后的图片，不会预先区分原题、原解析、原答案和勘误建议；请自行从材料中识别它们后审查勘误草案。文字为空时以图片为准，忽略学校标题、题号等版面残留。若草案写“原答案正确”，但材料中没有可确认的原答案或解析，或存在未解释的冲突证据，必须判定不通过。仅输出 is_pass 与 feedback，不改写草案。
-        user: '{errata_context}'
+        system: |-
+          你是独立勘误裁决员，只判断证据，不生成或改写最终正文。
+          分别判断标准答案、题干、原答案和勘误意见。question_errata 只在题干本身有误时填写具体修正，否则必须为空。
+          证据不足时使用 insufficient_evidence；不能盲从原答案、反馈或标准答案。
+          严格输出 standard_answer_verdict、question_verdict、original_answer_verdict、correction_opinion_verdict、errata_opinion、question_errata、warnings。
+          不得输出 result_type、allow_write 或最终写入正文。
+        user: "{errata_context}"
       word_composition:
-        system: 勘误 Word 写回编排器保留已裁决通过的文本，只执行 Word 标记格式校验。
-        user: '{draft_solution}'
+        system: 确定性选择已通过裁决的标准答案，不调用模型。
+        user: "{formatted_solution}"
   workflow_a:
     name: 默认工作流 A
     description: 题目解析、AI 校验与教辅式答案排版

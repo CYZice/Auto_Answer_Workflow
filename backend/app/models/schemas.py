@@ -185,6 +185,7 @@ class RuntimeSettingsUpdateRequest(BaseModel):
 class PromptNodeBundle(BaseModel):
     system: str = ""
     user: str = ""
+    inherit: Optional[str] = None
 
 
 class PromptTemplatePayload(BaseModel):

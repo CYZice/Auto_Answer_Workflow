@@ -231,6 +231,7 @@ class ErrataItem(Base):
     source_end_index = Column(Integer, nullable=True)
     material_docx_path = Column(Text, nullable=True)
     material_paths_json = Column(Text, nullable=True)
+    question_material_paths_json = Column(Text, nullable=True)
     material_text = Column(Text, nullable=True)
     material_version = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

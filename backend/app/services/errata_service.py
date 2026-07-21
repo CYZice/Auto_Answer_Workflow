@@ -5,14 +5,17 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from copy import deepcopy
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Literal
 
 from docx import Document
-from docx.enum.text import WD_COLOR_INDEX
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
+from docx.parts.numbering import NumberingPart
 from docx.text.paragraph import Paragraph
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
@@ -31,11 +34,9 @@ from app.agent.nodes.solver import solve_node_sync
 from app.core.database import SessionLocal, engine
 from app.core.database import DEFAULT_DB_PATH
 from app.models.domain import AgentLog, ErrataItem, ErrataJob, Task
-from app.models.schemas import ReviewDecision
 from app.services.mineru_ingestion import parse_local_file_with_mineru
 from app.services.runtime_config import (
     get_prompt_bundle,
-    read_model_defaults,
     resolve_fallback_models,
 )
 from app.services.task_artifacts import latest_task_artifact, persist_task_artifact
@@ -54,13 +55,8 @@ DEFAULT_ANCHORS = (
 )
 # 保留旧常量，兼容已有调用方与测试；新逻辑使用 DEFAULT_ANCHORS。
 MARKER = DEFAULT_ANCHORS[0]
-RESULT_TYPES = {
-    "correct",
-    "partial_fix",
-    "rewrite",
-    "question_errata",
-    "insufficient_evidence",
-}
+MODEL_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+ERRATA_WORKFLOW_VERSION = 2
 
 
 def _ensure_errata_task_column() -> None:
@@ -85,6 +81,7 @@ def _ensure_errata_task_column() -> None:
             "source_end_index": "INTEGER",
             "material_docx_path": "TEXT",
             "material_paths_json": "TEXT",
+            "question_material_paths_json": "TEXT",
             "material_text": "TEXT",
             "material_version": "INTEGER NOT NULL DEFAULT 0",
         }
@@ -93,26 +90,9 @@ def _ensure_errata_task_column() -> None:
                 conn.execute(text(f"ALTER TABLE errata_items ADD COLUMN {name} {sql_type}"))
 
 
-class ErrataDecision(BaseModel):
-    result_type: Literal[
-        "correct",
-        "partial_fix",
-        "rewrite",
-        "question_errata",
-        "insufficient_evidence",
-    ]
-    final_text_markup: str = Field(default="")
-    warnings: list[str] = Field(default_factory=list)
-
-
 class ErrataAdjudication(BaseModel):
-    result_type: Literal[
-        "correct",
-        "partial_fix",
-        "rewrite",
-        "question_errata",
-        "insufficient_evidence",
-    ]
+    standard_answer_verdict: Literal["correct", "incorrect", "insufficient_evidence"]
+    question_verdict: Literal["correct", "incorrect", "insufficient_evidence"]
     original_answer_verdict: Literal["correct", "incorrect", "insufficient_evidence"]
     correction_opinion_verdict: Literal[
         "correct", "partial", "incorrect", "not_provided", "insufficient_evidence"
@@ -120,6 +100,55 @@ class ErrataAdjudication(BaseModel):
     errata_opinion: str = Field(default="")
     question_errata: str = Field(default="")
     warnings: list[str] = Field(default_factory=list)
+
+
+def derive_errata_result_type(decision: ErrataAdjudication) -> str:
+    if (
+        decision.standard_answer_verdict == "insufficient_evidence"
+        or decision.question_verdict == "insufficient_evidence"
+        or decision.original_answer_verdict == "insufficient_evidence"
+        or decision.correction_opinion_verdict == "insufficient_evidence"
+    ):
+        return "insufficient_evidence"
+    if decision.question_verdict == "incorrect":
+        return "question_errata"
+    return "correct" if decision.original_answer_verdict == "correct" else "rewrite"
+
+
+def errata_allow_write(decision: ErrataAdjudication, has_correction_opinion: bool) -> bool:
+    return (
+        decision.standard_answer_verdict == "correct"
+        and decision.question_verdict != "insufficient_evidence"
+        and decision.original_answer_verdict != "insufficient_evidence"
+        and (
+            decision.question_verdict != "incorrect"
+            or bool((decision.question_errata or "").strip())
+        )
+        and (
+            not has_correction_opinion
+            or decision.correction_opinion_verdict != "insufficient_evidence"
+        )
+    )
+
+
+def build_errata_word_content(decision: ErrataAdjudication, formatted_solution: str) -> str:
+    solution = (formatted_solution or "").strip()
+    if decision.standard_answer_verdict != "correct":
+        raise ValueError("标准答案未通过裁决，不能生成最终正文")
+    if decision.question_verdict == "incorrect":
+        question_errata = (decision.question_errata or "").strip()
+        if not question_errata:
+            raise ValueError("题干错误但缺少 question_errata")
+        if not solution:
+            raise ValueError("题干错误时缺少 Formatter 标准答案")
+        return f"【题干勘误】{question_errata}\n\n{solution}"
+    if decision.original_answer_verdict == "correct":
+        return "原答案正确。"
+    if decision.original_answer_verdict == "incorrect":
+        if not solution:
+            raise ValueError("原答案错误时缺少 Formatter 标准答案")
+        return solution
+    raise ValueError("证据不足，不能生成最终正文")
 
 
 def _item_workflow_artifacts(task: Task | None) -> tuple[str, dict]:
@@ -137,6 +166,16 @@ def _item_workflow_artifacts(task: Task | None) -> tuple[str, dict]:
 
 def item_to_dict(item: ErrataItem, task: Task | None = None) -> dict:
     solution_text, adjudication = _item_workflow_artifacts(task)
+    result_type = item.result_type
+    allow_write = False
+    try:
+        decision = ErrataAdjudication.model_validate(adjudication)
+        result_type = derive_errata_result_type(decision)
+        allow_write = errata_allow_write(
+            decision, bool((item.correction_opinion or "").strip())
+        )
+    except ValueError:
+        pass
     return {
         "item_id": item.item_id,
         "job_id": item.job_id,
@@ -149,13 +188,15 @@ def item_to_dict(item: ErrataItem, task: Task | None = None) -> dict:
         "existing_content": item.existing_content or "",
         "evidence": json.loads(item.evidence_json or "[]"),
         "material_paths": json.loads(item.material_paths_json or "[]"),
+        "question_material_paths": json.loads(item.question_material_paths_json or "[]"),
         "material_text": item.material_text or "",
         "material_version": int(item.material_version or 0),
         "has_material_packet": bool(item.material_docx_path),
         "status": task.state if task else item.status,
         "task_state": task.state if task else None,
         "human_confirmed": item.status == "confirmed",
-        "result_type": item.result_type,
+        "result_type": result_type,
+        "allow_write": allow_write,
         "final_text_markup": (task.final_result if task else item.final_text_markup) or "",
         "warnings": json.loads(item.warnings_json or "[]"),
         "mineru_text": item.mineru_text or "",
@@ -163,6 +204,8 @@ def item_to_dict(item: ErrataItem, task: Task | None = None) -> dict:
         "review_feedback": item.review_feedback or "",
         "replace_existing": bool(item.replace_existing),
         "solution_text": solution_text,
+        "standard_answer_verdict": adjudication.get("standard_answer_verdict", ""),
+        "question_verdict": adjudication.get("question_verdict", ""),
         "original_answer_verdict": adjudication.get("original_answer_verdict", ""),
         "correction_opinion_verdict": adjudication.get("correction_opinion_verdict", ""),
         "errata_opinion": adjudication.get("errata_opinion", ""),
@@ -171,10 +214,7 @@ def item_to_dict(item: ErrataItem, task: Task | None = None) -> dict:
 
 
 def _errata_attachment_urls(item: ErrataItem) -> list[str]:
-    paths = list(dict.fromkeys([
-        *json.loads(item.material_paths_json or "[]"),
-        *json.loads(item.evidence_json or "[]"),
-    ]))
+    paths = list(dict.fromkeys(json.loads(item.question_material_paths_json or "[]")))
     return [f"/api/errata/jobs/{item.job_id}/evidence/{path}" for path in paths]
 
 
@@ -227,6 +267,7 @@ def sync_errata_task(
     history.update(
         {
             "workflow_type": "errata",
+            "errata_workflow_version": ERRATA_WORKFLOW_VERSION,
             "errata_item_id": item.item_id,
             "source_kind": "errata",
             "source_id": item.job_id,
@@ -256,6 +297,65 @@ def ensure_errata_tasks(db, job_id: str, *, create_missing: bool = False) -> Non
     items = db.query(ErrataItem).filter(ErrataItem.job_id == job_id).all()
     for item in items:
         sync_errata_task(db, item, job, create_missing=create_missing)
+
+
+def migrate_errata_workflow_v2() -> None:
+    migration_id = f"errata_workflow_v{ERRATA_WORKFLOW_VERSION}"
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS app_migrations "
+                "(migration_id VARCHAR PRIMARY KEY, applied_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
+            )
+        )
+        if conn.execute(
+            text("SELECT 1 FROM app_migrations WHERE migration_id = :migration_id"),
+            {"migration_id": migration_id},
+        ).first():
+            return
+
+    with SessionLocal() as db:
+        rows = (
+            db.query(ErrataItem, Task)
+            .join(Task, Task.task_id == ErrataItem.task_id)
+            .filter(Task.workflow_type == "errata")
+            .all()
+        )
+        for item, task in rows:
+            task.input_revision = int(task.input_revision or 1) + 1
+            task.state = "manual"
+            task.current_node = None
+            task.retry_count = 0
+            task.final_result = None
+            task.question_preview = None
+            task.answer_preview = None
+            task.error_code = "勘误工作流已升级到 v2，请重新运行。"
+            try:
+                history = json.loads(task.history or "{}")
+            except json.JSONDecodeError:
+                history = {}
+            for key in (
+                "draft_solution",
+                "formatted_solution",
+                "errata_decision",
+                "review_decision",
+                "review_feedback",
+                "failed_node",
+            ):
+                history.pop(key, None)
+            history["errata_workflow_version"] = ERRATA_WORKFLOW_VERSION
+            task.history = json.dumps(history, ensure_ascii=False)
+            item.status = "pending"
+            item.result_type = None
+            item.final_text_markup = None
+            item.review_status = "pending"
+            item.review_feedback = None
+            item.warnings_json = "[]"
+        db.execute(
+            text("INSERT INTO app_migrations (migration_id) VALUES (:migration_id)"),
+            {"migration_id": migration_id},
+        )
+        db.commit()
 
 
 def job_to_dict(job: ErrataJob, item_count: int = 0) -> dict:
@@ -401,10 +501,11 @@ def _build_material_packet(
     start: int,
     end: int,
     item_index: int,
+    packet_kind: str = "materials",
 ) -> tuple[Path, list[str], str]:
     """裁剪原 Word 的题块后渲染，避免用 OCR 字段替代原始版面。"""
     source_dir = source_path.parent
-    packet_dir = source_dir / "materials" / f"item_{item_index}"
+    packet_dir = source_dir / packet_kind / f"item_{item_index}"
     packet_dir.mkdir(parents=True, exist_ok=True)
     packet_path = packet_dir / "source.docx"
     shutil.copy2(source_path, packet_path)
@@ -417,11 +518,28 @@ def _build_material_packet(
     end_element = _top_level_body_element(paragraphs[end], source_body)
     start_index = source_children.index(start_element)
     end_index = source_children.index(end_element)
+    nested_paragraphs_to_remove: list[Paragraph] = []
+    if packet_kind == "question_materials":
+        packet_children = list(body)
+        for paragraph_index, paragraph in enumerate(_body_paragraphs(packet)):
+            top_level = _top_level_body_element(paragraph, body)
+            top_level_index = packet_children.index(top_level)
+            if (
+                start_index <= top_level_index <= end_index
+                and not start <= paragraph_index <= end
+            ):
+                nested_paragraphs_to_remove.append(paragraph)
     for index, element in reversed(list(enumerate(list(body)))):
         if element.tag == qn("w:sectPr"):
             continue
         if index < start_index or index > end_index:
             body.remove(element)
+    for paragraph in reversed(nested_paragraphs_to_remove):
+        paragraph_element = paragraph._p
+        parent = paragraph_element.getparent()
+        parent.remove(paragraph_element)
+        if parent.tag == qn("w:tc") and not any(child.tag == qn("w:p") for child in parent):
+            parent.append(OxmlElement("w:p"))
     packet.save(str(packet_path))
 
     rendered = _render_evidence(packet_path, packet_dir)
@@ -512,6 +630,24 @@ def extract_errata_items(job_id: str) -> None:
                 packet_path, material_paths, material_text = _build_material_packet(
                     source_path, doc, paragraphs, block_start, marker_index, item_index
                 )
+                question_end = next(
+                    (
+                        idx - 1
+                        for idx in range(block_start, marker_index)
+                        if texts[idx].startswith(("原答案：", "答案：", "修改意见：", "被反馈："))
+                    ),
+                    marker_index - 1,
+                )
+                question_end = max(block_start, question_end)
+                _, question_material_paths, _ = _build_material_packet(
+                    source_path,
+                    doc,
+                    paragraphs,
+                    block_start,
+                    question_end,
+                    item_index,
+                    "question_materials",
+                )
                 item_id = f"{job_id}_{item_index}"
                 item = existing_items.pop(item_id, None)
                 if not item:
@@ -521,8 +657,16 @@ def extract_errata_items(job_id: str) -> None:
                     rebuilt_item_ids.add(item_id)
                 item.source_ref = source_ref
                 item.question_text = _field_text(texts, block_start, marker_index, "原题：", ("原答案：", "修改意见：", *anchors)) or _field_text(texts, block_start, marker_index, "原始题目", ("原答案：", "答案：", "修改意见：", *anchors))
-                item.original_answer = _field_text(texts, block_start, marker_index, "原答案：", ("修改意见：", *anchors))
-                item.correction_opinion = _field_text(texts, block_start, marker_index, "修改意见：", anchors)
+                item.original_answer = _field_text(
+                    texts,
+                    block_start,
+                    marker_index,
+                    "原答案：",
+                    ("修改意见：", "被反馈：", *anchors),
+                )
+                item.correction_opinion = _field_text(
+                    texts, block_start, marker_index, "修改意见：", ("被反馈：", *anchors)
+                ) or _field_text(texts, block_start, marker_index, "被反馈：", anchors)
                 item.existing_content = "\n".join(existing_lines)
                 item.existing_paragraph_count = existing_count
                 item.evidence_json = json.dumps(evidence, ensure_ascii=False)
@@ -530,11 +674,21 @@ def extract_errata_items(job_id: str) -> None:
                 item.source_end_index = marker_index
                 item.material_docx_path = str(packet_path)
                 item.material_paths_json = json.dumps(material_paths, ensure_ascii=False)
+                item.question_material_paths_json = json.dumps(
+                    [
+                        path
+                        for path in question_material_paths
+                        if Path(path).suffix.lower() in MODEL_IMAGE_SUFFIXES
+                    ],
+                    ensure_ascii=False,
+                )
                 item.material_text = material_text
                 item.material_version = int(item.material_version or 0) + 1
                 item.status = "pending"
+                item.result_type = None
                 item.review_status = "pending"
                 item.review_feedback = None
+                item.warnings_json = "[]"
                 item.final_text_markup = None
                 previous_marker = marker_index
             for item in existing_items.values():
@@ -612,16 +766,6 @@ def rebuild_errata_materials(job_id: str) -> None:
     extract_errata_items(job_id)
 
 
-def _sanitize_markup(value: str) -> str:
-    text = (value or "").strip()
-    text = re.sub(r"^```(?:html|markdown|text)?\s*|\s*```$", "", text, flags=re.I)
-    if re.search(r"<(?!/?mark>)[^>]+>", text, flags=re.I):
-        raise ValueError("final_text_markup 只允许 <mark> 标签")
-    if text.lower().count("<mark>") != text.lower().count("</mark>"):
-        raise ValueError("<mark> 标签未闭合")
-    return text
-
-
 def _image_data_url(path: Path) -> str:
     mime = mimetypes.guess_type(path.name)[0] or "image/png"
     return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
@@ -640,7 +784,7 @@ def _set_errata_node_state(task_id: str, state: str, node_name: str) -> bool:
         return False
 
 
-def _load_errata_payload(task_id: str) -> tuple[dict, list[dict]]:
+def _load_errata_payload(task_id: str, scope: Literal["question", "full"] = "question") -> tuple[dict, list[dict]]:
     with SessionLocal() as db:
         task = db.query(Task).filter(Task.task_id == task_id).first()
         item = (
@@ -656,16 +800,29 @@ def _load_errata_payload(task_id: str) -> tuple[dict, list[dict]]:
         payload = item_to_dict(item)
         source_dir = Path(job.source_path).parent
         images: list[dict] = []
-        material_paths = list(dict.fromkeys([
-            *payload.get("material_paths", []),
-            *payload.get("evidence", []),
-        ]))
+        material_paths = (
+            payload.get("question_material_paths", [])
+            if scope == "question"
+            else [*payload.get("material_paths", []), *payload.get("evidence", [])]
+        )
+        material_paths = list(dict.fromkeys(material_paths))
         for relative_path in material_paths:
             evidence_path = (source_dir / relative_path).resolve()
-            if evidence_path.exists() and source_dir in evidence_path.parents:
+            if (
+                evidence_path.exists()
+                and source_dir in evidence_path.parents
+                and evidence_path.suffix.lower() in MODEL_IMAGE_SUFFIXES
+            ):
                 images.append(
                     {"type": "image_url", "image_url": {"url": _image_data_url(evidence_path)}}
                 )
+        text_available = bool(
+            (payload.get("question_text") or "").strip()
+            if scope == "question"
+            else (payload.get("material_text") or "").strip()
+        )
+        if not images and not text_available:
+            raise ValueError("题干文字和可用的 PNG/JPEG/WebP 图片均为空")
         return payload, images
 
 
@@ -701,9 +858,11 @@ async def errata_solver_node(state: AgentState) -> AgentState:
     if await asyncio.to_thread(solve_node_sync, task_id):
         return {**state, "status": "cancelled", "error_msg": "Task was manually cancelled."}
     try:
-        payload, image_content = await asyncio.to_thread(_load_errata_payload, task_id)
+        payload, image_content = await asyncio.to_thread(_load_errata_payload, task_id, "question")
         image_urls = [entry["image_url"]["url"] for entry in image_content]
-        question_text = (payload.get("question_text") or "").strip() or _raw_errata_material(payload, len(image_urls))
+        question_text = (payload.get("question_text") or "").strip() or (
+            f"题干文字未提取，请仅依据 {len(image_urls)} 张题干证据图片独立解题。"
+        )
         result = await solve_image(
             image_urls,
             state.get("review_feedback"),
@@ -743,39 +902,6 @@ async def errata_formatter_node(state: AgentState) -> AgentState:
     return {**result, "formatted_solution": solution, "final_result": None, "status": "reviewing"}
 
 
-def _decision_text(value: str) -> str:
-    return _sanitize_markup(value or "")
-
-
-def compose_errata_word_text(decision: ErrataAdjudication | dict, solution: str) -> str:
-    """确定性拼装 Word 内容，绝不让后续节点改写完整正解。"""
-    adjudication = decision if isinstance(decision, ErrataAdjudication) else ErrataAdjudication.model_validate(decision)
-    question_errata = _decision_text(adjudication.question_errata)
-    opinion = _decision_text(adjudication.errata_opinion)
-    opinion_labels = {
-        "correct": "勘误意见正确",
-        "partial": "勘误意见部分正确",
-        "incorrect": "勘误意见不正确",
-        "not_provided": "未提供勘误意见",
-        "insufficient_evidence": "勘误意见无法确认",
-    }
-    prefix = f"{question_errata}\n" if question_errata else ""
-    correction_label = opinion_labels[adjudication.correction_opinion_verdict]
-    if adjudication.original_answer_verdict == "correct":
-        parts = [f"【勘误】{prefix}答案无问题。原答案正确；{correction_label}。"]
-        if opinion:
-            parts.append(opinion)
-        return "\n".join(parts)
-
-    if not solution.strip():
-        raise ValueError("原答案有误时缺少完整正解")
-    parts = [f"【勘误】{prefix}答案有问题。原答案错误；{correction_label}。"]
-    if opinion:
-        parts.append(opinion)
-    parts.extend(["【正解】", solution.strip()])
-    return "\n\n".join(parts)
-
-
 async def errata_review_node(state: AgentState) -> AgentState:
     import asyncio
 
@@ -791,7 +917,7 @@ async def errata_review_node(state: AgentState) -> AgentState:
     if not solution:
         return {**state, "status": "failed", "failed_node": "errata_adjudication", "error_msg": "缺少完整解题结果"}
     try:
-        payload, image_content = await asyncio.to_thread(_load_errata_payload, task_id)
+        payload, image_content = await asyncio.to_thread(_load_errata_payload, task_id, "full")
         prompt_bundle = get_prompt_bundle("errata_adjudication", "errata_workflow")
         context = (
             f"{_raw_errata_material(payload, len(image_content))}\n\n"
@@ -815,28 +941,34 @@ async def errata_review_node(state: AgentState) -> AgentState:
             task_id=task_id,
         )
         decision = result if isinstance(result, ErrataAdjudication) else ErrataAdjudication.model_validate(result)
+        if decision.question_verdict != "incorrect":
+            decision.question_errata = ""
+        has_correction_opinion = bool((payload.get("correction_opinion") or "").strip())
+        if not has_correction_opinion:
+            decision.correction_opinion_verdict = "not_provided"
+        allow_write = errata_allow_write(decision, has_correction_opinion)
+        result_type = derive_errata_result_type(decision)
         artifact_content = decision.model_dump_json()
         await asyncio.to_thread(
             persist_task_artifact, task_id, "errata_adjudication", artifact_content,
-            {"tokens": 0}, state.get("input_revision", 1),
+            {"tokens": 0, "allow_write": allow_write, "result_type": result_type}, state.get("input_revision", 1),
         )
         await asyncio.to_thread(_record_errata_log, task_id, "errata_adjudication", context, artifact_content)
-        manual = decision.result_type == "insufficient_evidence" or decision.original_answer_verdict == "insufficient_evidence"
         with SessionLocal() as db:
             item = db.query(ErrataItem).filter(ErrataItem.task_id == task_id).first()
             if item:
-                item.result_type = decision.result_type
+                item.result_type = result_type
                 item.warnings_json = json.dumps(decision.warnings, ensure_ascii=False)
-                item.review_status = "needs_evidence" if manual else "passed"
+                item.review_status = "passed" if allow_write else "needs_evidence"
                 item.review_feedback = "；".join(decision.warnings)
-                item.status = "insufficient_evidence" if manual else "generated"
+                item.status = "generated" if allow_write else "insufficient_evidence"
                 db.commit()
         return {
             **state,
             "formatted_solution": solution,
             "errata_decision": decision.model_dump(),
-            "review_decision": "INSUFFICIENT" if manual else "PASS",
-            "status": "manual" if manual else "formatting",
+            "review_decision": "PASS" if allow_write else "INSUFFICIENT",
+            "status": "formatting" if allow_write else "manual",
         }
     except Exception as exc:
         return {**state, "status": "failed", "failed_node": "errata_adjudication", "error_msg": str(exc)}
@@ -860,10 +992,15 @@ async def errata_format_node(state: AgentState) -> AgentState:
         if not raw_decision:
             raise ValueError("缺少勘误裁决结果")
         decision = ErrataAdjudication.model_validate(raw_decision)
-        markup = _sanitize_markup(compose_errata_word_text(decision, solution))
+        if not errata_allow_write(
+            decision, decision.correction_opinion_verdict != "not_provided"
+        ):
+            raise ValueError("勘误裁决不允许写入，任务必须转人工处理")
+        markup = build_errata_word_content(decision, solution)
+        result_type = derive_errata_result_type(decision)
         await asyncio.to_thread(
             persist_task_artifact, task_id, "word_composition", markup,
-            {"format": "word_mark_markup", "result_type": decision.result_type, "deterministic": True},
+            {"format": "markdown", "result_type": result_type, "deterministic": True},
             state.get("input_revision", 1),
         )
         with SessionLocal() as db:
@@ -875,160 +1012,6 @@ async def errata_format_node(state: AgentState) -> AgentState:
         return {**state, "status": "completed", "final_result": markup, "formatted_solution": solution, "errata_decision": decision.model_dump()}
     except Exception as exc:
         return {**state, "status": "failed", "failed_node": "word_composition", "error_msg": str(exc)}
-
-
-async def generate_errata_item(item_id: str, model_config: dict | None = None) -> None:
-    with SessionLocal() as db:
-        item = db.query(ErrataItem).filter(ErrataItem.item_id == item_id).first()
-        if not item:
-            return
-        job = db.query(ErrataJob).filter(ErrataJob.job_id == item.job_id).first()
-        if not job:
-            return
-        item.status = "generating"
-        if item.task_id:
-            task = db.query(Task).filter(Task.task_id == item.task_id).first()
-            if task and task.state in {"cancelled", "paused", "terminated", "abandoned"}:
-                return
-            if task:
-                task.state = "solving"
-        db.commit()
-        payload = item_to_dict(item)
-        source_dir = Path(job.source_path).parent
-
-    system_prompt = """你是专业题目勘误审查员。独立核对题干、原答案、原解析和修改意见，不盲从任何现有结论。证据不足时必须返回 insufficient_evidence。最终文本直接用于填写 Word 的“勘误处理建议/应该为：”之后：原答案、题干和解析均正确时写“原答案正确。”；需要修改时直接给出【勘误】、【正解】和/或【解析】，不要写“学生认为”“建议采纳”。数学公式使用单个 $...$。仅用 <mark>...</mark> 标出相对原答案真正新增或修改的片段。"""
-    text_payload = (
-        f"来源：{payload['source_ref']}\n\n"
-        f"原题：\n{payload['question_text']}\n\n"
-        f"原答案：\n{payload['original_answer']}\n\n"
-        f"修改意见：\n{payload['correction_opinion']}\n\n"
-        f"锚点后已有内容：\n{payload['existing_content']}\n\n"
-        f"MinerU 题块候选（仅作补充证据）：\n{payload['mineru_text']}"
-    )
-    human_content: list[dict] = [{"type": "text", "text": text_payload}]
-    for relative_path in payload["evidence"]:
-        evidence_path = (source_dir / relative_path).resolve()
-        if evidence_path.exists() and source_dir in evidence_path.parents:
-            human_content.append(
-                {"type": "image_url", "image_url": {"url": _image_data_url(evidence_path)}}
-            )
-
-    defaults = read_model_defaults().get("solver_config") or {}
-    config = {**defaults, **(model_config or {}), "streaming": False}
-
-    def create_structured_llm(runtime_config: dict):
-        return get_llm(runtime_config).with_structured_output(ErrataDecision)
-
-    try:
-        timeout, max_retries = get_runtime_request_settings()
-        result = await call_with_retry_and_fallback(
-            create_llm_func=create_structured_llm,
-            messages=[SystemMessage(content=system_prompt), HumanMessage(content=human_content)],
-            model_config=config,
-            fallback_models=resolve_fallback_models("solver", config),
-            timeout=timeout,
-            max_retries=max_retries,
-        )
-        decision = result if isinstance(result, ErrataDecision) else ErrataDecision.model_validate(result)
-        markup = _sanitize_markup(decision.final_text_markup)
-        with SessionLocal() as db:
-            item = db.query(ErrataItem).filter(ErrataItem.item_id == item_id).first()
-            if not item:
-                return
-            item.result_type = decision.result_type
-            item.final_text_markup = markup
-            item.warnings_json = json.dumps(decision.warnings, ensure_ascii=False)
-            item.review_status = "pending"
-            item.review_feedback = None
-            item.status = (
-                "insufficient_evidence"
-                if decision.result_type == "insufficient_evidence"
-                else "generated"
-            )
-            task = db.query(Task).filter(Task.task_id == item.task_id).first() if item.task_id else None
-            if task and task.state not in {"cancelled", "paused", "terminated", "abandoned"}:
-                task.state = "manual"
-                task.final_result = markup
-            db.commit()
-    except Exception as exc:
-        with SessionLocal() as db:
-            item = db.query(ErrataItem).filter(ErrataItem.item_id == item_id).first()
-            if item:
-                item.status = "failed"
-                item.warnings_json = json.dumps([str(exc)], ensure_ascii=False)
-                task = db.query(Task).filter(Task.task_id == item.task_id).first() if item.task_id else None
-                if task and task.state not in {"cancelled", "paused", "terminated", "abandoned"}:
-                    task.state = "failed"
-                    task.error_code = str(exc)
-                db.commit()
-
-
-async def review_errata_item(item_id: str, model_config: dict | None = None) -> None:
-    with SessionLocal() as db:
-        item = db.query(ErrataItem).filter(ErrataItem.item_id == item_id).first()
-        if not item or not item.final_text_markup:
-            return
-        job = db.query(ErrataJob).filter(ErrataJob.job_id == item.job_id).first()
-        if not job:
-            return
-        item.review_status = "reviewing"
-        task = db.query(Task).filter(Task.task_id == item.task_id).first() if item.task_id else None
-        if task and task.state in {"cancelled", "paused", "terminated", "abandoned"}:
-            return
-        if task and task.state not in {"cancelled", "paused", "terminated", "abandoned"}:
-            task.state = "reviewing"
-        payload = item_to_dict(item)
-        source_dir = Path(job.source_path).parent
-        db.commit()
-
-    prompt = (
-        "你是独立复核员。检查下列勘误最终文本是否与题干、原答案、修改意见和图像证据一致。"
-        "仅输出 is_pass 与 feedback。证据不足、结论越界、公式或答案不正确均为 false。\n\n"
-        f"原题：\n{payload['question_text']}\n\n原答案：\n{payload['original_answer']}\n\n"
-        f"修改意见：\n{payload['correction_opinion']}\n\nMinerU 证据：\n{payload['mineru_text']}\n\n"
-        f"待写入文本：\n{payload['final_text_markup']}"
-    )
-    content: list[dict] = [{"type": "text", "text": prompt}]
-    for relative_path in payload["evidence"]:
-        evidence_path = (source_dir / relative_path).resolve()
-        if evidence_path.exists() and source_dir in evidence_path.parents:
-            content.append({"type": "image_url", "image_url": {"url": _image_data_url(evidence_path)}})
-
-    defaults = read_model_defaults().get("reviewer_config") or {}
-    config = {**defaults, **(model_config or {}), "streaming": False}
-    try:
-        timeout, max_retries = get_runtime_request_settings()
-        result = await call_with_retry_and_fallback(
-            create_llm_func=lambda runtime: get_llm(runtime).with_structured_output(ReviewDecision),
-            messages=[SystemMessage(content="你只做独立审查，不改写答案。"), HumanMessage(content=content)],
-            model_config=config,
-            fallback_models=resolve_fallback_models("reviewer", config),
-            timeout=timeout,
-            max_retries=max_retries,
-        )
-        decision = result if isinstance(result, ReviewDecision) else ReviewDecision.model_validate(result)
-        with SessionLocal() as db:
-            item = db.query(ErrataItem).filter(ErrataItem.item_id == item_id).first()
-            if item:
-                item.review_status = "passed" if decision.is_pass else "failed"
-                item.review_feedback = decision.feedback or ""
-                task = db.query(Task).filter(Task.task_id == item.task_id).first() if item.task_id else None
-                if task and task.state not in {"cancelled", "paused", "terminated", "abandoned"}:
-                    task.state = "manual"
-                    task.final_result = item.final_text_markup
-                    task.error_code = None if decision.is_pass else item.review_feedback
-                db.commit()
-    except Exception as exc:
-        with SessionLocal() as db:
-            item = db.query(ErrataItem).filter(ErrataItem.item_id == item_id).first()
-            if item:
-                item.review_status = "failed"
-                item.review_feedback = f"审查失败：{exc}"
-                task = db.query(Task).filter(Task.task_id == item.task_id).first() if item.task_id else None
-                if task and task.state not in {"cancelled", "paused", "terminated", "abandoned"}:
-                    task.state = "failed"
-                    task.error_code = item.review_feedback
-                db.commit()
 
 
 def _mineru_field(block: str, label: str, next_labels: tuple[str, ...]) -> str:
@@ -1122,6 +1105,22 @@ async def run_errata_task(
             return
         task.state = "queued"
         task.error_code = None
+        if start_node == "solver":
+            task.retry_count = 0
+            try:
+                history = json.loads(task.history or "{}")
+            except json.JSONDecodeError:
+                history = {}
+            for key in (
+                "draft_solution",
+                "formatted_solution",
+                "errata_decision",
+                "review_decision",
+                "review_feedback",
+                "failed_node",
+            ):
+                history.pop(key, None)
+            task.history = json.dumps(history, ensure_ascii=False)
         db.commit()
     from app.main import run_agent_workflow_async
 
@@ -1156,22 +1155,182 @@ async def run_errata_task_by_item(
     await run_errata_task(task_id, model_config, reviewer_config)
 
 
-def _append_markup_paragraph(after: Paragraph, text: str) -> Paragraph:
-    element = OxmlElement("w:p")
-    if after._p.pPr is not None:
-        element.append(deepcopy(after._p.pPr))
-    after._p.addnext(element)
-    paragraph = Paragraph(element, after._parent)
-    position = 0
-    for match in re.finditer(r"<mark>(.*?)</mark>", text, flags=re.I | re.S):
-        if match.start() > position:
-            paragraph.add_run(text[position : match.start()])
-        run = paragraph.add_run(match.group(1))
-        run.font.highlight_color = WD_COLOR_INDEX.YELLOW
-        position = match.end()
-    if position < len(text):
-        paragraph.add_run(text[position:])
-    return paragraph
+_MARK_START = "ERRATAHIGHLIGHTSTART"
+_MARK_END = "ERRATAHIGHLIGHTEND"
+
+
+class _LegacyMarkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.in_mark = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "mark" or attrs or self.in_mark:
+            raise ValueError("历史高亮内容只允许精确的 <mark> 标签")
+        self.in_mark = True
+        self.parts.append(_MARK_START)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "mark" or not self.in_mark:
+            raise ValueError("历史 <mark> 标签未正确闭合")
+        self.in_mark = False
+        self.parts.append(_MARK_END)
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+    def close(self) -> None:
+        super().close()
+        if self.in_mark:
+            raise ValueError("历史 <mark> 标签未闭合")
+
+
+def _prepare_legacy_markdown(value: str) -> tuple[str, bool]:
+    text_value = (value or "").strip()
+    if not re.search(r"</?mark(?:\s|>)", text_value, flags=re.I):
+        return text_value, False
+    protected_math: list[str] = []
+
+    def protect_math(match: re.Match) -> str:
+        protected_math.append(match.group(0))
+        return f"ERRATAMATH{len(protected_math) - 1}TOKEN"
+
+    protected_value = re.sub(r"\$[^$\r\n]+\$", protect_math, text_value)
+    parser = _LegacyMarkParser()
+    parser.feed(protected_value)
+    parser.close()
+    prepared = "".join(parser.parts)
+    for index, math_text in enumerate(protected_math):
+        prepared = prepared.replace(f"ERRATAMATH{index}TOKEN", math_text)
+    return prepared, True
+
+
+def _highlight_legacy_markers(doc: Document) -> None:
+    highlighted = False
+    for paragraph in _body_paragraphs(doc):
+        active = False
+        for run_element in list(paragraph._p.findall(qn("w:r"))):
+            text_nodes = list(run_element.iter(qn("w:t")))
+            run_text = "".join(node.text or "" for node in text_nodes)
+            if not run_text:
+                continue
+            pieces = re.split(f"({_MARK_START}|{_MARK_END})", run_text)
+            if len(pieces) == 1:
+                if active:
+                    run_properties = run_element.get_or_add_rPr()
+                    highlight = OxmlElement("w:highlight")
+                    highlight.set(qn("w:val"), "yellow")
+                    run_properties.append(highlight)
+                continue
+            insert_at = paragraph._p.index(run_element)
+            paragraph._p.remove(run_element)
+            for piece in pieces:
+                if piece == _MARK_START:
+                    active = True
+                    highlighted = True
+                    continue
+                if piece == _MARK_END:
+                    active = False
+                    continue
+                if not piece:
+                    continue
+                clone = deepcopy(run_element)
+                clone_text_nodes = list(clone.iter(qn("w:t")))
+                for node in clone_text_nodes:
+                    node.text = ""
+                if clone_text_nodes:
+                    clone_text_nodes[0].text = piece
+                if active:
+                    run_properties = clone.get_or_add_rPr()
+                    highlight = OxmlElement("w:highlight")
+                    highlight.set(qn("w:val"), "yellow")
+                    run_properties.append(highlight)
+                paragraph._p.insert(insert_at, clone)
+                insert_at += 1
+    if highlighted:
+        return
+
+
+def _pandoc_docx_blocks(markdown: str, reference_doc: Path, target_doc: Document) -> list[object]:
+    pandoc = shutil.which("pandoc")
+    if not pandoc:
+        raise ValueError("DOCX 导出失败：未找到 pandoc 命令")
+    prepared, has_legacy_mark = _prepare_legacy_markdown(markdown)
+    with tempfile.TemporaryDirectory(prefix="errata_pandoc_") as temp_dir:
+        markdown_path = Path(temp_dir) / "answer.md"
+        output_path = Path(temp_dir) / "answer.docx"
+        markdown_path.write_text(prepared, encoding="utf-8")
+        result = subprocess.run(
+            [
+                pandoc,
+                "-f",
+                "markdown+tex_math_dollars",
+                str(markdown_path),
+                "--reference-doc",
+                str(reference_doc),
+                "-o",
+                str(output_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0 or not output_path.exists():
+            detail = (result.stderr or result.stdout or "").strip()
+            raise ValueError(f"DOCX 导出失败：Pandoc 转换失败{f'：{detail}' if detail else ''}")
+        converted = Document(str(output_path))
+        if has_legacy_mark:
+            _highlight_legacy_markers(converted)
+        try:
+            converted_numbering_part = converted.part.part_related_by(RT.NUMBERING)
+        except KeyError:
+            converted_numbering_part = None
+        if converted_numbering_part is not None:
+            try:
+                target_numbering_part = target_doc.part.part_related_by(RT.NUMBERING)
+            except KeyError:
+                target_numbering_part = NumberingPart(
+                    converted_numbering_part.partname,
+                    converted_numbering_part.content_type,
+                    deepcopy(converted_numbering_part.element),
+                    target_doc.part.package,
+                )
+                target_doc.part.relate_to(target_numbering_part, RT.NUMBERING)
+            else:
+                converted_numbering = converted_numbering_part.element
+                target_numbering = target_numbering_part.element
+                for tag_name, id_name in (("w:abstractNum", "w:abstractNumId"), ("w:num", "w:numId")):
+                    known_ids = {
+                        element.get(qn(id_name))
+                        for element in target_numbering.findall(qn(tag_name))
+                    }
+                    for element in converted_numbering.findall(qn(tag_name)):
+                        if element.get(qn(id_name)) not in known_ids:
+                            target_numbering.append(deepcopy(element))
+        return [
+            deepcopy(element)
+            for element in converted.element.body
+            if element.tag != qn("w:sectPr")
+        ]
+
+
+def _remove_existing_after_anchor(anchor: Paragraph, count: int) -> None:
+    next_element = anchor._p.getnext()
+    removed = 0
+    while next_element is not None and removed < count:
+        following = next_element.getnext()
+        if next_element.tag == qn("w:p"):
+            next_element.getparent().remove(next_element)
+            removed += 1
+        next_element = following
+
+
+def _insert_blocks_after(anchor_element, blocks: list[object]) -> None:
+    current = anchor_element
+    for block in blocks:
+        current.addnext(block)
+        current = block
 
 
 def export_errata_job(job_id: str) -> Path:
@@ -1226,17 +1385,16 @@ def export_errata_job(job_id: str) -> Path:
             if _is_marker(_paragraph_text(paragraph), anchors_for_job)
         ]
         for item, task in rows:
-            final_markup = _sanitize_markup(task.final_result or "")
+            final_markup = (task.final_result or "").strip()
+            blocks = _pandoc_docx_blocks(final_markup, source_path, doc)
             if item.item_index > len(anchors):
                 doc.add_paragraph(f"【手动新增勘误】{item.source_ref or f'题块 {item.item_index}'}")
-                current = doc.paragraphs[-1]
-                for line in final_markup.splitlines() or [""]:
-                    current = _append_markup_paragraph(current, line)
+                _insert_blocks_after(doc.paragraphs[-1]._p, blocks)
                 continue
             anchor = anchors[item.item_index - 1]
-            current = anchor
-            for line in final_markup.splitlines() or [""]:
-                current = _append_markup_paragraph(current, line)
+            if item.replace_existing:
+                _remove_existing_after_anchor(anchor, int(item.existing_paragraph_count or 0))
+            _insert_blocks_after(anchor._p, blocks)
 
         doc.save(str(output_path))
         job.output_path = str(output_path)

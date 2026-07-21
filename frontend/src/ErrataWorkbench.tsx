@@ -12,7 +12,8 @@ type ErrataItem = {
   material_paths: string[]; material_text: string; material_version: number; has_material_packet: boolean
   warnings: string[]; replace_existing: boolean
   mineru_text: string; review_status: string; review_feedback: string
-  solution_text: string; original_answer_verdict: string; correction_opinion_verdict: string
+  solution_text: string; standard_answer_verdict: string; question_verdict: string
+  original_answer_verdict: string; correction_opinion_verdict: string
   errata_opinion: string; question_errata: string
   human_confirmed?: boolean
 }
@@ -32,6 +33,7 @@ export default function ErrataWorkbench({ focusItemId }: { focusItemId?: string 
   const [mineruStatus, setMineruStatus] = useState('not_requested')
   const [selectedId, setSelectedId] = useState(() => localStorage.getItem('zyb.active_errata_item_id') || '')
   const [busy, setBusy] = useState(false)
+  const [exporting, setExporting] = useState(false)
   const [message, setMessage] = useState('')
   const [jobError, setJobError] = useState('')
   const [recentJobs, setRecentJobs] = useState<ErrataJobSummary[]>([])
@@ -136,7 +138,7 @@ export default function ErrataWorkbench({ focusItemId }: { focusItemId?: string 
     if (!item) return false
     setSaveState('saving')
     try {
-      const payload = { source_ref: item.source_ref, question_text: item.question_text, original_answer: item.original_answer, correction_opinion: item.correction_opinion, existing_content: item.existing_content, result_type: item.result_type || 'partial_fix', ...(item.original_answer_verdict ? { errata_opinion: item.errata_opinion } : {}), final_text_markup: item.final_text_markup, replace_existing: item.replace_existing }
+      const payload = { source_ref: item.source_ref, question_text: item.question_text, original_answer: item.original_answer, correction_opinion: item.correction_opinion, existing_content: item.existing_content, solution_text: item.solution_text, replace_existing: item.replace_existing }
       const { data } = await api.patch(`/api/errata/items/${item.item_id}`, payload)
       setItems((current) => current.map((currentItem) => currentItem.item_id === data.item_id ? data : currentItem))
       setDirtyItemId((current) => current === item.item_id ? '' : current)
@@ -181,11 +183,23 @@ export default function ErrataWorkbench({ focusItemId }: { focusItemId?: string 
   const exportDocx = async () => {
     const pendingItems = items.filter((item) => item.status !== 'completed' || !item.human_confirmed)
     if (pendingItems.length > 0) { setMessage(`仍有 ${pendingItems.length} 题未完成或未人工确认，不能导出`); return }
+    setExporting(true)
+    setMessage('正在生成 Word，请稍候…')
     try {
       const response = await api.post(`/api/errata/jobs/${jobId}/export`, {}, { responseType: 'blob' })
       const url = URL.createObjectURL(response.data); const anchor = document.createElement('a')
       anchor.href = url; anchor.download = '勘误_已处理.docx'; anchor.click(); URL.revokeObjectURL(url)
-    } catch (error) { setMessage(axios.isAxiosError(error) ? error.response?.data?.detail || '导出失败' : '导出失败') }
+      setMessage('Word 已生成，下载已开始')
+    } catch (error) {
+      let detail = '导出失败'
+      if (axios.isAxiosError(error)) {
+        const data = error.response?.data
+        if (data instanceof Blob) {
+          try { detail = JSON.parse(await data.text()).detail || detail } catch { /* 响应不是 JSON */ }
+        } else detail = data?.detail || error.message || detail
+      }
+      setMessage(detail)
+    } finally { setExporting(false) }
   }
 
   const addManualItem = async () => {
@@ -284,9 +298,9 @@ export default function ErrataWorkbench({ focusItemId }: { focusItemId?: string 
       </aside>
       {!selected && <section className="grid place-items-center px-8 py-7"><div className="max-w-md border-l-2 border-amber-400 pl-5"><h2 className="text-lg font-semibold text-slate-900">当前任务没有可处理题目</h2><p className="mt-2 text-sm leading-6 text-slate-600">{jobError || '请返回项目列表，选择其他任务或重新导入文件。'}</p><button onClick={showJobList} className="mt-5 rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white">返回项目列表</button></div></section>}
       {selected && <section className="min-w-0 px-8 py-7">
-        <header className="flex items-start justify-between border-b border-slate-200 pb-5">
+        <header className="flex items-start justify-between gap-6 border-b border-slate-200 pb-5">
           <div><p className="text-xs font-medium tracking-wider text-indigo-600">{selected.source_ref || `题块 ${selected.item_index}`}</p><h2 className="mt-1 text-2xl font-semibold">复核并填写锚点内容</h2><p className="mt-2 text-xs text-slate-500">主任务：{selected.task_id || '创建中'} · 勘误：{taskStatusLabel[selected.status] || selected.status} · 审查：{selected.review_status} · {saveState === 'saving' ? '保存中…' : saveState === 'failed' ? '保存失败，可重试' : '已保存'}</p></div>
-          <div className="flex gap-2"><button onClick={showJobList} className="rounded-lg border border-slate-300 px-3 py-2 text-sm">切换任务</button><button onClick={() => operateTask('start')} className="rounded-lg border border-emerald-300 px-3 py-2 text-sm text-emerald-700">开始</button><button onClick={() => operateTask('pause')} className="rounded-lg border border-amber-300 px-3 py-2 text-sm text-amber-700">暂停</button><button onClick={() => operateTask('terminate')} className="rounded-lg border border-rose-300 px-3 py-2 text-sm text-rose-700">终止</button><button onClick={regenerate} className="inline-flex items-center gap-2 rounded-lg border border-slate-300 px-3 py-2 text-sm"><RefreshCw className="h-4 w-4" />重新生成</button><button onClick={exportDocx} className="inline-flex items-center gap-2 rounded-lg border border-slate-300 px-3 py-2 text-sm"><Download className="h-4 w-4" />导出 Word</button><button onClick={() => void deleteSelectedItem()} className="inline-flex items-center gap-2 rounded-lg border border-rose-300 px-3 py-2 text-sm text-rose-700"><Trash2 className="h-4 w-4" />删除本题</button></div>
+          <div className="min-w-0"><div className="flex flex-wrap justify-end gap-2"><button onClick={showJobList} className="rounded-lg border border-slate-300 px-3 py-2 text-sm">切换任务</button><button onClick={() => operateTask('start')} className="rounded-lg border border-emerald-300 px-3 py-2 text-sm text-emerald-700">开始</button><button onClick={() => operateTask('pause')} className="rounded-lg border border-amber-300 px-3 py-2 text-sm text-amber-700">暂停</button><button onClick={() => operateTask('terminate')} className="rounded-lg border border-rose-300 px-3 py-2 text-sm text-rose-700">终止</button><button onClick={regenerate} className="inline-flex items-center gap-2 rounded-lg border border-slate-300 px-3 py-2 text-sm"><RefreshCw className="h-4 w-4" />重新生成</button><button onClick={exportDocx} disabled={exporting} className="inline-flex min-w-28 items-center justify-center gap-2 rounded-lg border border-slate-300 px-3 py-2 text-sm disabled:opacity-50">{exporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}{exporting ? '正在导出' : '导出 Word'}</button><button onClick={() => void deleteSelectedItem()} className="inline-flex items-center gap-2 rounded-lg border border-rose-300 px-3 py-2 text-sm text-rose-700"><Trash2 className="h-4 w-4" />删除本题</button></div>{message && <p role="status" aria-live="polite" className="mt-2 text-right text-xs text-slate-600">{message}</p>}</div>
         </header>
         <div className="grid grid-cols-[minmax(0,1fr)_minmax(360px,0.8fr)] gap-8 pt-6">
           <div className="space-y-7">
@@ -294,20 +308,18 @@ export default function ErrataWorkbench({ focusItemId }: { focusItemId?: string 
           </div>
           <div className="sticky top-6 h-fit border-l border-slate-200 pl-8">
             <label className="text-xs font-semibold uppercase tracking-wider text-slate-400">完整解题结果</label>
-            <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap border border-slate-200 bg-slate-50 p-3 text-sm leading-6 text-slate-700">{selected.solution_text || '完成解题与排版后显示完整正解。'}</pre>
+            <textarea value={selected.solution_text} onChange={(event) => patchItem({ solution_text: event.target.value, final_text_markup: '', result_type: undefined })} rows={14} className="mt-2 w-full rounded-lg border border-slate-300 p-3 font-mono text-sm leading-6 outline-none focus:border-indigo-500" placeholder="完成解题与排版后显示完整正解。" />
             <label className="mt-5 block text-xs font-semibold uppercase tracking-wider text-slate-400">勘误裁决</label>
-            <p className="mt-2 text-sm leading-6 text-slate-700">原答案：{selected.original_answer_verdict || '待裁决'}；勘误意见：{selected.correction_opinion_verdict || '待裁决'}</p>
+            <p className="mt-2 text-sm leading-6 text-slate-700">标准答案：{selected.standard_answer_verdict || '待裁决'}；题干：{selected.question_verdict || '待裁决'}；原答案：{selected.original_answer_verdict || '待裁决'}；勘误意见：{selected.correction_opinion_verdict || '待裁决'}</p>
             {selected.question_errata && <p className="mt-2 text-sm leading-6 text-amber-800">题干勘误：{selected.question_errata}</p>}
             <label className="mt-3 block text-xs font-semibold uppercase tracking-wider text-slate-400">勘误意见</label>
-            <textarea value={selected.errata_opinion} onChange={(event) => patchItem({ errata_opinion: event.target.value })} rows={4} className="mt-2 w-full rounded-lg border border-slate-300 p-3 text-sm leading-6 outline-none focus:border-indigo-500" placeholder="完成裁决后可补充或修改勘误意见" />
-            <label className="mt-5 block text-xs font-semibold uppercase tracking-wider text-slate-400">处理类型</label>
-            <select value={selected.result_type || 'partial_fix'} onChange={(event) => patchItem({ result_type: event.target.value })} className="mt-2 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"><option value="correct">原解析正确</option><option value="partial_fix">局部修改</option><option value="rewrite">重写解析</option><option value="question_errata">题目有误</option><option value="insufficient_evidence">证据不足</option></select>
+            <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap border border-slate-200 bg-slate-50 p-3 text-sm leading-6 text-slate-700">{selected.errata_opinion || '待裁决'}</pre>
+            <p className="mt-4 text-xs text-slate-500">处理类型：{selected.result_type || '待服务端派生'}</p>
             <label className="mt-5 block text-xs font-semibold uppercase tracking-wider text-slate-400">最终写入文本</label>
-            <textarea value={selected.final_text_markup} onChange={(event) => patchItem({ final_text_markup: event.target.value })} rows={18} className="mt-2 w-full rounded-lg border border-slate-300 p-3 font-mono text-sm leading-6 outline-none focus:border-indigo-500" placeholder="用 <mark>...</mark> 标注需要黄色高亮的内容" />
+            <pre className="mt-2 max-h-96 min-h-40 overflow-auto whitespace-pre-wrap border border-slate-200 bg-slate-50 p-3 font-mono text-sm leading-6 text-slate-700">{selected.final_text_markup || '人工编辑 Formatter 后需重新裁决，裁决通过后生成预览。'}</pre>
             {selected.warnings.map((warning) => <p key={warning} className="mt-2 text-xs text-amber-700">⚠ {warning}</p>)}
             <div className={`mt-3 text-xs ${selected.review_status === 'passed' ? 'text-emerald-700' : 'text-amber-700'}`}>审查：{selected.review_status}{selected.review_feedback ? ` — ${selected.review_feedback}` : ''}</div>
             <div className="mt-5 flex gap-2"><button onClick={() => save(false)} className="flex-1 rounded-lg border border-slate-300 px-4 py-2.5 text-sm font-medium">立即保存</button><button onClick={review} disabled={!selected.task_id} className="flex-1 rounded-lg border border-indigo-300 px-4 py-2.5 text-sm font-medium text-indigo-700 disabled:opacity-40">从审查节点继续</button><button onClick={() => save(true)} disabled={saveState !== 'saved' || selected.status !== 'completed'} className="inline-flex flex-1 items-center justify-center gap-2 rounded-lg bg-slate-950 px-4 py-2.5 text-sm font-medium text-white disabled:opacity-40"><FileCheck2 className="h-4 w-4" />标记已检查</button></div>
-            {message && <p className="mt-3 text-xs text-slate-500">{message}</p>}
           </div>
         </div>
       </section>}

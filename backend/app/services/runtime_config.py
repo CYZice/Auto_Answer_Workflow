@@ -16,6 +16,20 @@ PROMPT_TEMPLATES_PATH = CONFIG_DIR / "prompt_templates.yaml"
 MODEL_DEFAULTS_PATH = CONFIG_DIR / "model_defaults.local.yaml"
 PRIVATE_MODEL_DEFAULTS_PATH = CONFIG_DIR / "model_defaults.local.private.yaml"
 
+ERRATA_PROMPT_NODES = (
+    "solver",
+    "reviewer",
+    "formatter",
+    "errata_adjudication",
+    "word_composition",
+)
+ERRATA_PROMPT_PLACEHOLDERS = {
+    "reviewer": "{draft_solution}",
+    "formatter": "{draft_solution}",
+    "errata_adjudication": "{errata_context}",
+    "word_composition": "{formatted_solution}",
+}
+
 DEFAULT_RUNTIME_SETTINGS = {
     "active_template_id": "workflow_a",
     "request_timeout_seconds": 300,
@@ -34,19 +48,29 @@ DEFAULT_PROMPT_TEMPLATES = {
     "templates": {
         "errata_workflow": {
             "name": "勘误工作流",
-            "description": "勘误生成、独立审查与 Word 写回格式",
+            "description": "独立解题、结构化裁决与确定性 Word 写回",
             "prompts": {
-                "evidence_analysis": {
-                    "system": "你是勘误证据核验员。输入是同一题块的全部文字片段和按原 DOCX 顺序附后的图片，不预先区分原题、原解析、原答案和勘误建议；请自行识别并判断。文字为空时以图片为准，不能在找不到现有答案或解析时写“原答案正确”。最终文本只允许使用 <mark> 标记修改片段。",
-                    "user": "{errata_context}",
+                "solver": {
+                    "inherit": "workflow_a.solver",
+                    "system": "",
+                    "user": "",
+                },
+                "reviewer": {
+                    "system": "你负责审查大学物理、电路分析和模拟电子技术题目的独立解题草稿。只审查明确标注的草稿答案，不得把题目图片中的其他文字当作待审答案。仅输出 is_pass 与 feedback。",
+                    "user": "题目见题干证据。待审查草稿：\n\n{draft_solution}",
+                },
+                "formatter": {
+                    "inherit": "workflow_a.formatter",
+                    "system": "",
+                    "user": "",
                 },
                 "errata_adjudication": {
-                    "system": "你是勘误裁决员。输入是同一题块的全部文字片段和按原 DOCX 顺序附后的图片；请自行识别材料角色后判断草案。证据不足或存在未解释冲突时必须不通过，仅输出 is_pass 与 feedback。",
+                    "system": "你是独立勘误裁决员。分别判断标准答案、题干、原答案和勘误意见，不生成或改写最终正文。question_errata 只在题干本身有误时填写。",
                     "user": "{errata_context}",
                 },
                 "word_composition": {
-                    "system": "你是 Word 勘误写回编排器。保留已通过裁决的文本并校验 <mark> 标记格式。",
-                    "user": "{draft_solution}",
+                    "system": "确定性选择已通过裁决的标准答案，不调用模型。",
+                    "user": "{formatted_solution}",
                 },
             },
         },
@@ -385,7 +409,13 @@ def update_runtime_settings(payload: dict[str, Any]) -> dict[str, Any]:
 
 def read_prompt_templates() -> dict[str, Any]:
     with _LOCK:
-        raw = _safe_read_yaml(PROMPT_TEMPLATES_PATH, DEFAULT_PROMPT_TEMPLATES)
+        _ensure_file(PROMPT_TEMPLATES_PATH, DEFAULT_PROMPT_TEMPLATES)
+        try:
+            raw = yaml.safe_load(PROMPT_TEMPLATES_PATH.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError(f"提示词配置无法解析：{exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("提示词配置必须是 YAML 对象")
     templates = raw.get("templates") if isinstance(raw.get("templates"), dict) else {}
     return {"templates": templates}
 
@@ -428,6 +458,11 @@ def get_template(template_id: str | None) -> dict[str, Any] | None:
     return None
 
 
+def _get_template_exact(template_id: str) -> dict[str, Any] | None:
+    data = read_prompt_templates().get("templates", {}).get(template_id)
+    return {"template_id": template_id, **data} if isinstance(data, dict) else None
+
+
 def upsert_template(template_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     template_id = template_id.strip()
     if not template_id:
@@ -436,22 +471,40 @@ def upsert_template(template_id: str, payload: dict[str, Any]) -> dict[str, Any]
     name = str(payload.get("name") or template_id).strip() or template_id
     description = str(payload.get("description") or "").strip()
     prompts = payload.get("prompts") if isinstance(payload.get("prompts"), dict) else {}
+    if template_id == "errata_workflow":
+        missing_nodes = [node for node in ERRATA_PROMPT_NODES if not isinstance(prompts.get(node), dict)]
+        if missing_nodes:
+            raise ValueError(f"errata_workflow 缺少节点提示词：{', '.join(missing_nodes)}")
 
+    node_names = ERRATA_PROMPT_NODES if template_id == "errata_workflow" else (
+        "solver",
+        "reviewer",
+        "formatter",
+    )
     normalized_prompts: dict[str, dict[str, str]] = {}
-    for node_name in ["solver", "reviewer", "formatter"]:
+    for node_name in node_names:
         node_prompt = (
             prompts.get(node_name) if isinstance(prompts.get(node_name), dict) else {}
         )
-        normalized_prompts[node_name] = {
+        normalized_prompt = {
             "system": str(node_prompt.get("system") or "").strip(),
             "user": str(node_prompt.get("user") or "").strip(),
         }
+        inherit = str(node_prompt.get("inherit") or "").strip()
+        if inherit:
+            normalized_prompt["inherit"] = inherit
+        normalized_prompts[node_name] = normalized_prompt
 
     payload_to_save = {
         "name": name,
         "description": description,
         "prompts": normalized_prompts,
     }
+
+    if template_id == "errata_workflow":
+        validate_errata_workflow_prompts(
+            {"template_id": template_id, **payload_to_save}
+        )
 
     with _LOCK:
         raw = _safe_read_yaml(PROMPT_TEMPLATES_PATH, DEFAULT_PROMPT_TEMPLATES)
@@ -523,8 +576,14 @@ def resolve_fallback_models(
 
 
 def get_prompt_bundle(node_name: str, template_id: str | None = None) -> dict[str, str]:
-    template = get_template(template_id)
+    template = (
+        _get_template_exact(template_id)
+        if template_id == "errata_workflow"
+        else get_template(template_id)
+    )
     if not template:
+        if template_id == "errata_workflow":
+            raise ValueError("errata_workflow 提示词模板不存在")
         return {"system": "", "user": ""}
     prompts = (
         template.get("prompts") if isinstance(template.get("prompts"), dict) else {}
@@ -532,10 +591,57 @@ def get_prompt_bundle(node_name: str, template_id: str | None = None) -> dict[st
     node_prompt = (
         prompts.get(node_name) if isinstance(prompts.get(node_name), dict) else {}
     )
+    if template_id == "errata_workflow" and not node_prompt:
+        raise ValueError(f"errata_workflow 缺少节点提示词：{node_name}")
+    seen: set[str] = set()
+    while str(node_prompt.get("inherit") or "").strip():
+        inherit = str(node_prompt["inherit"]).strip()
+        if inherit in seen:
+            raise ValueError(f"提示词继承存在循环：{inherit}")
+        seen.add(inherit)
+        inherited_template_id, separator, inherited_node = inherit.partition(".")
+        inherited_template = _get_template_exact(inherited_template_id) if separator else None
+        inherited_prompts = (
+            inherited_template.get("prompts")
+            if isinstance(inherited_template, dict)
+            and isinstance(inherited_template.get("prompts"), dict)
+            else {}
+        )
+        inherited_prompt = inherited_prompts.get(inherited_node)
+        if not isinstance(inherited_prompt, dict):
+            raise ValueError(f"提示词继承目标不存在：{inherit}")
+        node_prompt = inherited_prompt
     return {
         "system": str(node_prompt.get("system") or ""),
         "user": str(node_prompt.get("user") or ""),
     }
+
+
+def validate_errata_workflow_prompts(template: dict[str, Any] | None = None) -> None:
+    template = template or _get_template_exact("errata_workflow")
+    prompts = template.get("prompts") if isinstance(template, dict) else None
+    if not isinstance(prompts, dict):
+        raise ValueError("errata_workflow 提示词模板不存在")
+    missing_nodes = [node for node in ERRATA_PROMPT_NODES if not isinstance(prompts.get(node), dict)]
+    if missing_nodes:
+        raise ValueError(f"errata_workflow 缺少节点提示词：{', '.join(missing_nodes)}")
+    for node in ERRATA_PROMPT_NODES:
+        node_prompt = prompts[node]
+        inherit = str(node_prompt.get("inherit") or "").strip()
+        if inherit:
+            inherited_template_id, separator, inherited_node = inherit.partition(".")
+            inherited_template = _get_template_exact(inherited_template_id) if separator else None
+            inherited_prompts = inherited_template.get("prompts", {}) if inherited_template else {}
+            node_prompt = inherited_prompts.get(inherited_node, {})
+        bundle = {
+            "system": str(node_prompt.get("system") or ""),
+            "user": str(node_prompt.get("user") or ""),
+        }
+        if not bundle["system"].strip() or not bundle["user"].strip():
+            raise ValueError(f"errata_workflow.{node} 的 system/user 不能为空")
+        placeholder = ERRATA_PROMPT_PLACEHOLDERS.get(node)
+        if placeholder and placeholder not in bundle["user"]:
+            raise ValueError(f"errata_workflow.{node}.user 缺少占位符 {placeholder}")
 
 
 def render_user_prompt(template: str, values: dict[str, Any]) -> str:

@@ -1,6 +1,9 @@
 import axios from 'axios'
-import { ChevronLeft, ChevronRight, Download, Eye, LoaderCircle, RefreshCw } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Download, Eye, LoaderCircle, RefreshCw, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
+import ReactMarkdown from 'react-markdown'
+import rehypeKatex from 'rehype-katex'
+import remarkMath from 'remark-math'
 
 const api = axios.create({ baseURL: import.meta.env.VITE_API_BASE_URL || '' })
 const pageSize = 20
@@ -14,13 +17,14 @@ type TargetTask = {
 
 type FilterOption = { id: number; name: string }
 type SyncStatus = { state: string; synced: number; imported: number; schools_done: number; schools_total: number; error: string }
+type WorkflowTask = { task_id: string; answer_preview?: string | null; final_result?: string | null }
 
 const statusLabel: Record<string, string> = {
   discovered: '待选择', selected: '已选择', claimed: '已抢题', solving: '解题中', review_pending: '已解答，待人工填入',
   abandoned: '已撤回',
 }
 
-export default function TargetSystemWorkbench({ onOpenTask }: { onOpenTask: (taskId: string) => void }) {
+export default function TargetSystemWorkbench() {
   const [items, setItems] = useState<TargetTask[]>([])
   const [filters, setFilters] = useState<{ schools: FilterOption[]; subjects: FilterOption[] }>({ schools: [], subjects: [] })
   const [selected, setSelected] = useState<string[]>([])
@@ -35,6 +39,9 @@ export default function TargetSystemWorkbench({ onOpenTask }: { onOpenTask: (tas
   const [total, setTotal] = useState(0)
   const [busy, setBusy] = useState('')
   const [message, setMessage] = useState('')
+  const [previewTask, setPreviewTask] = useState<WorkflowTask | null>(null)
+  const [previewLoading, setPreviewLoading] = useState(false)
+  const [previewError, setPreviewError] = useState('')
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
 
   const refresh = async () => {
@@ -68,6 +75,19 @@ export default function TargetSystemWorkbench({ onOpenTask }: { onOpenTask: (tas
     setLoadingDetail(item.id)
     try { const { data } = await api.get(`/api/target-system/tasks/${item.id}/detail`); setDetails((current) => ({ ...current, [item.id]: data })) } finally { setLoadingDetail(null) }
   }
+  const openAnswerPreview = async (taskId: string) => {
+    setPreviewTask(null)
+    setPreviewError('')
+    setPreviewLoading(true)
+    try {
+      const { data } = await api.get<WorkflowTask>(`/api/admin/tasks/${encodeURIComponent(taskId)}`)
+      setPreviewTask(data)
+    } catch (error: any) {
+      setPreviewError(error?.response?.data?.detail || error?.message || '无法加载 AI 结果')
+    } finally {
+      setPreviewLoading(false)
+    }
+  }
   const shownStart = total ? (page - 1) * pageSize + 1 : 0
   const shownEnd = Math.min(page * pageSize, total)
   const selectedSchoolName = useMemo(() => filters.schools.find((item) => String(item.id) === schoolId)?.name, [filters.schools, schoolId])
@@ -97,7 +117,7 @@ export default function TargetSystemWorkbench({ onOpenTask }: { onOpenTask: (tas
             <input type="checkbox" disabled={!['discovered', 'selected'].includes(item.status)} checked={selected.includes(item.remote_task_id)} onChange={() => toggle(item.remote_task_id)} />
             <span className="font-mono text-xs text-gray-500">{item.remote_task_id}</span>
             <div className="min-w-0"><p className="font-medium truncate">{item.title}</p><p className="text-xs text-gray-400">{item.school_name || '未指定学校'}{item.subject_name ? ` · ${item.subject_name}` : ''}</p><button onClick={() => void toggleDetail(item)} className="mt-1 inline-flex items-center gap-1 text-xs text-indigo-600 hover:underline"><Eye className="w-3 h-3" />{expandedId === item.id ? '收起题目' : '查看题目'}</button>{item.error_message && <p className="text-xs text-red-600 truncate mt-1">{item.error_message}</p>}</div>
-            {item.workflow_task_id ? <button onClick={() => onOpenTask(item.workflow_task_id!)} className="text-indigo-600 text-xs hover:underline">查看 AI 结果</button> : <span className="text-xs text-gray-400">未创建</span>}
+            {item.workflow_task_id ? <button onClick={() => void openAnswerPreview(item.workflow_task_id!)} className="text-indigo-600 text-xs hover:underline">查看 AI 结果</button> : <span className="text-xs text-gray-400">未创建</span>}
             <div className="space-y-1"><span className="block text-xs">{statusLabel[item.status] || item.status}</span>{!['discovered', 'selected', 'delivered'].includes(item.status) && <button onClick={() => returnToAll(item)} disabled={Boolean(busy)} className="text-left text-xs text-rose-600 hover:underline disabled:opacity-50">撤回到全部</button>}</div>
           </div>
           {expandedId === item.id && <div className="ml-[152px] mr-4 mb-4 rounded bg-slate-50 border px-3 py-3 text-xs">
@@ -109,5 +129,13 @@ export default function TargetSystemWorkbench({ onOpenTask }: { onOpenTask: (tas
       </div>
 
     </div>
+    {(previewLoading || previewTask || previewError) && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6" onClick={() => { setPreviewTask(null); setPreviewError(''); setPreviewLoading(false) }}>
+      <article className="relative max-h-[90vh] w-full max-w-5xl overflow-y-auto bg-white p-8 shadow-2xl" onClick={(event) => event.stopPropagation()}>
+        <button type="button" onClick={() => { setPreviewTask(null); setPreviewError(''); setPreviewLoading(false) }} className="absolute right-3 top-3 p-2 text-gray-500 hover:bg-gray-100 hover:text-gray-900" aria-label="关闭 AI 结果预览" title="关闭"><X className="h-5 w-5" /></button>
+        {previewLoading && <div className="flex min-h-48 items-center justify-center gap-2 text-sm text-gray-500"><LoaderCircle className="h-5 w-5 animate-spin" />正在加载 AI 结果…</div>}
+        {previewError && <div className="min-h-48 py-10 text-sm text-red-600">{previewError}</div>}
+        {previewTask && <div className="prose prose-slate max-w-none break-words"><ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>{previewTask.answer_preview || previewTask.final_result || ''}</ReactMarkdown></div>}
+      </article>
+    </div>}
   </div>
 }

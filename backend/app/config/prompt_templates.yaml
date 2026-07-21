@@ -1,30 +1,30 @@
 templates:
   errata_workflow:
     name: 勘误工作流
-    description: 完整解题、独立裁决与确定性 Word 写回编排
+    description: 独立解题、结构化裁决与确定性 Word 写回
     prompts:
       solver:
-        system: |
-          你是一位专业的 AI 解题助手。当前题目来自勘误工作流，但本步骤只负责独立完成题目，这份完整答案将作为后续勘误的唯一解题依据。
-          忽略材料中的原答案、原解析和勘误意见，不评价它们是否正确。使用简体中文，所有数学公式使用单个 $...$，给出完整、可复核的标准答案与必要推导。
-        user: "请从图片和 OCR 文本中识别题目并独立完成解答。"
+        inherit: workflow_a.solver
       reviewer:
-        system: |
-          你负责复核独立解题草稿的逻辑与结果。不要比较原答案或勘误意见；只检查这份解答是否能作为完整正解。
-          仅输出结构化字段 is_pass 与 feedback。若不通过，feedback 说明应修正的推导或结果。
-        user: "题目见图片和 OCR 文本。待复核的完整解题草稿：\n\n{draft_solution}"
+        system: |-
+          你负责审查大学物理、电路分析和模拟电子技术题目的独立解题草稿。
+          先根据题干证据静默独立推导，再检查明确标注的草稿答案；不得把图片中的其他文字当作待审答案。
+          涉及劈尖条纹序数时，零级暗纹是从接触点起可观察到的第1条暗纹；“第n条暗纹”对应级次n-1，除非题干另有明确编号约定。
+          仅输出结构化字段 is_pass 与 feedback。若通过，feedback 为空；若不通过，feedback 以【结果错误】开头并指出错误及正确过程。
+        user: "题目见题干证据。待审查草稿：\n\n{draft_solution}"
       formatter:
-        system: |
-          你是标准答案排版助手。将已通过的解题草稿整理为完整、清晰、可直接用于勘误比对的答案。
-          保留最终答案和必要推导，不要评价原答案、勘误意见或写入【勘误】。使用简体中文和单个 $...$ 行内公式。
-        user: "请排版以下完整解题草稿：\n\n{draft_solution}"
+        inherit: workflow_a.formatter
       errata_adjudication:
-        system: |
-          你是独立勘误裁决员。比较题目证据、独立完成的完整正解、原答案和勘误意见，不能盲从任一方。
-          必须分别输出 original_answer_verdict（correct、incorrect、insufficient_evidence）和 correction_opinion_verdict（correct、partial、incorrect、not_provided、insufficient_evidence）。
-          errata_opinion 只写简洁的勘误依据；question_errata 只在题干本身有误时填写。证据不足时 result_type 必须为 insufficient_evidence，且不得将原答案判为 correct。
-          只在相对原文的真实修改片段使用 <mark>...</mark>。
+        system: |-
+          你是独立勘误裁决员，只判断证据，不生成或改写最终正文。
+          分别判断标准答案、题干、原答案和勘误意见。question_errata 只在题干本身有误时填写具体修正，否则必须为空。
+          证据不足时使用 insufficient_evidence；不能盲从原答案、反馈或标准答案。
+          严格输出 standard_answer_verdict、question_verdict、original_answer_verdict、correction_opinion_verdict、errata_opinion、question_errata、warnings。
+          不得输出 result_type、allow_write 或最终写入正文。
         user: "{errata_context}"
+      word_composition:
+        system: "确定性选择已通过裁决的标准答案，不调用模型。"
+        user: "{formatted_solution}"
   workflow_a:
     name: 电路分析
     description: 电路分析解题流程提示词

@@ -3738,7 +3738,7 @@ function App() {
         )}
         {currentView === 'paper-docx' && <PaperDocxWorkbench focusQuestionId={paperFocusQuestionId} />}
         {currentView === 'errata' && <ErrataWorkbench focusItemId={errataFocusItemId} />}
-        {currentView === 'target-system' && <TargetSystemWorkbench onOpenTask={(taskId) => { setAdminFocusTaskId(taskId); setCurrentView('admin') }} />}
+        {currentView === 'target-system' && <TargetSystemWorkbench />}
       </div>
     </QueryClientProvider>
   )

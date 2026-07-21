@@ -69,6 +69,7 @@ from app.services.runtime_config import (
     read_runtime_settings,
     update_runtime_settings,
     upsert_template,
+    validate_errata_workflow_prompts,
 )
 from app.api.mineru_routes import router as mineru_router
 from app.api.errata_routes import router as errata_router
@@ -83,6 +84,7 @@ from app.services.errata_service import (
     errata_formatter_node,
     errata_format_node,
     errata_review_node,
+    migrate_errata_workflow_v2,
 )
 
 # 全局并发信号量，控制同时进行的大模型推理任务数
@@ -623,11 +625,13 @@ def _sync_target_system_workflow_state(db: Session, task_record: Task) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    validate_errata_workflow_prompts()
     migrate_legacy_sqlite_db()
     Base.metadata.create_all(bind=engine)
     ensure_task_preview_columns()
     _ensure_errata_task_column()
     migrate_task_workflow_metadata()
+    migrate_errata_workflow_v2()
     ensure_target_system_columns()
     with SessionLocal() as db:
         db.query(Task).filter(Task.state.in_(["queued", "solving", "reviewing", "formatting"])).update(
@@ -730,6 +734,7 @@ async def create_task(
         new_task_id = f"task_{uuid.uuid4().hex[:8]}"
         new_thread_id = f"thread_{uuid.uuid4().hex[:8]}"
         runtime_settings = read_runtime_settings()
+        model_defaults = read_model_defaults()
         workflow_template_id = (
             req.workflow_template_id
             or model_defaults.get("workflow_template_id")
@@ -1021,6 +1026,8 @@ def list_task_inbox(
         except Exception:
             meta = {}
         kind = task.workflow_type or "standard"
+        if kind == "errata" and task.state == "completed":
+            continue
         legacy_errata = errata_map.get(task.task_id)
         if kind == "errata" and legacy_errata:
             job = errata_jobs.get(legacy_errata.job_id)
@@ -2078,6 +2085,8 @@ def ensure_task_preview_columns() -> None:
                     conn.execute(text("ALTER TABLE errata_items ADD COLUMN review_feedback TEXT"))
                 if "task_id" not in item_columns:
                     conn.execute(text("ALTER TABLE errata_items ADD COLUMN task_id VARCHAR"))
+                if "question_material_paths_json" not in item_columns:
+                    conn.execute(text("ALTER TABLE errata_items ADD COLUMN question_material_paths_json TEXT"))
             paper_columns = {
                 row[1]
                 for row in conn.execute(text("PRAGMA table_info(paper_projects)")).fetchall()

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 import shutil
 import uuid
 from pathlib import Path
@@ -16,23 +15,17 @@ from app.models.domain import AgentLog, ErrataItem, ErrataJob, Task, TaskArtifac
 from app.models.schemas import ModelConfig
 from app.services.errata_service import (
     ERRATA_ROOT,
-    ErrataAdjudication,
-    RESULT_TYPES,
-    compose_errata_word_text,
     export_errata_job,
     extract_errata_items,
-    generate_errata_job,
     enrich_errata_job_with_mineru,
     ensure_errata_tasks,
     item_to_dict,
     job_to_dict,
     normalize_errata_evidence,
     rebuild_errata_materials,
-    review_errata_item,
     run_errata_task,
     run_errata_task_batch,
     sync_errata_task,
-    _sanitize_markup,
 )
 from app.services.mineru_v4_service import mineru_is_configured
 
@@ -61,6 +54,7 @@ class ErrataItemUpdateRequest(BaseModel):
             "insufficient_evidence",
         ]
     ] = None
+    solution_text: Optional[str] = None
     final_text_markup: Optional[str] = None
     errata_opinion: Optional[str] = None
     status: Optional[
@@ -304,28 +298,56 @@ def update_errata_item(item_id: str, req: ErrataItemUpdateRequest):
         )
         for field in context_fields & updates.keys():
             setattr(item, field, updates[field] or "")
-        if "result_type" in updates and updates["result_type"] not in RESULT_TYPES:
-            raise HTTPException(status_code=400, detail="无效的 result_type")
-        if "final_text_markup" in updates and not context_changed:
-            markup = _sanitize_markup(updates["final_text_markup"] or "")
-            item.final_text_markup = markup
-            task = db.query(Task).filter(Task.task_id == item.task_id).first() if item.task_id else None
-            if task:
-                output_changed = (task.final_result or "") != markup
-                task.final_result = markup or None
-                task.state = "completed" if markup else "manual"
-                task.current_node = "word_composition" if markup else None
+        if "result_type" in updates:
+            raise HTTPException(status_code=400, detail="result_type 为只读派生字段，不能人工修改")
+
+        task = db.query(Task).filter(Task.task_id == item.task_id).first() if item.task_id else None
+        job = db.query(ErrataJob).filter(ErrataJob.job_id == item.job_id).first()
+        if context_changed:
+            sync_errata_task(db, item, job, invalidate=True)
+
+        formatter_edit_present = "solution_text" in updates or "final_text_markup" in updates
+        if formatter_edit_present:
+            if not task:
+                raise HTTPException(status_code=409, detail="该勘误题没有关联 Task")
+            raw_solution = (
+                updates.get("solution_text")
+                if "solution_text" in updates
+                else updates.get("final_text_markup")
+            )
+            solution_text = str(raw_solution or "").strip()
+            current_formatter = (
+                db.query(TaskArtifact)
+                .filter(
+                    TaskArtifact.task_id == task.task_id,
+                    TaskArtifact.node_name == "formatter",
+                    TaskArtifact.input_revision == int(task.input_revision or 1),
+                )
+                .order_by(TaskArtifact.id.desc())
+                .first()
+            )
+            if context_changed or not current_formatter or current_formatter.content.strip() != solution_text:
+                if not context_changed:
+                    task.input_revision = int(task.input_revision or 1) + 1
+                revision = int(task.input_revision or 1)
+                db.add(TaskArtifact(
+                    task_id=task.task_id,
+                    node_name="formatter",
+                    input_revision=revision,
+                    content=solution_text,
+                    metadata_json=json.dumps({"manual_edit": True}, ensure_ascii=False),
+                ))
+                task.final_result = None
+                task.state = "manual"
+                task.current_node = None
                 task.error_code = None
-                if markup and output_changed:
-                    db.add(TaskArtifact(
-                        task_id=task.task_id,
-                        node_name="word_composition",
-                        input_revision=int(task.input_revision or 1),
-                        content=markup,
-                        metadata_json=json.dumps({"manual_override": True}, ensure_ascii=False),
-                    ))
+                item.final_text_markup = None
+                item.result_type = None
+                item.status = "pending"
+                item.review_status = "pending"
+                item.review_feedback = None
+                item.warnings_json = "[]"
         if "errata_opinion" in updates:
-            task = db.query(Task).filter(Task.task_id == item.task_id).first() if item.task_id else None
             if not task:
                 raise HTTPException(status_code=409, detail="该勘误题没有关联 Task")
             revision = int(task.input_revision or 1)
@@ -339,46 +361,20 @@ def update_errata_item(item_id: str, req: ErrataItemUpdateRequest):
                 .order_by(TaskArtifact.id.desc())
                 .first()
             )
-            solution_artifact = (
-                db.query(TaskArtifact)
-                .filter(
-                    TaskArtifact.task_id == task.task_id,
-                    TaskArtifact.node_name == "formatter",
-                    TaskArtifact.input_revision == revision,
-                )
-                .order_by(TaskArtifact.id.desc())
-                .first()
-            )
-            if not decision_artifact or not solution_artifact:
-                raise HTTPException(status_code=409, detail="完成解题和勘误裁决后才能编辑勘误意见")
+            if not decision_artifact:
+                raise HTTPException(status_code=409, detail="完成勘误裁决后才能编辑裁决意见")
             try:
-                decision = ErrataAdjudication.model_validate_json(decision_artifact.content)
-            except ValueError as exc:
+                decision_data = json.loads(decision_artifact.content)
+            except (TypeError, json.JSONDecodeError) as exc:
                 raise HTTPException(status_code=409, detail="当前勘误裁决产物格式无效") from exc
-            decision.errata_opinion = _sanitize_markup(updates["errata_opinion"] or "")
-            decision_json = decision.model_dump_json()
+            decision_data["errata_opinion"] = str(updates["errata_opinion"] or "").strip()
             db.add(TaskArtifact(
                 task_id=task.task_id,
                 node_name="errata_adjudication",
                 input_revision=revision,
-                content=decision_json,
-                metadata_json=json.dumps({"manual_override": True}, ensure_ascii=False),
+                content=json.dumps(decision_data, ensure_ascii=False),
+                metadata_json=json.dumps({"manual_edit": True}, ensure_ascii=False),
             ))
-            markup = _sanitize_markup(compose_errata_word_text(decision, solution_artifact.content))
-            db.add(TaskArtifact(
-                task_id=task.task_id,
-                node_name="word_composition",
-                input_revision=revision,
-                content=markup,
-                metadata_json=json.dumps({"manual_override": True, "deterministic": True}, ensure_ascii=False),
-            ))
-            item.final_text_markup = markup
-            task.final_result = markup
-            task.state = "completed"
-            task.current_node = "word_composition"
-            task.error_code = None
-        if "result_type" in updates:
-            item.result_type = updates["result_type"]
         if "status" in updates:
             if updates["status"] == "confirmed" and not (
                 item.final_text_markup or ""
@@ -389,8 +385,8 @@ def update_errata_item(item_id: str, req: ErrataItemUpdateRequest):
             item.replace_existing = updates["replace_existing"]
         if "warnings" in updates:
             item.warnings_json = json.dumps(updates["warnings"] or [], ensure_ascii=False)
-        job = db.query(ErrataJob).filter(ErrataJob.job_id == item.job_id).first()
-        sync_errata_task(db, item, job, invalidate=context_changed)
+        if not context_changed:
+            sync_errata_task(db, item, job, invalidate=False)
         db.commit()
         db.refresh(item)
         task = db.query(Task).filter(Task.task_id == item.task_id).first() if item.task_id else None
@@ -435,7 +431,11 @@ def create_manual_errata_item(job_id: str, req: ErrataItemCreateRequest):
             material_version=1,
             status="pending",
         )
-        db.add(item); db.flush(); ensure_errata_tasks(db, job_id, create_missing=True); db.commit(); db.refresh(item)
+        db.add(item)
+        db.flush()
+        ensure_errata_tasks(db, job_id, create_missing=True)
+        db.commit()
+        db.refresh(item)
         task = db.query(Task).filter(Task.task_id == item.task_id).first()
         return item_to_dict(item, task)
 

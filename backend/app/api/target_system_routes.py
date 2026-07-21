@@ -211,13 +211,21 @@ def list_target_tasks(status: str | None = None, school_id: int | None = None, s
     page_size = min(max(page_size, 1), 100)
     with SessionLocal() as db:
         _refresh_review_states(db)
-        query = db.query(TargetSystemTask)
+        base_query = db.query(TargetSystemTask)
+        if school_id is not None:
+            base_query = base_query.filter(func.json_extract(TargetSystemTask.source_json, "$.paperInfo.school_id") == school_id)
+        if subject_id is not None:
+            base_query = base_query.filter(func.json_extract(TargetSystemTask.source_json, "$.paperInfo.subject_id") == subject_id)
+        all_total = base_query.count()
+        status_counts = {
+            state: count
+            for state, count in base_query.with_entities(
+                TargetSystemTask.status, func.count(TargetSystemTask.id)
+            ).group_by(TargetSystemTask.status).all()
+        }
+        query = base_query
         if status:
             query = query.filter(TargetSystemTask.status == status)
-        if school_id is not None:
-            query = query.filter(func.json_extract(TargetSystemTask.source_json, "$.paperInfo.school_id") == school_id)
-        if subject_id is not None:
-            query = query.filter(func.json_extract(TargetSystemTask.source_json, "$.paperInfo.subject_id") == subject_id)
         total = query.count()
         items = query.order_by(TargetSystemTask.delivery_order.asc().nullslast(), TargetSystemTask.id.asc()).offset((page - 1) * page_size).limit(page_size).all()
         task_ids = [item.workflow_task_id for item in items if item.workflow_task_id]
@@ -229,6 +237,8 @@ def list_target_tasks(status: str | None = None, school_id: int | None = None, s
         return {
             "items": [_task_to_dict(item, task_map.get(item.workflow_task_id or "")) for item in items],
             "total": total,
+            "all_total": all_total,
+            "status_counts": status_counts,
             "page": page,
             "page_size": page_size,
             "locked_task_id": lock.target_task_id if lock else None,

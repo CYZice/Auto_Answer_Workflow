@@ -84,7 +84,7 @@ from app.services.errata_service import (
     errata_formatter_node,
     errata_format_node,
     errata_review_node,
-    migrate_errata_workflow_v2,
+    migrate_errata_workflow_v3,
 )
 
 # 全局并发信号量，控制同时进行的大模型推理任务数
@@ -631,7 +631,7 @@ async def lifespan(app: FastAPI):
     ensure_task_preview_columns()
     _ensure_errata_task_column()
     migrate_task_workflow_metadata()
-    migrate_errata_workflow_v2()
+    migrate_errata_workflow_v3()
     ensure_target_system_columns()
     with SessionLocal() as db:
         db.query(Task).filter(Task.state.in_(["queued", "solving", "reviewing", "formatting"])).update(
@@ -1004,84 +1004,6 @@ def run_task_from_node(
     return {"status": "accepted", "start_node": req.start_node, "target_nodes": targets}
 
 
-@app.get("/api/task-inbox")
-def list_task_inbox(
-    workflow_type: str | None = Query(default=None),
-    state: str | None = Query(default=None),
-    keyword: str | None = Query(default=None),
-    needs_attention: bool = Query(default=False),
-    limit: int = Query(default=200, ge=1, le=500),
-    db: Session = Depends(get_db),
-):
-    """统一返回可恢复任务；工作流和来源筛选使用 Task 显式字段。"""
-    rows = db.query(Task).order_by(Task.updated_at.desc(), Task.created_at.desc()).limit(limit).all()
-    task_ids = [task.task_id for task in rows]
-    errata_map = {item.task_id: item for item in db.query(ErrataItem).filter(ErrataItem.task_id.in_(task_ids)).all() if item.task_id}
-    errata_job_ids = {item.job_id for item in errata_map.values()}
-    errata_jobs = {job.job_id: job for job in db.query(ErrataJob).filter(ErrataJob.job_id.in_(errata_job_ids)).all()} if errata_job_ids else {}
-    items = []
-    for task in rows:
-        try:
-            meta = json.loads(task.history or "{}")
-        except Exception:
-            meta = {}
-        kind = task.workflow_type or "standard"
-        if kind == "errata" and task.state == "completed":
-            continue
-        legacy_errata = errata_map.get(task.task_id)
-        if kind == "errata" and legacy_errata:
-            job = errata_jobs.get(legacy_errata.job_id)
-            attachment_urls = []
-            for relative_path in json.loads(legacy_errata.evidence_json or "[]"):
-                parts = Path(relative_path).parts
-                if len(parts) >= 2 and parts[0] in {"render", "evidence"}:
-                    attachment_urls.append(f"/api/errata/jobs/{legacy_errata.job_id}/evidence/{parts[0]}/{Path(relative_path).name}")
-            meta = {
-                **meta,
-                "source_kind": "errata",
-                "source_id": legacy_errata.job_id,
-                "source_title": job.original_filename if job else "勘误任务",
-                "source_item_label": legacy_errata.source_ref or f"题块 {legacy_errata.item_index}",
-                "errata_item_id": legacy_errata.item_id,
-                "attachment_urls": attachment_urls,
-            }
-        source_title = str(meta.get("source_title") or "普通解题")
-        source_item_label = str(meta.get("source_item_label") or task.task_id)
-        searchable = " ".join([task.task_id, task.question_text or "", source_title, source_item_label]).lower()
-        requested_workflow = {
-            "normal": "standard",
-            "paper": "full_paper",
-            "target_system": "automation",
-        }.get(workflow_type or "", workflow_type)
-        if requested_workflow and kind != requested_workflow:
-            continue
-        if state and task.state != state:
-            continue
-        if keyword and keyword.lower() not in searchable:
-            continue
-        if needs_attention and task.state not in {"manual", "failed", "paused", "terminated", "abandoned"}:
-            continue
-        items.append({
-            "task_id": task.task_id,
-            "workflow_type": kind,
-            "state": task.state,
-            "source_kind": task.source_kind or meta.get("source_kind") or kind,
-            "source_id": task.source_id or meta.get("source_id"),
-            "source_title": source_title,
-            "source_item_label": source_item_label,
-            "attachment_urls": meta.get("attachment_urls") or task.image_urls,
-            "resume_target": {
-                "view": "errata" if kind == "errata" else "paper-docx" if kind == "full_paper" else "target-system" if kind == "automation" else "admin",
-                "source_id": task.source_id or meta.get("source_id"),
-                "item_id": task.source_item_id or meta.get("errata_item_id") or meta.get("paper_question_id"),
-            },
-            "error_code": task.error_code,
-            "updated_at": task.updated_at,
-            "created_at": task.created_at,
-        })
-    return {"total": len(items), "items": items}
-
-
 @app.get("/api/tasks/{task_id}/stream")
 async def stream_task(task_id: str):
     """
@@ -1339,19 +1261,6 @@ def get_paper_builder_draft(draft_id: str):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="draft_id 不能为空。",
         )
-    try:
-        is_errata_task = json.loads(task.history or "{}").get("workflow_type") == "errata"
-    except Exception:
-        is_errata_task = False
-    if is_errata_task:
-        from app.services.errata_service import run_errata_task
-
-        task.state = TaskStatus.QUEUED.value
-        task.error_code = None
-        db.commit()
-        background_tasks.add_task(run_errata_task, task_id)
-        return {"status": "success", "message": "勘误任务已继续。"}
-
     store = load_paper_builder_drafts_store()
     drafts = store.get("drafts") or {}
     raw_value = drafts.get(normalized_draft_id)

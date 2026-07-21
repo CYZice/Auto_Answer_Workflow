@@ -24,6 +24,13 @@ const statusLabel: Record<string, string> = {
   abandoned: '已撤回',
 }
 
+const apiErrorMessage = (error: unknown, fallback: string) => {
+  if (axios.isAxiosError(error)) {
+    return (error.response?.data as { detail?: string } | undefined)?.detail || error.message || fallback
+  }
+  return error instanceof Error ? error.message : fallback
+}
+
 export default function TargetSystemWorkbench() {
   const [items, setItems] = useState<TargetTask[]>([])
   const [filters, setFilters] = useState<{ schools: FilterOption[]; subjects: FilterOption[] }>({ schools: [], subjects: [] })
@@ -37,6 +44,8 @@ export default function TargetSystemWorkbench() {
   const [statusFilter, setStatusFilter] = useState('')
   const [page, setPage] = useState(1)
   const [total, setTotal] = useState(0)
+  const [allTotal, setAllTotal] = useState(0)
+  const [statusCounts, setStatusCounts] = useState<Record<string, number>>({})
   const [busy, setBusy] = useState('')
   const [message, setMessage] = useState('')
   const [previewTask, setPreviewTask] = useState<WorkflowTask | null>(null)
@@ -52,6 +61,8 @@ export default function TargetSystemWorkbench() {
     ])
     setItems(tasks.data.items || [])
     setTotal(tasks.data.total || 0)
+    setAllTotal(tasks.data.all_total || 0)
+    setStatusCounts(tasks.data.status_counts || {})
     setSyncInfo(status.data)
   }
 
@@ -60,7 +71,7 @@ export default function TargetSystemWorkbench() {
 
   const perform = async (name: string, action: () => Promise<void>) => {
     setBusy(name); setMessage('')
-    try { await action(); await refresh() } catch (error: any) { setMessage(error?.response?.data?.detail || error?.message || '操作失败') } finally { setBusy('') }
+    try { await action(); await refresh() } catch (error: unknown) { setMessage(apiErrorMessage(error, '操作失败')) } finally { setBusy('') }
   }
 
   const toggle = (remoteId: string) => setSelected((current) => current.includes(remoteId) ? current.filter((id) => id !== remoteId) : [...current, remoteId])
@@ -82,8 +93,8 @@ export default function TargetSystemWorkbench() {
     try {
       const { data } = await api.get<WorkflowTask>(`/api/admin/tasks/${encodeURIComponent(taskId)}`)
       setPreviewTask(data)
-    } catch (error: any) {
-      setPreviewError(error?.response?.data?.detail || error?.message || '无法加载 AI 结果')
+    } catch (error: unknown) {
+      setPreviewError(apiErrorMessage(error, '无法加载 AI 结果'))
     } finally {
       setPreviewLoading(false)
     }
@@ -91,36 +102,34 @@ export default function TargetSystemWorkbench() {
   const shownStart = total ? (page - 1) * pageSize + 1 : 0
   const shownEnd = Math.min(page * pageSize, total)
   const selectedSchoolName = useMemo(() => filters.schools.find((item) => String(item.id) === schoolId)?.name, [filters.schools, schoolId])
-  const statusCounts = useMemo(() => items.reduce<Record<string, number>>((counts, item) => ({ ...counts, [item.status]: (counts[item.status] || 0) + 1 }), {}), [items])
-
-  return <div className="max-w-7xl mx-auto px-8 space-y-5">
-    <div className="bg-white border rounded-xl p-5 flex flex-wrap items-center gap-3">
-      <div className="mr-auto"><h2 className="text-lg font-semibold">目标系统工作台</h2><p className="text-xs text-gray-500 mt-1">先按学校/科目拉取，再选择抢题；完整题目仅在展开时加载。</p></div>
+  return <main className="mx-auto max-w-7xl space-y-5 px-4 py-5 sm:px-6 lg:px-8">
+    <header className="flex flex-wrap items-center gap-3 border-b border-slate-200 bg-white pb-5">
+      <div className="mr-auto"><p className="text-xs font-semibold tracking-wider text-indigo-600">TARGET SYSTEM</p><h1 className="mt-1 text-2xl font-semibold">目标系统</h1><p className="mt-1 text-xs text-gray-500">按学校和科目同步、抢题并检查交付状态。</p></div>
       <select value={schoolId} onChange={(event) => { setSchoolId(event.target.value); setPage(1) }} className="border rounded px-2 py-2 text-sm"><option value="">选择学校</option>{filters.schools.map((school) => <option key={school.id} value={school.id}>{school.name}</option>)}</select>
       <select value={subjectId} onChange={(event) => { setSubjectId(event.target.value); setPage(1) }} className="border rounded px-2 py-2 text-sm"><option value="">全部科目</option>{filters.subjects.map((subject) => <option key={subject.id} value={subject.id}>{subject.name}</option>)}</select>
       <button onClick={() => perform('sync', async () => { await api.post('/api/target-system/sync', { school_id: Number(schoolId), ...(subjectId ? { subject_id: Number(subjectId) } : {}) }); setMessage(`已开始同步${selectedSchoolName || '当前学校'}的题目`) })} disabled={Boolean(busy) || !schoolId} className="inline-flex items-center gap-2 px-3 py-2 rounded border text-sm hover:bg-gray-50 disabled:opacity-50"><RefreshCw className="w-4 h-4" />同步待接题</button>
       <button onClick={() => { if (window.confirm(`确认抢题并启动 ${selected.length} 道题吗？`)) void perform('claim', async () => { await api.post('/api/target-system/tasks/select', { remote_task_ids: selected }); await api.post('/api/target-system/tasks/claim', { remote_task_ids: selected }); setSelected([]); setMessage('已确认抢题并开始解题') }) }} disabled={Boolean(busy) || selected.length === 0} className="inline-flex items-center gap-2 px-3 py-2 rounded bg-indigo-600 text-white text-sm disabled:opacity-50"><Download className="w-4 h-4" />确认抢题 ({selected.length})</button>
-    </div>
+    </header>
 
     {message && <div className="border rounded-lg bg-amber-50 text-amber-800 px-4 py-3 text-sm">{message}</div>}
     {syncInfo?.state === 'running' && <div className="border rounded-lg bg-blue-50 text-blue-800 px-4 py-3 text-sm">正在通过 API 分页读取：已扫描 {syncInfo.schools_done}/{syncInfo.schools_total || '…'} 所学校，发现 {syncInfo.synced} 题。</div>}
     {syncInfo?.state === 'failed' && <div className="border rounded-lg bg-red-50 text-red-700 px-4 py-3 text-sm">同步失败：{syncInfo.error || '请稍后重试'}</div>}
-    <div className="flex flex-wrap border-y bg-white text-sm">{[['', '全部'], ['discovered', '待选择'], ['solving', '解题中'], ['review_pending', '已解答']].map(([value, label]) => <button key={value} onClick={() => { setStatusFilter(value); setPage(1) }} className={`border-r px-4 py-3 ${statusFilter === value ? 'bg-indigo-600 text-white' : 'hover:bg-slate-50'}`}>{label} {value ? statusCounts[value] || 0 : total}</button>)}</div>
+    <div className="flex overflow-x-auto border-y bg-white text-sm">{[['', '全部'], ['discovered', '待选择'], ['solving', '解题中'], ['review_pending', '已解答']].map(([value, label]) => <button key={value} onClick={() => { setStatusFilter(value); setPage(1) }} className={`shrink-0 border-r px-4 py-3 ${statusFilter === value ? 'bg-indigo-600 text-white' : 'hover:bg-slate-50'}`}>{label} {value ? statusCounts[value] || 0 : allTotal}</button>)}</div>
 
     <div>
-      <div className="bg-white border rounded-xl overflow-hidden">
+      <div className="overflow-hidden rounded-lg border bg-white">
         <div className="flex items-center justify-between px-4 py-3 border-b"><span className="text-xs text-gray-500">显示 {shownStart}–{shownEnd} / {total} 题</span><span className="text-xs text-gray-400">图片和完整题干按需加载</span></div>
-        <div className="grid grid-cols-[40px_100px_1fr_110px_160px] gap-3 px-4 py-3 text-xs font-medium text-gray-500 border-b"><span>选</span><span>远端 ID</span><span>题目</span><span>工作流</span><span>状态与操作</span></div>
+        <div className="hidden grid-cols-[40px_100px_1fr_110px_160px] gap-3 border-b px-4 py-3 text-xs font-medium text-gray-500 md:grid"><span>选</span><span>远端 ID</span><span>题目</span><span>工作流</span><span>状态与操作</span></div>
         {items.length === 0 && <div className="p-8 text-sm text-gray-500">当前筛选条件下尚无已同步题目。</div>}
         {items.map((item) => <div key={item.id} className="border-b last:border-0">
-          <div className="grid grid-cols-[40px_100px_1fr_110px_160px] gap-3 px-4 py-3 items-start text-sm">
+          <div className="grid grid-cols-[32px_minmax(0,1fr)] gap-3 px-4 py-3 text-sm md:grid-cols-[40px_100px_1fr_110px_160px] md:items-start">
             <input type="checkbox" disabled={!['discovered', 'selected'].includes(item.status)} checked={selected.includes(item.remote_task_id)} onChange={() => toggle(item.remote_task_id)} />
             <span className="font-mono text-xs text-gray-500">{item.remote_task_id}</span>
             <div className="min-w-0"><p className="font-medium truncate">{item.title}</p><p className="text-xs text-gray-400">{item.school_name || '未指定学校'}{item.subject_name ? ` · ${item.subject_name}` : ''}</p><button onClick={() => void toggleDetail(item)} className="mt-1 inline-flex items-center gap-1 text-xs text-indigo-600 hover:underline"><Eye className="w-3 h-3" />{expandedId === item.id ? '收起题目' : '查看题目'}</button>{item.error_message && <p className="text-xs text-red-600 truncate mt-1">{item.error_message}</p>}</div>
             {item.workflow_task_id ? <button onClick={() => void openAnswerPreview(item.workflow_task_id!)} className="text-indigo-600 text-xs hover:underline">查看 AI 结果</button> : <span className="text-xs text-gray-400">未创建</span>}
             <div className="space-y-1"><span className="block text-xs">{statusLabel[item.status] || item.status}</span>{!['discovered', 'selected', 'delivered'].includes(item.status) && <button onClick={() => returnToAll(item)} disabled={Boolean(busy)} className="text-left text-xs text-rose-600 hover:underline disabled:opacity-50">撤回到全部</button>}</div>
           </div>
-          {expandedId === item.id && <div className="ml-[152px] mr-4 mb-4 rounded bg-slate-50 border px-3 py-3 text-xs">
+          {expandedId === item.id && <div className="mx-4 mb-4 rounded border bg-slate-50 px-3 py-3 text-xs md:ml-[152px]">
             {loadingDetail === item.id && <span className="inline-flex items-center gap-1 text-gray-500"><LoaderCircle className="w-3 h-3 animate-spin" />正在加载题干和题图…</span>}
             {details[item.id] && <><p className="whitespace-pre-wrap leading-5 text-gray-700">{details[item.id].question_text || '接口未返回文字题干。'}</p>{details[item.id].image_urls?.length ? <div className="mt-3 flex flex-wrap gap-2">{details[item.id].image_urls!.map((url, index) => <a key={url} href={url} target="_blank" rel="noreferrer"><img src={url} loading="lazy" alt={`题图${index + 1}`} className="h-28 w-40 object-contain bg-white border rounded" /></a>)}</div> : null}{(details[item.id].rendered_answer_url || details[item.id].browser_screenshot_url) && <div className="mt-3 flex flex-wrap gap-3">{details[item.id].rendered_answer_url && <a href={details[item.id].rendered_answer_url || undefined} target="_blank" rel="noreferrer"><img src={details[item.id].rendered_answer_url || undefined} alt="KaTeX 渲染答案" className="h-28 w-40 object-contain bg-white border rounded" /></a>}{details[item.id].browser_screenshot_url && <a href={details[item.id].browser_screenshot_url || undefined} target="_blank" rel="noreferrer"><img src={details[item.id].browser_screenshot_url || undefined} alt="浏览器填写后网页" className="h-28 w-40 object-contain bg-white border rounded" /></a>}</div>}</>}
           </div>}
@@ -137,5 +146,5 @@ export default function TargetSystemWorkbench() {
         {previewTask && <div className="prose prose-slate max-w-none break-words"><ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>{previewTask.answer_preview || previewTask.final_result || ''}</ReactMarkdown></div>}
       </article>
     </div>}
-  </div>
+  </main>
 }

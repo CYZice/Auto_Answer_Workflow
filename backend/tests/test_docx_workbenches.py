@@ -4,9 +4,12 @@ import uuid
 import zipfile
 from pathlib import Path
 
+import pytest
 from docx import Document
 from docx.enum.text import WD_COLOR_INDEX
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from app.core.database import Base, SessionLocal, engine
 from app.models.domain import ErrataItem, ErrataJob, PaperProject, PaperQuestion, Task, TaskArtifact
@@ -19,8 +22,10 @@ from app.services.errata_service import (
     build_errata_word_content,
     derive_errata_result_type,
     errata_allow_write,
+    extract_formatter_answer_content,
     export_errata_job,
     extract_errata_items,
+    migrate_errata_workflow_v3,
 )
 from app.services.paper_docx_service import apply_mineru_paper_questions, extract_paper_questions
 from app.services.task_artifacts import persist_task_artifact
@@ -100,6 +105,9 @@ def test_errata_material_packet_keeps_feedback_in_original_order(tmp_path: Path)
     document = Document()
     document.add_paragraph("原题：混合材料题干")
     document.add_picture(str(image))
+    document.add_page_break()
+    document.add_paragraph("题干第二页")
+    document.add_picture(str(image))
     document.add_paragraph("原答案：原解析内容")
     document.add_paragraph("被反馈：以下截图指出答案错误")
     document.add_picture(str(image))
@@ -123,7 +131,11 @@ def test_errata_material_packet_keeps_feedback_in_original_order(tmp_path: Path)
         assert "混合材料题干" in question_text
         assert "原解析内容" not in question_text
         assert "被反馈" not in question_text
-        assert all(Path(path).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"} for path in json.loads(item.question_material_paths_json or "[]"))
+        question_material_paths = json.loads(item.question_material_paths_json or "[]")
+        assert len(question_material_paths) >= 2
+        assert all(Path(path).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"} for path in question_material_paths)
+        task = db.query(Task).filter(Task.task_id == item.task_id).one()
+        assert len(json.loads(task.image_urls_json or "[]")) == len(question_material_paths)
         payload = {"material_text": item.material_text, "question_text": "不应作为模型输入"}
         assert "不应作为模型输入" not in _raw_errata_material(payload, 1)
         item.result_type = "rewrite"
@@ -174,7 +186,7 @@ def test_errata_model_attachments_filter_emf(tmp_path: Path):
 
 
 def test_errata_word_composition_copies_formatter_after_original_answer_error():
-    solution = "【解析】由 $U=IR$ 得 $I=2A$。\n\n【结论】电流为 $2A$。"
+    solution = "原题：求电流。\n\n【解析】由 $U=IR$ 得 $I=2A$。\n\n【结论】电流为 $2A$。"
     text = build_errata_word_content(
         ErrataAdjudication(
             standard_answer_verdict="correct",
@@ -185,7 +197,96 @@ def test_errata_word_composition_copies_formatter_after_original_answer_error():
         ),
         solution,
     )
-    assert text == solution
+    assert text == "【解析】由 $U=IR$ 得 $I=2A$。\n\n【结论】电流为 $2A$。"
+
+
+def test_errata_word_composition_rejects_formatter_without_answer_marker():
+    decision = ErrataAdjudication(
+        standard_answer_verdict="correct",
+        question_verdict="correct",
+        original_answer_verdict="incorrect",
+        correction_opinion_verdict="not_provided",
+    )
+    with pytest.raises(ValueError, match="缺少【正解】或【解析】"):
+        build_errata_word_content(decision, "原题和一段没有标准标题的答案")
+    with pytest.raises(ValueError, match="缺少【正解】或【解析】"):
+        extract_formatter_answer_content("没有标准标题")
+
+
+def test_errata_v3_migration_recomposes_existing_artifacts_without_model(tmp_path: Path, monkeypatch):
+    import app.services.errata_service as errata_service
+
+    isolated_engine = create_engine(f"sqlite:///{(tmp_path / 'migration.db').as_posix()}")
+    isolated_session = sessionmaker(autocommit=False, autoflush=False, bind=isolated_engine)
+    Base.metadata.create_all(bind=isolated_engine)
+    monkeypatch.setattr(errata_service, "engine", isolated_engine)
+    monkeypatch.setattr(errata_service, "SessionLocal", isolated_session)
+    task_id = "migration_task"
+    job_id = "migration_job"
+    item_id = "migration_item"
+    decision = ErrataAdjudication(
+        standard_answer_verdict="correct",
+        question_verdict="correct",
+        original_answer_verdict="incorrect",
+        correction_opinion_verdict="not_provided",
+    )
+    with isolated_session() as db:
+        db.add(ErrataJob(job_id=job_id, original_filename="old.docx", source_path=str(tmp_path / "old.docx"), output_path=str(tmp_path / "old-output.docx")))
+        db.add(Task(task_id=task_id, thread_id=task_id, image_url="", state="completed", workflow_type="errata", input_revision=1, final_result="旧正文"))
+        db.add(ErrataItem(item_id=item_id, job_id=job_id, item_index=1, task_id=task_id, status="confirmed", correction_opinion="", final_text_markup="旧正文"))
+        db.add_all([
+            TaskArtifact(task_id=task_id, node_name="formatter", input_revision=1, content="原题：不应写入\n\n【解析】正确答案"),
+            TaskArtifact(task_id=task_id, node_name="errata_adjudication", input_revision=1, content=decision.model_dump_json()),
+        ])
+        db.commit()
+
+    migrate_errata_workflow_v3()
+
+    with isolated_session() as db:
+        task = db.query(Task).filter(Task.task_id == task_id).one()
+        item = db.query(ErrataItem).filter(ErrataItem.item_id == item_id).one()
+        job = db.query(ErrataJob).filter(ErrataJob.job_id == job_id).one()
+        composition = db.query(TaskArtifact).filter(TaskArtifact.task_id == task_id, TaskArtifact.node_name == "word_composition").one()
+        assert task.state == "completed"
+        assert task.final_result == "【解析】正确答案"
+        assert item.status == "generated"
+        assert item.final_text_markup == task.final_result
+        assert job.output_path is None
+        assert composition.content == task.final_result
+
+
+def test_errata_question_packet_supports_all_answer_boundaries(tmp_path: Path):
+    Base.metadata.create_all(bind=engine)
+    source = tmp_path / "answer-boundaries.docx"
+    document = Document()
+    boundaries = ("答案:", "【正解】A", "【解析】计算过程", "修改意见:", "被反馈:")
+    for index, boundary in enumerate(boundaries, start=1):
+        document.add_paragraph(f"原题：边界测试题 {index}")
+        document.add_paragraph(boundary)
+        document.add_paragraph(f"不应进入题干材料 {index}")
+        document.add_paragraph(MARKER)
+    document.save(source)
+    job_id = f"boundaries_{uuid.uuid4().hex}"
+    with SessionLocal() as db:
+        db.add(ErrataJob(job_id=job_id, original_filename=source.name, source_path=str(source)))
+        db.commit()
+
+    extract_errata_items(job_id)
+    with SessionLocal() as db:
+        items = db.query(ErrataItem).filter(ErrataItem.job_id == job_id).order_by(ErrataItem.item_index).all()
+        assert len(items) == len(boundaries)
+        for item in items:
+            packet = source.parent / "question_materials" / f"item_{item.item_index}" / "source.docx"
+            packet_text = "\n".join(paragraph.text for paragraph in Document(packet).paragraphs)
+            assert f"边界测试题 {item.item_index}" in packet_text
+            assert "不应进入题干材料" not in packet_text
+            assert not any(boundary in packet_text for boundary in boundaries)
+        task_ids = [item.task_id for item in items if item.task_id]
+        db.query(ErrataItem).filter(ErrataItem.job_id == job_id).delete()
+        if task_ids:
+            db.query(Task).filter(Task.task_id.in_(task_ids)).delete(synchronize_session=False)
+        db.query(ErrataJob).filter(ErrataJob.job_id == job_id).delete()
+        db.commit()
 
 
 def test_errata_word_composition_uses_fixed_text_when_original_is_correct():

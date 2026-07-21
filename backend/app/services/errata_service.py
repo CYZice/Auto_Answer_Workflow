@@ -33,7 +33,7 @@ from app.agent.nodes.formatter import format_node
 from app.agent.nodes.solver import solve_node_sync
 from app.core.database import SessionLocal, engine
 from app.core.database import DEFAULT_DB_PATH
-from app.models.domain import AgentLog, ErrataItem, ErrataJob, Task
+from app.models.domain import AgentLog, ErrataItem, ErrataJob, Task, TaskArtifact
 from app.services.mineru_ingestion import parse_local_file_with_mineru
 from app.services.runtime_config import (
     get_prompt_bundle,
@@ -56,7 +56,19 @@ DEFAULT_ANCHORS = (
 # 保留旧常量，兼容已有调用方与测试；新逻辑使用 DEFAULT_ANCHORS。
 MARKER = DEFAULT_ANCHORS[0]
 MODEL_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
-ERRATA_WORKFLOW_VERSION = 2
+ERRATA_WORKFLOW_VERSION = 3
+QUESTION_ANSWER_BOUNDARIES = (
+    "原答案：",
+    "原答案:",
+    "答案：",
+    "答案:",
+    "【正解】",
+    "【解析】",
+    "修改意见：",
+    "修改意见:",
+    "被反馈：",
+    "被反馈:",
+)
 
 
 def _ensure_errata_task_column() -> None:
@@ -131,22 +143,30 @@ def errata_allow_write(decision: ErrataAdjudication, has_correction_opinion: boo
     )
 
 
-def build_errata_word_content(decision: ErrataAdjudication, formatted_solution: str) -> str:
+def extract_formatter_answer_content(formatted_solution: str) -> str:
     solution = (formatted_solution or "").strip()
+    marker_positions = [
+        position
+        for marker in ("【正解】", "【解析】")
+        if (position := solution.find(marker)) >= 0
+    ]
+    if not marker_positions:
+        raise ValueError("Formatter 结果缺少【正解】或【解析】标记，不能生成最终正文")
+    return solution[min(marker_positions) :].strip()
+
+
+def build_errata_word_content(decision: ErrataAdjudication, formatted_solution: str) -> str:
     if decision.standard_answer_verdict != "correct":
         raise ValueError("标准答案未通过裁决，不能生成最终正文")
+    if decision.original_answer_verdict == "correct" and decision.question_verdict != "incorrect":
+        return "原答案正确。"
+    solution = extract_formatter_answer_content(formatted_solution)
     if decision.question_verdict == "incorrect":
         question_errata = (decision.question_errata or "").strip()
         if not question_errata:
             raise ValueError("题干错误但缺少 question_errata")
-        if not solution:
-            raise ValueError("题干错误时缺少 Formatter 标准答案")
         return f"【题干勘误】{question_errata}\n\n{solution}"
-    if decision.original_answer_verdict == "correct":
-        return "原答案正确。"
     if decision.original_answer_verdict == "incorrect":
-        if not solution:
-            raise ValueError("原答案错误时缺少 Formatter 标准答案")
         return solution
     raise ValueError("证据不足，不能生成最终正文")
 
@@ -299,7 +319,7 @@ def ensure_errata_tasks(db, job_id: str, *, create_missing: bool = False) -> Non
         sync_errata_task(db, item, job, create_missing=create_missing)
 
 
-def migrate_errata_workflow_v2() -> None:
+def migrate_errata_workflow_v3() -> None:
     migration_id = f"errata_workflow_v{ERRATA_WORKFLOW_VERSION}"
     with engine.begin() as conn:
         conn.execute(
@@ -321,36 +341,91 @@ def migrate_errata_workflow_v2() -> None:
             .filter(Task.workflow_type == "errata")
             .all()
         )
+        cleared_job_ids: set[str] = set()
         for item, task in rows:
-            task.input_revision = int(task.input_revision or 1) + 1
-            task.state = "manual"
-            task.current_node = None
-            task.retry_count = 0
-            task.final_result = None
-            task.question_preview = None
-            task.answer_preview = None
-            task.error_code = "勘误工作流已升级到 v2，请重新运行。"
+            revision = int(task.input_revision or 1)
+            formatter = (
+                db.query(TaskArtifact)
+                .filter(
+                    TaskArtifact.task_id == task.task_id,
+                    TaskArtifact.node_name == "formatter",
+                    TaskArtifact.input_revision == revision,
+                )
+                .order_by(TaskArtifact.id.desc())
+                .first()
+            )
+            adjudication = (
+                db.query(TaskArtifact)
+                .filter(
+                    TaskArtifact.task_id == task.task_id,
+                    TaskArtifact.node_name == "errata_adjudication",
+                    TaskArtifact.input_revision == revision,
+                )
+                .order_by(TaskArtifact.id.desc())
+                .first()
+            )
             try:
                 history = json.loads(task.history or "{}")
             except json.JSONDecodeError:
                 history = {}
-            for key in (
-                "draft_solution",
-                "formatted_solution",
-                "errata_decision",
-                "review_decision",
-                "review_feedback",
-                "failed_node",
-            ):
-                history.pop(key, None)
             history["errata_workflow_version"] = ERRATA_WORKFLOW_VERSION
             task.history = json.dumps(history, ensure_ascii=False)
-            item.status = "pending"
-            item.result_type = None
-            item.final_text_markup = None
-            item.review_status = "pending"
-            item.review_feedback = None
-            item.warnings_json = "[]"
+            task.question_preview = None
+            task.answer_preview = None
+            item.status = "generated"
+            cleared_job_ids.add(item.job_id)
+
+            try:
+                if not formatter:
+                    raise ValueError("缺少当前版本 Formatter 产物")
+                if not adjudication:
+                    raise ValueError("缺少当前版本结构化裁决产物")
+                decision = ErrataAdjudication.model_validate_json(adjudication.content)
+                if not errata_allow_write(
+                    decision, bool((item.correction_opinion or "").strip())
+                ):
+                    raise ValueError("现有裁决不允许写入")
+                markup = build_errata_word_content(decision, formatter.content)
+                result_type = derive_errata_result_type(decision)
+                db.add(
+                    TaskArtifact(
+                        task_id=task.task_id,
+                        node_name="word_composition",
+                        input_revision=revision,
+                        content=markup,
+                        metadata_json=json.dumps(
+                            {
+                                "format": "markdown",
+                                "result_type": result_type,
+                                "deterministic": True,
+                                "workflow_version": ERRATA_WORKFLOW_VERSION,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                )
+                task.state = "completed"
+                task.current_node = "word_composition"
+                task.final_result = markup
+                task.error_code = None
+                item.result_type = result_type
+                item.final_text_markup = markup
+                item.review_status = "passed"
+                item.review_feedback = None
+            except (ValueError, json.JSONDecodeError) as exc:
+                reason = f"勘误工作流 v3 重组失败：{exc}"
+                task.state = "manual"
+                task.current_node = "word_composition"
+                task.final_result = None
+                task.error_code = reason
+                item.status = "failed"
+                item.final_text_markup = None
+                item.review_status = "needs_evidence"
+                item.review_feedback = reason
+        if cleared_job_ids:
+            db.query(ErrataJob).filter(ErrataJob.job_id.in_(cleared_job_ids)).update(
+                {ErrataJob.output_path: None}, synchronize_session=False
+            )
         db.execute(
             text("INSERT INTO app_migrations (migration_id) VALUES (:migration_id)"),
             {"migration_id": migration_id},
@@ -634,11 +709,12 @@ def extract_errata_items(job_id: str) -> None:
                     (
                         idx - 1
                         for idx in range(block_start, marker_index)
-                        if texts[idx].startswith(("原答案：", "答案：", "修改意见：", "被反馈："))
+                        if texts[idx].lstrip().startswith(QUESTION_ANSWER_BOUNDARIES)
                     ),
                     marker_index - 1,
                 )
-                question_end = max(block_start, question_end)
+                if question_end < block_start:
+                    raise ValueError(f"第 {item_index} 题在答案边界前没有可用题干材料")
                 _, question_material_paths, _ = _build_material_packet(
                     source_path,
                     doc,

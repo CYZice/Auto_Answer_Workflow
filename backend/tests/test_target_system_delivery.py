@@ -1,4 +1,5 @@
 import asyncio
+import json
 import uuid
 
 import pytest
@@ -14,6 +15,7 @@ from app.api.target_system_routes import (
     extract_delivery_content,
     mark_delivered,
     mark_filled,
+    list_target_tasks,
     reserve_next_delivery,
     return_task_to_all,
 )
@@ -60,6 +62,37 @@ def test_delivery_queue_blocks_until_manual_delivery():
         db.query(TargetSystemDeliveryLock).delete()
         db.query(TargetSystemTask).filter(TargetSystemTask.id.in_([first_id, second_id])).delete(synchronize_session=False)
         db.query(Task).filter(Task.task_id.in_([first_task_id, second_task_id])).delete(synchronize_session=False)
+        db.commit()
+
+
+def test_target_task_counts_ignore_status_pagination_but_keep_school_subject_filters():
+    Base.metadata.create_all(bind=engine)
+    school_id = 900000 + int(uuid.uuid4().hex[:4], 16)
+    subject_id = 800000 + int(uuid.uuid4().hex[4:8], 16)
+    remote_ids = [f"remote_count_{uuid.uuid4().hex}" for _ in range(27)]
+    with SessionLocal() as db:
+        for index, remote_id in enumerate(remote_ids):
+            db.add(TargetSystemTask(
+                remote_task_id=remote_id,
+                status="discovered" if index < 23 else "review_pending",
+                source_json=json.dumps({"paperInfo": {"school_id": school_id, "subject_id": subject_id}}),
+            ))
+        db.commit()
+
+    result = list_target_tasks(
+        status="review_pending",
+        school_id=school_id,
+        subject_id=subject_id,
+        page=1,
+        page_size=20,
+    )
+    assert result["total"] == 4
+    assert result["all_total"] == 27
+    assert result["status_counts"] == {"discovered": 23, "review_pending": 4}
+    assert len(result["items"]) == 4
+
+    with SessionLocal() as db:
+        db.query(TargetSystemTask).filter(TargetSystemTask.remote_task_id.in_(remote_ids)).delete(synchronize_session=False)
         db.commit()
 
 
@@ -183,7 +216,7 @@ def test_image_download_includes_rich_text_side_image():
 
 
 def test_active_routes_are_registered_before_task_id_route():
-    paths = [route.path for route in app.routes]
+    paths = [path for route in app.routes if (path := getattr(route, "path", None))]
     assert paths.index("/api/tasks/active") < paths.index("/api/tasks/{task_id}")
     assert paths.index("/api/tasks/active/list") < paths.index("/api/tasks/{task_id}")
 

@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider, useMutation, useQueries, useQuery } from '@tanstack/react-query'
 import axios from 'axios'
 import 'katex/dist/katex.min.css'
-import { ChevronDown, ChevronUp, Database, Download, Image as ImageIcon, ListTodo, Maximize2, Play, Plus, Save, Search, Settings, Trash2, X } from 'lucide-react'
+import { ChevronDown, ChevronUp, Download, Image as ImageIcon, Maximize2, Play, Plus, Save, Settings, Trash2, X } from 'lucide-react'
 import { ChangeEvent, DragEvent, MouseEvent, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import rehypeKatex from 'rehype-katex'
@@ -271,7 +271,7 @@ const persistTaskForDashboard = (taskId: string) => {
 
 // --- Components ---
 
-function TaskDashboard({ onOpenAdmin, onOpenTargetSystem }: { onOpenAdmin: () => void; onOpenTargetSystem: () => void }) {
+function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOpenRequest: number; onOpenTargetSystem: () => void }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const [pendingInputImages, setPendingInputImages] = useState<string[]>([])
   const [inputQuestionText, setInputQuestionText] = useState('')
@@ -337,7 +337,7 @@ function TaskDashboard({ onOpenAdmin, onOpenTargetSystem }: { onOpenAdmin: () =>
   const [mineruApiToken, setMineruApiToken] = useState<string>('')
   const [mineruApiTokenMasked, setMineruApiTokenMasked] = useState('')
   const [clearMineruApiToken, setClearMineruApiToken] = useState(false)
-  const [runtimeLoading, setRuntimeLoading] = useState(false)
+  const [, setRuntimeLoading] = useState(false)
   const [runtimeError, setRuntimeError] = useState<string | null>(null)
   const [activeTemplateId, setActiveTemplateId] = useState<string>(() => localStorage.getItem(WORKFLOW_TEMPLATE_ID_STORAGE_KEY) || 'workflow_a')
   const [requestTimeoutSeconds, setRequestTimeoutSeconds] = useState<number>(300)
@@ -623,6 +623,10 @@ function TaskDashboard({ onOpenAdmin, onOpenTargetSystem }: { onOpenAdmin: () =>
   }
 
   useEffect(() => {
+    if (settingsOpenRequest > 0) void openSettingsModal()
+  }, [settingsOpenRequest])
+
+  useEffect(() => {
     const handleWindowPaste = (event: globalThis.ClipboardEvent) => {
       const target = event.target
       if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
@@ -874,7 +878,7 @@ function TaskDashboard({ onOpenAdmin, onOpenTargetSystem }: { onOpenAdmin: () =>
   }
 
   return (
-    <div className="max-w-7xl mx-auto p-8 space-y-8">
+    <div className="mx-auto max-w-7xl space-y-8 p-4 sm:p-6 lg:p-8">
       {/* 错误提示框 */}
       {errorMessage && (
         <div className="bg-red-50 border-l-4 border-red-500 p-4 rounded shadow-sm flex justify-between items-start">
@@ -902,23 +906,6 @@ function TaskDashboard({ onOpenAdmin, onOpenTargetSystem }: { onOpenAdmin: () =>
           <h1 className="text-3xl font-bold text-gray-900">Zyb-Agent 生产流水线</h1>
           <p className="text-sm text-gray-500 mt-2">提示: 可以直接在这个页面 <kbd className="bg-gray-100 px-1 rounded border">Ctrl+V</kbd> 粘贴图片，也可以输入题目文本；每次录入一题并提交后再开始下一题。</p>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={onOpenAdmin}
-            className="p-2 text-gray-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-full transition-colors"
-            title="后台管理"
-          >
-            <Database size={24} />
-          </button>
-          <button
-            onClick={() => void openSettingsModal()}
-            className="p-2 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-full transition-colors"
-            title="模型配置"
-            disabled={runtimeLoading}
-          >
-            <Settings size={24} />
-          </button>
-        </div>
       </header>
 
       {runtimeError && (
@@ -928,7 +915,7 @@ function TaskDashboard({ onOpenAdmin, onOpenTargetSystem }: { onOpenAdmin: () =>
       )}
 
       {/* 单题输入区域 */}
-      <div className="bg-white p-6 rounded-xl shadow-sm border space-y-4">
+      <div className="space-y-4 rounded-lg border bg-white p-4 sm:p-6">
         <input
           ref={fileInputRef}
           type="file"
@@ -937,7 +924,7 @@ function TaskDashboard({ onOpenAdmin, onOpenTargetSystem }: { onOpenAdmin: () =>
           className="hidden"
           onChange={handleLocalImageChange}
         />
-        <div className="flex justify-between items-center">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <h2 className="text-lg font-semibold flex items-center gap-2">
             <ImageIcon size={20} className="text-blue-500" />
             当前题目输入
@@ -945,7 +932,7 @@ function TaskDashboard({ onOpenAdmin, onOpenTargetSystem }: { onOpenAdmin: () =>
           <div className="flex items-center gap-2">
             <button
               onClick={handlePickLocalImage}
-              className="flex items-center gap-2 bg-white text-blue-700 border border-blue-200 px-4 py-2 rounded-lg font-medium disabled:opacity-50 hover:bg-blue-50 transition-colors"
+              className="flex flex-1 items-center justify-center gap-2 whitespace-nowrap rounded-lg border border-blue-200 bg-white px-4 py-2 font-medium text-blue-700 transition-colors hover:bg-blue-50 disabled:opacity-50"
               title="从本地选择一张或多张图片"
             >
               <Plus size={18} />
@@ -954,7 +941,7 @@ function TaskDashboard({ onOpenAdmin, onOpenTargetSystem }: { onOpenAdmin: () =>
             <button
               onClick={handleSubmitCurrentTask}
               disabled={!canSubmitInputTask}
-              className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg font-medium disabled:opacity-50 hover:bg-blue-700 transition-colors"
+              className="flex flex-1 items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-blue-600 px-4 py-2 font-medium text-white transition-colors hover:bg-blue-700 disabled:opacity-50"
               title={inputBlockedReason || '提交当前题目'}
             >
               <Play size={18} />
@@ -1946,11 +1933,11 @@ function TaskDetail({ taskId, onPreview, onOpenTargetSystem }: { taskId: string,
 }
 
 function AdminPanel({
-  onBack,
   initialTaskId,
+  onOpenErrata,
 }: {
-  onBack: () => void;
   initialTaskId?: string | null;
+  onOpenErrata: (jobId: string, itemId: string) => void;
 }) {
   const [searchTaskId, setSearchTaskId] = useState('')
   const [stateFilter, setStateFilter] = useState('')
@@ -2426,12 +2413,10 @@ function AdminPanel({
     <div className="max-w-7xl mx-auto p-8 space-y-6">
       <header className="border-b pb-4 flex justify-between items-center">
         <div>
-          <h1 className="text-3xl font-bold text-gray-900">后台管理</h1>
+          <p className="text-xs font-semibold tracking-wider text-indigo-600">TASK DATABASE</p>
+          <h1 className="mt-1 text-2xl font-semibold text-gray-900">任务数据库</h1>
           <p className="text-sm text-gray-500 mt-2">按 task_id 管理任务记录</p>
         </div>
-        <button onClick={onBack} className="px-4 py-2 bg-white border rounded-lg hover:bg-gray-50 transition-colors">
-          返回处理台
-        </button>
       </header>
 
       {operationMessage && (
@@ -2471,28 +2456,28 @@ function AdminPanel({
           </div>
 
           <div className="pt-2 border-t">
-            <div className="flex items-center justify-between mb-2">
+            <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <h3 className="font-semibold text-gray-800">任务列表 ({listData?.total || 0})</h3>
-              <div className="flex items-center gap-2">
+              <div className="grid grid-cols-2 gap-2 sm:flex sm:items-center">
                 <button
                   onClick={toggleSelectAllInList}
-                  className="text-xs px-2.5 py-1 border rounded hover:bg-gray-50"
+                  className="whitespace-nowrap rounded border px-2.5 py-1.5 text-xs hover:bg-gray-50"
                 >
-                  全选当前列表
+                  全选列表
                 </button>
                 <button
                   onClick={() => void handleBatchDelete()}
                   disabled={isBatchDeleting || selectedDeletableCount === 0}
-                  className="inline-flex items-center gap-1 text-xs px-2.5 py-1 text-red-600 border border-red-200 rounded disabled:opacity-50 hover:bg-red-50"
+                  className="inline-flex items-center justify-center gap-1 whitespace-nowrap rounded border border-red-200 px-2.5 py-1.5 text-xs text-red-600 disabled:opacity-50 hover:bg-red-50"
                 >
                   <Trash2 size={12} />
-                  {isBatchDeleting ? '删除中...' : `批量永久删除(${selectedDeletableCount})`}
+                  {isBatchDeleting ? '删除中...' : `批量删除(${selectedDeletableCount})`}
                 </button>
-                <div className="flex bg-indigo-600 rounded">
+                <div className="col-span-2 flex rounded bg-indigo-600 sm:col-span-1">
                   <button
                     onClick={exportFinalResults}
                     disabled={isExporting || selectedExportIds.length === 0}
-                    className="inline-flex items-center gap-1 text-xs px-2.5 py-1 text-white border-r border-indigo-700 disabled:opacity-50 hover:bg-indigo-700 rounded-l"
+                    className="inline-flex flex-1 items-center justify-center gap-1 whitespace-nowrap rounded-l border-r border-indigo-700 px-2.5 py-1.5 text-xs text-white disabled:opacity-50 hover:bg-indigo-700"
                   >
                     <Download size={12} />
                     {isExporting ? '导出中...' : `导出 MD(${selectedExportIds.length})`}
@@ -2500,7 +2485,7 @@ function AdminPanel({
                   <button
                     onClick={exportFinalResultsDocx}
                     disabled={isExporting || selectedExportIds.length === 0}
-                    className="inline-flex items-center gap-1 text-xs px-2.5 py-1 text-white disabled:opacity-50 hover:bg-indigo-700 rounded-r"
+                    className="inline-flex flex-1 items-center justify-center gap-1 whitespace-nowrap rounded-r px-2.5 py-1.5 text-xs text-white disabled:opacity-50 hover:bg-indigo-700"
                   >
                     <Download size={12} />
                     导出 DOCX
@@ -2583,13 +2568,17 @@ function AdminPanel({
               <div className="flex justify-between items-center">
                 <h2 className="text-lg font-semibold text-gray-800 font-mono">{selectedTask.task_id}</h2>
                 <div className="flex items-center gap-2">
-                  <button
+                  {isErrataTask(selectedTask) ? <button
+                    onClick={() => onOpenErrata(selectedTask.source_id || '', selectedTask.source_item_id || '')}
+                    disabled={!selectedTask.source_id || !selectedTask.source_item_id}
+                    className="inline-flex items-center gap-2 px-3 py-1.5 text-sm text-indigo-700 border border-indigo-200 rounded hover:bg-indigo-50 disabled:opacity-50"
+                  >打开勘误工作台</button> : <button
                     onClick={() => retryMutation.mutate()}
                     disabled={!canRetrySelectedTask || retryMutation.isPending}
                     className="inline-flex items-center gap-2 px-3 py-1.5 text-sm text-green-700 border border-green-200 rounded hover:bg-green-50 disabled:opacity-50"
                   >
                     {retryMutation.isPending ? '重试中...' : '断点重试'}
-                  </button>
+                  </button>}
                   <button
                     onClick={() => handleDelete(selectedTask.task_id)}
                     className="inline-flex items-center gap-2 px-3 py-1.5 text-sm text-red-600 border border-red-200 rounded hover:bg-red-50"
@@ -2600,7 +2589,7 @@ function AdminPanel({
                 </div>
               </div>
 
-              <div className="space-y-3 border rounded-lg p-4 bg-indigo-50/40 border-indigo-100">
+              {!isErrataTask(selectedTask) && <div className="space-y-3 border rounded-lg p-4 bg-indigo-50/40 border-indigo-100">
                 <div className="flex items-center justify-between gap-3">
                   <div>
                     <h3 className="text-sm font-semibold text-indigo-700">自定义节点执行 (custom_run)</h3>
@@ -2689,7 +2678,7 @@ function AdminPanel({
                     </div>
                   </>
                 )}
-              </div>
+              </div>}
 
               <div className="grid grid-cols-2 gap-4 text-sm bg-gray-50 border rounded p-4">
                 <div><strong>thread_id:</strong> {selectedTask.thread_id}</div>
@@ -2713,7 +2702,7 @@ function AdminPanel({
               </div>
 
               <div className="space-y-2">
-                <label className="text-sm font-medium text-gray-700">image_url</label>
+                <label className="text-sm font-medium text-gray-700">模型实际附件（{normalizeImageUrls(selectedTask.image_urls, selectedTask.image_url).length}页）</label>
                 <div className="grid grid-cols-2 gap-3">
                   {normalizeImageUrls(selectedTask.image_urls, selectedTask.image_url).map((imageUrl, index) => (
                     <img key={`admin-task-image-${index}`} src={imageUrl} alt={`task-${index + 1}`} className="max-h-60 border rounded bg-gray-50 object-contain" />
@@ -3628,31 +3617,12 @@ function PaperBuilder({
   )
 }
 
-type InboxTask = { task_id: string; workflow_type: string; state: string; source_title: string; source_item_label: string; attachment_urls: string[]; error_code?: string | null; updated_at?: string | null; resume_target: { view: string; source_id?: string | null; item_id?: string | number | null } }
-
-function TaskInbox({ onOpen }: { onOpen: (item: InboxTask) => void }) {
-  const [workflow, setWorkflow] = useState('')
-  const [state, setState] = useState('')
-  const [keyword, setKeyword] = useState('')
-  const [attentionOnly, setAttentionOnly] = useState(true)
-  const { data, isLoading, refetch } = useQuery({
-    queryKey: ['task-inbox', workflow, state, keyword, attentionOnly],
-    queryFn: () => api.get<{ items: InboxTask[] }>('/api/task-inbox', { params: { workflow_type: workflow || undefined, state: state || undefined, keyword: keyword || undefined, needs_attention: attentionOnly } }).then((res) => res.data),
-    refetchInterval: 4000,
-  })
-  const items = data?.items || []
-  return <main className="mx-auto max-w-7xl px-8 py-6">
-    <header className="flex flex-wrap items-end justify-between gap-4 border-b border-slate-200 pb-5"><div><p className="text-xs font-semibold tracking-wider text-indigo-600">TASK INBOX</p><h1 className="mt-1 text-2xl font-semibold text-slate-950">待处理任务</h1><p className="mt-1 text-sm text-slate-500">从这里恢复人工处理，进入对应专用工作台。</p></div><button onClick={() => void refetch()} className="rounded border border-slate-300 px-3 py-2 text-sm">刷新</button></header>
-    <div className="mt-5 flex flex-wrap gap-3 border-b border-slate-200 pb-4"><label className="relative"><Search className="pointer-events-none absolute left-2 top-2 h-4 w-4 text-slate-400" /><input value={keyword} onChange={(event) => setKeyword(event.target.value)} placeholder="搜索来源、题号或任务" className="w-64 rounded border border-slate-300 py-2 pl-8 pr-3 text-sm" /></label><select value={workflow} onChange={(event) => setWorkflow(event.target.value)} className="rounded border border-slate-300 px-3 py-2 text-sm"><option value="">全部工作流</option><option value="normal">普通解题</option><option value="errata">勘误</option><option value="paper">整卷</option><option value="target_system">目标系统</option></select><select value={state} onChange={(event) => setState(event.target.value)} className="rounded border border-slate-300 px-3 py-2 text-sm"><option value="">全部状态</option><option value="manual">待人工</option><option value="failed">失败</option><option value="paused">已暂停</option><option value="queued">排队中</option></select><label className="flex items-center gap-2 py-2 text-sm"><input type="checkbox" checked={attentionOnly} onChange={(event) => setAttentionOnly(event.target.checked)} />仅待处理</label></div>
-    <div className="mt-2 divide-y divide-slate-200">{isLoading && <p className="py-8 text-sm text-slate-500">正在加载任务…</p>}{!isLoading && !items.length && <p className="py-8 text-sm text-slate-500">当前筛选下没有待处理任务。</p>}{items.map((item) => <button key={item.task_id} onClick={() => onOpen(item)} className="grid w-full grid-cols-[minmax(0,1fr)_130px_120px_150px] gap-4 py-4 text-left hover:bg-slate-50"><div className="min-w-0"><div className="flex items-center gap-2"><span className="text-sm font-semibold text-slate-900">{item.source_title}</span><span className="text-xs text-indigo-700">{item.workflow_type}</span>{item.attachment_urls?.length > 0 && <ImageIcon className="h-3.5 w-3.5 text-slate-400" />}</div><p className="mt-1 truncate text-sm text-slate-600">{item.source_item_label}</p>{item.error_code && <p className="mt-1 truncate text-xs text-rose-600">{item.error_code}</p>}</div><span className="self-center text-sm text-slate-700">{item.state}</span><span className="self-center text-xs text-slate-500">{item.updated_at ? new Date(item.updated_at).toLocaleString() : '-'}</span><span className="self-center text-right text-sm font-medium text-indigo-700">继续处理</span></button>)}</div>
-  </main>
-}
-
 function App() {
-  const [currentView, setCurrentView] = useState<'dashboard' | 'inbox' | 'admin' | 'builder' | 'smart-parser' | 'errata' | 'paper-docx' | 'target-system'>('dashboard')
+  const [currentView, setCurrentView] = useState<'dashboard' | 'admin' | 'builder' | 'smart-parser' | 'errata' | 'paper-docx' | 'target-system'>('dashboard')
   const [adminFocusTaskId, setAdminFocusTaskId] = useState<string | null>(null)
   const [errataFocusItemId, setErrataFocusItemId] = useState<string | null>(null)
-  const [paperFocusQuestionId, setPaperFocusQuestionId] = useState<number | null>(null)
+  const paperFocusQuestionId: number | null = null
+  const [settingsOpenRequest, setSettingsOpenRequest] = useState(0)
   const targetRenderTaskId = new URLSearchParams(window.location.search).get('target-render-task')
 
   if (targetRenderTaskId) {
@@ -3661,68 +3631,28 @@ function App() {
 
   return (
     <QueryClientProvider client={queryClient}>
-      <div className="min-h-screen bg-gray-100/50 py-8 font-sans text-gray-800">
-        <div className="max-w-7xl mx-auto px-8 pb-4">
-          <div className="inline-flex rounded-xl border bg-white p-1 shadow-sm gap-1">
-            <button
-              onClick={() => setCurrentView('dashboard')}
-              className={`px-3 py-1.5 text-sm rounded-lg ${currentView === 'dashboard' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}
-            >
-              工作台
-            </button>
-            <button onClick={() => setCurrentView('inbox')} className={`px-3 py-1.5 text-sm rounded-lg ${currentView === 'inbox' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}><ListTodo className="mr-1 inline h-4 w-4" />待处理</button>
-            <button
-              onClick={() => setCurrentView('admin')}
-              className={`px-3 py-1.5 text-sm rounded-lg ${currentView === 'admin' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}
-            >
-              数据库
-            </button>
-            <button
-              onClick={() => setCurrentView('builder')}
-              className={`px-3 py-1.5 text-sm rounded-lg ${currentView === 'builder' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}
-            >
-              排版台
-            </button>
-            <button
-              onClick={() => setCurrentView('smart-parser')}
-              className={`px-3 py-1.5 text-sm rounded-lg ${currentView === 'smart-parser' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}
-            >
-              智能解析
-            </button>
-            <button
-              onClick={() => setCurrentView('paper-docx')}
-              className={`px-3 py-1.5 text-sm rounded-lg ${currentView === 'paper-docx' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}
-            >
-              整卷答案
-            </button>
-            <button
-              onClick={() => setCurrentView('errata')}
-              className={`px-3 py-1.5 text-sm rounded-lg ${currentView === 'errata' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}
-            >
-              勘误工作台
-            </button>
-            <button
-              onClick={() => setCurrentView('target-system')}
-              className={`px-3 py-1.5 text-sm rounded-lg ${currentView === 'target-system' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}
-            >
-              目标系统
-            </button>
+      <div className="min-h-screen bg-slate-50 font-sans text-slate-800">
+        <header className="border-b border-slate-200 bg-white">
+          <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-1 px-4 py-3 sm:px-6 lg:px-8">
+            <span className="mr-4 text-sm font-semibold text-slate-950">Zyb-Agent</span>
+            {[['dashboard', '工作台'], ['admin', '数据库'], ['errata', '勘误'], ['target-system', '目标系统']].map(([view, label]) => <button key={view} onClick={() => setCurrentView(view as typeof currentView)} className={`rounded-md px-3 py-2 text-sm ${currentView === view ? 'bg-indigo-600 text-white' : 'text-slate-600 hover:bg-slate-100'}`}>{label}</button>)}
+            <details className="relative">
+              <summary className="cursor-pointer list-none rounded-md px-3 py-2 text-sm text-slate-600 hover:bg-slate-100">更多工具</summary>
+              <div className="absolute left-0 z-40 mt-1 w-36 border border-slate-200 bg-white p-1 shadow-lg">
+                {[['builder', '排版台'], ['smart-parser', '智能解析'], ['paper-docx', '整卷答案']].map(([view, label]) => <button key={view} onClick={() => setCurrentView(view as typeof currentView)} className="block w-full rounded px-3 py-2 text-left text-sm hover:bg-slate-100">{label}</button>)}
+              </div>
+            </details>
+            <button onClick={() => { setCurrentView('dashboard'); setSettingsOpenRequest((value) => value + 1) }} className="ml-auto rounded-md p-2 text-slate-500 hover:bg-slate-100 hover:text-indigo-700" title="模型配置" aria-label="模型配置"><Settings className="h-5 w-5" /></button>
           </div>
-        </div>
+        </header>
 
         {currentView === 'dashboard' && (
-          <TaskDashboard onOpenAdmin={() => setCurrentView('admin')} onOpenTargetSystem={() => setCurrentView('target-system')} />
+          <TaskDashboard settingsOpenRequest={settingsOpenRequest} onOpenTargetSystem={() => setCurrentView('target-system')} />
         )}
-        {currentView === 'inbox' && <TaskInbox onOpen={(item) => {
-          const target = item.resume_target
-          if (target.view === 'errata') { if (target.source_id) localStorage.setItem('zyb.active_errata_job_id', target.source_id); if (target.item_id) localStorage.setItem('zyb.active_errata_item_id', String(target.item_id)); setErrataFocusItemId(String(target.item_id || '')); setCurrentView('errata'); return }
-          if (target.view === 'paper-docx') { if (target.source_id) localStorage.setItem('zyb.active_paper_id', target.source_id); setPaperFocusQuestionId(Number(target.item_id) || null); setCurrentView('paper-docx'); return }
-          setAdminFocusTaskId(item.task_id); setCurrentView(target.view === 'target-system' ? 'target-system' : 'admin')
-        }} />}
         {currentView === 'admin' && (
           <AdminPanel
             initialTaskId={adminFocusTaskId}
-            onBack={() => setCurrentView('dashboard')}
+            onOpenErrata={(jobId, itemId) => { localStorage.setItem('zyb.active_errata_job_id', jobId); localStorage.setItem('zyb.active_errata_item_id', itemId); setErrataFocusItemId(itemId); setCurrentView('errata') }}
           />
         )}
         {currentView === 'builder' && (

@@ -51,11 +51,34 @@ def coerce_token_count(value: Any, default: int = 0) -> int:
         return default
 
 
+def extract_response_text(content: Any) -> str:
+    """兼容 Chat Completions 字符串和 Responses API 的结构化内容。"""
+    if isinstance(content, str):
+        return content.strip()
+
+    fragments: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+        elif isinstance(value, dict):
+            if value.get("type") in {"output_text", "text"}:
+                text = value.get("text")
+                if isinstance(text, str) and text.strip():
+                    fragments.append(text.strip())
+            else:
+                visit(value.get("content"))
+
+    visit(content)
+    return "\n".join(fragments)
+
+
 def log_agent_interaction(
     task_id: str,
     node_name: str,
     request_payload: list,
-    response_payload: str,
+    response_payload: Any,
     cost_tokens: Any,
 ):
     if not task_id:
@@ -67,11 +90,16 @@ def log_agent_interaction(
                 [{"role": m.type, "content": m.content} for m in request_payload],
                 ensure_ascii=False,
             )
+            response_str = (
+                response_payload
+                if isinstance(response_payload, str)
+                else json.dumps(response_payload, ensure_ascii=False, default=str)
+            )
             log_entry = AgentLog(
                 task_id=task_id,
                 node_name=node_name,
                 request_payload=req_str,
-                response_payload=response_payload,
+                response_payload=response_str,
                 cost_tokens=coerce_token_count(cost_tokens, 0),
             )
             db.add(log_entry)
@@ -406,7 +434,7 @@ async def solve_image(
         )
 
     # 返回草稿和消耗的 token
-    return {"draft": response.content, "tokens": tokens}
+    return {"draft": extract_response_text(response.content), "tokens": tokens}
 
 
 async def format_solution(
@@ -476,4 +504,4 @@ async def format_solution(
         )
 
     # 返回最终结果和消耗的 token
-    return {"formatted_result": response.content, "tokens": tokens}
+    return {"formatted_result": extract_response_text(response.content), "tokens": tokens}

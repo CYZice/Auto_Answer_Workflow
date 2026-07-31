@@ -2,7 +2,7 @@ from pathlib import Path
 
 from langchain_core.messages import HumanMessage
 
-from app.agent.nodes.llm_client import get_llm
+from app.agent.nodes.llm_client import extract_response_text, get_llm
 from app.services import runtime_config
 
 
@@ -114,3 +114,18 @@ def test_reasoning_effort_can_be_cleared(monkeypatch, tmp_path):
     public = runtime_config.public_model_defaults()
     assert defaults["solver_config"]["reasoning_effort"] is None
     assert public["solver_config"]["reasoning_effort"] is None
+
+
+def test_extract_response_text_supports_responses_api_content_items():
+    content = [
+        {"type": "reasoning", "summary": [], "content": []},
+        {
+            "type": "message",
+            "content": [
+                {"type": "output_text", "text": "第一段"},
+                {"type": "output_text", "text": "第二段"},
+            ],
+        },
+    ]
+
+    assert extract_response_text(content) == "第一段\n第二段"

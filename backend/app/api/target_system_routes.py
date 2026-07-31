@@ -13,19 +13,27 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import Request
+from fastapi.responses import FileResponse, Response
+import httpx
 from pydantic import BaseModel, Field
 from sqlalchemy import func, text, update
 
 from app.core.database import SessionLocal
 from app.models.domain import Task, TargetSystemDeliveryLock, TargetSystemTask
-from app.services.target_system_client import TargetSystemClient
+from app.services.target_system_client import TargetSystemClient, is_target_auth_failure
 
 
 router = APIRouter(prefix="/api/target-system", tags=["target-system"])
 DELIVERY_ROOT = Path(os.getenv("DATA_DIR", "/app/data")) / "target-system-delivery"
 ACTIVE_DELIVERY_STATES = {"filling", "awaiting_user_submit", "fill_failed"}
 BROWSER_ACCESS_URL = os.getenv("TARGET_SYSTEM_BROWSER_ACCESS_URL", "").strip()
+XUEJIE_BASE_URL = os.getenv("TARGET_SYSTEM_PROXY_BASE_URL", "https://yy.xuejie.cn").rstrip("/")
+XUEJIE_PROXY_PREFIX = "/api/target-system/xuejie"
+XUEJIE_PROXY_COOKIE_NAME = "xuejie_proxy_token"
+XUEJIE_STATIC_SUFFIXES = (".js", ".css", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".woff", ".woff2", ".ttf")
+xuejie_http_client: httpx.AsyncClient | None = None
+xuejie_static_cache: dict[str, tuple[bytes, str, dict[str, str]]] = {}
 sync_lock = asyncio.Lock()
 sync_status = {"state": "idle", "synced": 0, "imported": 0, "schools_done": 0, "schools_total": 0, "error": ""}
 target_workflow_tasks: set[asyncio.Task] = set()
@@ -183,12 +191,15 @@ def _lock_for_task(db, item_id: int) -> TargetSystemDeliveryLock | None:
 
 
 @router.get("/filters")
-async def list_target_filters():
+async def list_target_filters(school_id: int | None = None):
     with SessionLocal() as db:
-        subject_rows = db.query(
+        subject_query = db.query(
             func.json_extract(TargetSystemTask.source_json, "$.paperInfo.subject_id"),
             func.json_extract(TargetSystemTask.source_json, "$.paperInfo.subject_name"),
-        ).distinct().all()
+        )
+        if school_id is not None:
+            subject_query = subject_query.filter(func.json_extract(TargetSystemTask.source_json, "$.paperInfo.school_id") == school_id)
+        subject_rows = subject_query.distinct().all()
         local_school_rows = db.query(
             func.json_extract(TargetSystemTask.source_json, "$.paperInfo.school_id"),
             func.json_extract(TargetSystemTask.source_json, "$.paperInfo.school_name"),
@@ -196,13 +207,24 @@ async def list_target_filters():
     schools = {str(item_id): {"id": item_id, "name": str(name or f"学校{item_id}")} for item_id, name in local_school_rows if item_id is not None}
     try:
         for school in await TargetSystemClient().list_schools():
-            school_id = school.get("school_id")
-            if school_id is not None:
-                schools[str(school_id)] = {"id": school_id, "name": str(school.get("school_name") or f"学校{school_id}")}
+            listed_school_id = school.get("school_id")
+            if listed_school_id is not None:
+                schools[str(listed_school_id)] = {"id": listed_school_id, "name": str(school.get("school_name") or f"学校{listed_school_id}")}
     except Exception:
         pass
-    subjects = [{"id": item_id, "name": str(name)} for item_id, name in subject_rows if item_id is not None and name]
-    return {"schools": sorted(schools.values(), key=lambda item: item["name"]), "subjects": sorted(subjects, key=lambda item: item["name"])}
+    subjects = {str(item_id): {"id": item_id, "name": str(name)} for item_id, name in subject_rows if item_id is not None and name}
+    if school_id is not None:
+        try:
+            client = TargetSystemClient()
+            async for batch in client.iter_pending_task_batches(school_id=school_id):
+                for raw in batch["rows"]:
+                    paper = raw.get("paperInfo") if isinstance(raw, dict) else None
+                    if not isinstance(paper, dict) or paper.get("subject_id") is None or not paper.get("subject_name"):
+                        continue
+                    subjects[str(paper["subject_id"])] = {"id": paper["subject_id"], "name": str(paper["subject_name"])}
+        except Exception:
+            pass
+    return {"schools": sorted(schools.values(), key=lambda item: item["name"]), "subjects": sorted(subjects.values(), key=lambda item: item["name"])}
 
 
 @router.get("/tasks")
@@ -273,6 +295,7 @@ async def _run_remote_sync(school_id: int | None = None, subject_id: int | None 
         sync_status = {"state": "running", "synced": 0, "imported": 0, "schools_done": 0, "schools_total": 0, "error": ""}
         try:
             client = TargetSystemClient()
+            seen_remote_ids: set[str] = set()
             async for batch in client.iter_pending_task_batches(school_id=school_id, subject_ids=[subject_id] if subject_id else None):
                 batch_imported = 0
                 with SessionLocal() as db:
@@ -281,8 +304,14 @@ async def _run_remote_sync(school_id: int | None = None, subject_id: int | None 
                             remote_task_id = _remote_id(raw)
                         except ValueError:
                             continue
+                        seen_remote_ids.add(remote_task_id)
                         item = db.query(TargetSystemTask).filter(TargetSystemTask.remote_task_id == remote_task_id).first()
                         if item:
+                            item.source_json = json.dumps(raw, ensure_ascii=False)
+                            item.title = _first_text(raw, ("title", "topic", "topic_text", "question", "content"))[:160] or item.title
+                            if item.status == "remote_closed":
+                                item.status = "discovered"
+                                item.error_message = None
                             continue
                         title = _first_text(raw, ("title", "topic", "topic_text", "question", "content"))[:160]
                         db.add(TargetSystemTask(remote_task_id=remote_task_id, title=title or "远端题目", source_json=json.dumps(raw, ensure_ascii=False), status="discovered"))
@@ -296,6 +325,19 @@ async def _run_remote_sync(school_id: int | None = None, subject_id: int | None 
                     "schools_total": batch["school_total"],
                     "error": "",
                 }
+            if school_id is not None:
+                with SessionLocal() as db:
+                    candidates = db.query(TargetSystemTask).filter(
+                        TargetSystemTask.status.in_(("discovered", "selected")),
+                        func.json_extract(TargetSystemTask.source_json, "$.paperInfo.school_id") == school_id,
+                    )
+                    if subject_id is not None:
+                        candidates = candidates.filter(func.json_extract(TargetSystemTask.source_json, "$.paperInfo.subject_id") == subject_id)
+                    for item in candidates.all():
+                        if item.remote_task_id not in seen_remote_ids:
+                            item.status = "remote_closed"
+                            item.error_message = "远端已不在待接题列表，可能已被解答或关闭。"
+                    db.commit()
         except Exception as exc:
             sync_status = {**sync_status, "state": "failed", "error": str(exc)[:500]}
             return
@@ -521,6 +563,164 @@ def current_delivery():
 @router.get("/delivery/session")
 def delivery_browser_session():
     return {"access_url": BROWSER_ACCESS_URL or None}
+
+
+def _rewrite_xuejie_content(body: bytes, content_type: str, bootstrap_token: str = "") -> bytes:
+    """把学解前端里的绝对地址改成本系统的同源代理地址。"""
+    if not any(token in content_type.lower() for token in ("javascript", "html", "json", "text")):
+        return body
+    try:
+        text_body = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return body
+    rewritten = text_body.replace(XUEJIE_BASE_URL, XUEJIE_PROXY_PREFIX)
+    rewritten = rewritten.replace(f"//{XUEJIE_BASE_URL.removeprefix('https://').removeprefix('http://')}", XUEJIE_PROXY_PREFIX)
+    if "javascript" in content_type.lower():
+        rewritten = rewritten.replace(
+            '.cookies.get("token")',
+            '.cookies.get("token") || sessionStorage.getItem("token")',
+        )
+    if bootstrap_token and "html" in content_type.lower():
+        bootstrap = f"<script>sessionStorage.setItem('token',{json.dumps(bootstrap_token)});</script>"
+        rewritten = rewritten.replace("<head>", f"<head>{bootstrap}", 1)
+    return rewritten.encode("utf-8")
+
+
+async def _request_xuejie(method: str, url: str, **kwargs) -> httpx.Response:
+    global xuejie_http_client
+    if xuejie_http_client is None or xuejie_http_client.is_closed:
+        xuejie_http_client = httpx.AsyncClient(
+            timeout=60,
+            follow_redirects=False,
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+        )
+    return await xuejie_http_client.request(method, url, **kwargs)
+
+
+@router.api_route(
+    "/xuejie/{path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+)
+async def proxy_xuejie(request: Request, path: str):
+    """同源代理学解页面和接口，解决浏览器无法跨域写入登录 Cookie 的问题。"""
+    target_url = f"{XUEJIE_BASE_URL}/{path.lstrip('/')}"
+    if request.url.query:
+        target_url = f"{target_url}?{request.url.query}"
+    body = await request.body()
+    static_asset = request.method == "GET" and path.lower().split("?", 1)[0].endswith(XUEJIE_STATIC_SUFFIXES)
+    cache_key = target_url
+    if static_asset and cache_key in xuejie_static_cache:
+        cached_body, cached_type, cached_headers = xuejie_static_cache[cache_key]
+        return Response(content=cached_body, media_type=cached_type or None, headers=cached_headers)
+    forwarded_headers = {}
+    for name in ("accept", "content-type", "user-agent", "referer", "range", "x-requested-with"):
+        value = request.headers.get(name)
+        if value:
+            forwarded_headers[name] = value
+    token = request.cookies.get(XUEJIE_PROXY_COOKIE_NAME, "").strip()
+    auto_login = False
+    if not token and path.rstrip("/") in {"", "index.html"}:
+        try:
+            login_client = TargetSystemClient()
+            await login_client.login()
+            token = login_client.token
+            auto_login = bool(token)
+        except Exception:
+            token = ""
+    authorization = request.headers.get("authorization", "").strip()
+    if token:
+        forwarded_headers["authorization"] = token
+    elif authorization:
+        forwarded_headers["authorization"] = authorization
+    cookies = {"token": token} if token else None
+    upstream = await _request_xuejie(
+        request.method,
+        target_url,
+        content=body or None,
+        headers=forwarded_headers,
+        cookies=cookies,
+    )
+    try:
+        upstream_body = upstream.json()
+    except ValueError:
+        upstream_body = None
+    if is_target_auth_failure(upstream.status_code, upstream_body):
+        try:
+            recovery_client = TargetSystemClient()
+            await recovery_client.login(force=True)
+            token = recovery_client.token
+            auto_login = bool(token)
+            if token:
+                forwarded_headers["authorization"] = token
+                upstream = await _request_xuejie(
+                    request.method,
+                    target_url,
+                    content=body or None,
+                    headers=forwarded_headers,
+                    cookies={"token": token},
+                )
+        except Exception:
+            pass
+
+    content_type = upstream.headers.get("content-type", "")
+    response_body = _rewrite_xuejie_content(
+        upstream.content,
+        content_type,
+        token if path.rstrip("/") in {"", "index.html"} else "",
+    )
+    response_headers = {}
+    for name in ("cache-control", "etag", "last-modified", "content-disposition"):
+        value = upstream.headers.get(name)
+        if value:
+            response_headers[name] = value
+    if static_asset and upstream.status_code == 200:
+        response_headers["cache-control"] = "public, max-age=604800, immutable"
+    location = upstream.headers.get("location")
+    if location:
+        response_headers["location"] = location.replace(XUEJIE_BASE_URL, XUEJIE_PROXY_PREFIX)
+    result = Response(
+        content=response_body,
+        status_code=upstream.status_code,
+        headers=response_headers,
+        media_type=content_type.split(";", 1)[0] or None,
+    )
+    for set_cookie in upstream.headers.get_list("set-cookie"):
+        result.headers.append("set-cookie", set_cookie)
+    if path.rstrip("/") == "admin/login" and upstream.status_code < 300:
+        try:
+            payload = upstream.json()
+            token_value = str((payload.get("data") or {}).get("token") or "").strip()
+            if token_value:
+                result.set_cookie(
+                    XUEJIE_PROXY_COOKIE_NAME,
+                    token_value,
+                    httponly=True,
+                    samesite="lax",
+                    path=XUEJIE_PROXY_PREFIX,
+                )
+        except (ValueError, TypeError):
+            pass
+    if auto_login:
+        result.set_cookie(
+            XUEJIE_PROXY_COOKIE_NAME,
+            token,
+            httponly=True,
+            samesite="lax",
+            path=XUEJIE_PROXY_PREFIX,
+        )
+    if static_asset and upstream.status_code == 200:
+        xuejie_static_cache[cache_key] = (response_body, content_type.split(";", 1)[0], response_headers)
+    return result
+
+
+@router.post("/browser/open-ai-research")
+def open_ai_research_browser():
+    """返回同源代理入口，浏览器打开后由代理完成学解登录。"""
+    return {
+        "state": "redirect",
+        "access_url": f"{XUEJIE_PROXY_PREFIX}/#/xueba/ai_research",
+        "message": "正在打开学解 AI Research，登录后可直接录入。",
+    }
 
 
 def _save_upload(item_id: int, label: str, upload: UploadFile | None) -> str | None:

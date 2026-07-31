@@ -76,6 +76,7 @@ from app.api.errata_routes import router as errata_router
 from app.api.paper_routes import router as paper_router
 from app.api.target_system_routes import router as target_system_router
 from app.services.task_artifacts import latest_task_artifact
+from app.services.markdown_sanitizer import sanitize_stored_markdown_math
 from app.services.mineru_jobs import resume_pending_mineru_jobs
 from app.services.errata_service import (
     _ensure_errata_task_column,
@@ -634,6 +635,7 @@ async def lifespan(app: FastAPI):
     migrate_errata_workflow_v3()
     ensure_target_system_columns()
     with SessionLocal() as db:
+        markdown_cleanup = sanitize_stored_markdown_math(db)
         db.query(Task).filter(Task.state.in_(["queued", "solving", "reviewing", "formatting"])).update(
             {Task.state: TaskStatus.PAUSED.value, Task.error_code: "服务重启后已暂停，请手动继续"},
             synchronize_session=False,
@@ -651,6 +653,12 @@ async def lifespan(app: FastAPI):
             if not active or active.status not in {"awaiting_user_submit", "fill_failed"}:
                 lock.target_task_id = None
         db.commit()
+        if markdown_cleanup["tasks"] or markdown_cleanup["artifacts"]:
+            print(
+                "[DB] Sanitized Markdown math wrappers: "
+                f"{markdown_cleanup['tasks']} tasks, "
+                f"{markdown_cleanup['artifacts']} formatter artifacts"
+            )
     await resume_pending_mineru_jobs()
     yield
 
@@ -2108,8 +2116,22 @@ def admin_list_logs(task_id: str, db: Session = Depends(get_db)):
 
 # 挂载前端静态文件（SPA 支持）
 # 在所有 API 路由之后挂载，确保 /api/* 优先匹配
+class NoCacheHtmlStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        if response.headers.get("content-type", "").startswith("text/html"):
+            response.headers["Cache-Control"] = (
+                "no-store, no-cache, must-revalidate, max-age=0"
+            )
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
+
+
 frontend_dist_path = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 if os.path.exists(frontend_dist_path):
     app.mount(
-        "/", StaticFiles(directory=frontend_dist_path, html=True), name="frontend"
+        "/",
+        NoCacheHtmlStaticFiles(directory=frontend_dist_path, html=True),
+        name="frontend",
     )

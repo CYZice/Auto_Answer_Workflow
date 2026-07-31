@@ -1,5 +1,5 @@
 import axios from 'axios'
-import { Download, FileCheck2, Loader2, MoreHorizontal, RefreshCw, Trash2, Upload, X } from 'lucide-react'
+import { ArrowLeft, Download, FileCheck2, Loader2, MoreHorizontal, RefreshCw, Trash2, Upload, X } from 'lucide-react'
 import { ChangeEvent, useEffect, useMemo, useRef, useState } from 'react'
 
 const api = axios.create({ baseURL: import.meta.env.VITE_API_BASE_URL || '' })
@@ -32,6 +32,7 @@ export default function ErrataWorkbench({ focusItemId }: { focusItemId?: string 
   const [items, setItems] = useState<ErrataItem[]>([])
   const [mineruStatus, setMineruStatus] = useState('not_requested')
   const [selectedId, setSelectedId] = useState(() => localStorage.getItem('zyb.active_errata_item_id') || '')
+  const [mobileListOpen, setMobileListOpen] = useState(true)
   const [busy, setBusy] = useState(false)
   const [exporting, setExporting] = useState(false)
   const [message, setMessage] = useState('')
@@ -79,7 +80,10 @@ export default function ErrataWorkbench({ focusItemId }: { focusItemId?: string 
   }, [jobId])
 
   useEffect(() => {
-    if (focusItemId) setSelectedId(focusItemId)
+    if (focusItemId) {
+      setSelectedId(focusItemId)
+      setMobileListOpen(false)
+    }
   }, [focusItemId])
 
   useEffect(() => {
@@ -223,6 +227,7 @@ export default function ErrataWorkbench({ focusItemId }: { focusItemId?: string 
   const selectItem = async (itemId: string) => {
     if (dirtyItemId && selected) await saveDraft(selected)
     setSelectedId(itemId)
+    setMobileListOpen(false)
   }
 
   const operateTask = async (action: 'pause' | 'terminate') => {
@@ -278,7 +283,7 @@ export default function ErrataWorkbench({ focusItemId }: { focusItemId?: string 
 
   return (
     <main className="grid min-h-[calc(100vh-65px)] grid-cols-[minmax(0,1fr)] bg-white lg:grid-cols-[280px_minmax(0,1fr)]">
-      <aside className="min-w-0 border-b border-slate-200 bg-slate-50/70 lg:border-b-0 lg:border-r">
+      <aside className={`${mobileListOpen ? 'block' : 'hidden'} min-w-0 border-b border-slate-200 bg-slate-50/70 lg:block lg:border-b-0 lg:border-r`}>
         <div className="border-b border-slate-200 p-5">
           <div className="flex items-center justify-between"><h1 className="font-semibold text-slate-950">勘误题目</h1><span className="text-xs text-slate-500">{items.filter((i) => i.status === 'completed').length}/{items.length} 已完成</span></div>
           <button onClick={generateAll} disabled={!items.length || busy} className="mt-4 w-full rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-40">批量生成并审查</button>
@@ -289,7 +294,7 @@ export default function ErrataWorkbench({ focusItemId }: { focusItemId?: string 
           <button onClick={showJobList} className="mt-4 text-xs font-medium text-indigo-700 hover:text-indigo-900">返回项目列表</button>
           {message && <p role="status" aria-live="polite" className="mt-3 text-xs leading-5 text-slate-600">{message}</p>}
         </div>
-        <div className="max-h-[calc(100vh-180px)] overflow-y-auto">
+        <div className="max-h-[55svh] overflow-y-auto lg:max-h-[calc(100vh-180px)]">
           {visibleItems.map((item) => <button key={item.item_id} onClick={() => void selectItem(item.item_id)} className={`w-full border-b border-slate-200 px-5 py-4 text-left transition ${selected?.item_id === item.item_id ? 'bg-white shadow-[inset_3px_0_0_#4f46e5]' : 'hover:bg-white'}`}>
             <div className="flex items-center justify-between"><span className="text-sm font-semibold">题块 {item.item_index} {item.material_paths.length > 0 ? '· 原始材料' : ''}</span><span className={`text-xs ${item.status === 'completed' ? 'text-emerald-600' : item.status === 'failed' ? 'text-rose-600' : 'text-slate-400'}`}>{taskStatusLabel[item.status] || item.status}{item.human_confirmed ? ' · 已检查' : ''}</span></div>
             <p className="mt-1 line-clamp-2 text-xs leading-5 text-slate-500">{item.question_text || '未提取到题干文字'}</p>
@@ -297,7 +302,8 @@ export default function ErrataWorkbench({ focusItemId }: { focusItemId?: string 
         </div>
       </aside>
       {!selected && <section className="grid place-items-center px-8 py-7"><div className="max-w-md border-l-2 border-amber-400 pl-5"><h2 className="text-lg font-semibold text-slate-900">当前任务没有可处理题目</h2><p className="mt-2 text-sm leading-6 text-slate-600">{jobError || '请返回项目列表，选择其他任务或重新导入文件。'}</p><button onClick={showJobList} className="mt-5 rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white">返回项目列表</button></div></section>}
-      {selected && <section className="min-w-0 px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
+      {selected && <section className={`${mobileListOpen ? 'hidden' : 'block'} min-w-0 px-4 py-5 lg:block sm:px-6 lg:px-8 lg:py-7`}>
+        <button type="button" onClick={() => setMobileListOpen(true)} className="mb-4 inline-flex min-h-10 items-center gap-2 text-sm font-medium text-indigo-700 lg:hidden"><ArrowLeft className="h-4 w-4" />返回勘误题目</button>
         <header className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-200 pb-5">
           <div><p className="text-xs font-medium tracking-wider text-indigo-600">{selected.source_ref || `题块 ${selected.item_index}`}</p><h2 className="mt-1 text-2xl font-semibold">复核并填写锚点内容</h2><p className="mt-2 text-xs text-slate-500">主任务：{selected.task_id || '创建中'} · 勘误：{taskStatusLabel[selected.status] || selected.status} · 审查：{selected.review_status} · {saveState === 'saving' ? '保存中…' : saveState === 'failed' ? '保存失败，可重试' : '已保存'}</p></div>
           <div className="flex flex-wrap justify-end gap-2"><button onClick={regenerate} className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-3 py-2 text-sm text-white"><RefreshCw className="h-4 w-4" />重新生成</button><button onClick={review} disabled={!selected.task_id} className="rounded-lg border border-indigo-300 px-3 py-2 text-sm font-medium text-indigo-700 disabled:opacity-40">重新裁决</button><details className="relative"><summary className="inline-flex cursor-pointer list-none items-center rounded-lg border border-slate-300 p-2 text-slate-600 hover:bg-slate-50" title="更多操作"><MoreHorizontal className="h-5 w-5" /></summary><div className="absolute right-0 z-30 mt-1 w-44 border border-slate-200 bg-white p-1 shadow-lg"><button onClick={addManualItem} className="block w-full rounded px-3 py-2 text-left text-sm hover:bg-slate-50">新增手动题</button><button onClick={() => void rebuildMaterials()} className="block w-full rounded px-3 py-2 text-left text-sm hover:bg-slate-50">重建材料</button><button onClick={() => operateTask('pause')} className="block w-full rounded px-3 py-2 text-left text-sm hover:bg-slate-50">暂停任务</button><button onClick={() => operateTask('terminate')} className="block w-full rounded px-3 py-2 text-left text-sm text-amber-700 hover:bg-amber-50">终止任务</button><button onClick={() => void deleteSelectedItem()} className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-rose-700 hover:bg-rose-50"><Trash2 className="h-4 w-4" />删除本题</button></div></details></div>
@@ -323,7 +329,7 @@ export default function ErrataWorkbench({ focusItemId }: { focusItemId?: string 
           </div>
         </div>
       </section>}
-      {previewEvidenceUrl && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6" onClick={() => setPreviewEvidenceUrl('')} role="dialog" aria-modal="true" aria-label="图片预览"><button onClick={() => setPreviewEvidenceUrl('')} className="absolute right-5 top-5 rounded border border-white/40 p-2 text-white hover:bg-white/15" title="关闭图片预览"><X className="h-6 w-6" /></button><img src={previewEvidenceUrl} alt="勘误证据原图" className="max-h-full max-w-full object-contain" onClick={(event) => event.stopPropagation()} /></div>}
+      {previewEvidenceUrl && <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/80 p-6" onClick={() => setPreviewEvidenceUrl('')} role="dialog" aria-modal="true" aria-label="图片预览"><button onClick={() => setPreviewEvidenceUrl('')} className="absolute right-5 top-5 rounded border border-white/40 p-2 text-white hover:bg-white/15" title="关闭图片预览"><X className="h-6 w-6" /></button><img src={previewEvidenceUrl} alt="勘误证据原图" className="max-h-full max-w-full object-contain" onClick={(event) => event.stopPropagation()} /></div>}
     </main>
   )
 }

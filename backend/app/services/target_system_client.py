@@ -1,12 +1,27 @@
 """Only-read target-system client. Saving/submitting is deliberately absent."""
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 from collections.abc import AsyncIterator
 from typing import Any
 import httpx
 import yaml
+
+
+_shared_sessions: dict[tuple[str, str], dict[str, Any]] = {}
+_shared_session_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
+
+def is_target_auth_failure(status_code: int, body: Any) -> bool:
+    if status_code in (401, 403):
+        return True
+    if not isinstance(body, dict):
+        return False
+    code = body.get("code")
+    message = str(body.get("message") or body.get("msg") or "").lower()
+    return code in (401, 403, 505) or any(token in message for token in ("请先登录", "登录失效", "token", "未登录"))
 
 
 def read_target_config() -> dict[str, str]:
@@ -26,7 +41,32 @@ class TargetSystemClient:
         self.cookies: dict[str, str] = {}
         self.developer_id = 0
 
-    async def login(self) -> None:
+    def _session_key(self) -> tuple[str, str]:
+        return self.base_url, self.config["username"]
+
+    def _apply_session(self, session: dict[str, Any]) -> None:
+        self.token = str(session["token"])
+        self.cookies = dict(session["cookies"])
+        self.developer_id = int(session["developer_id"])
+
+    async def login(self, force: bool = False) -> None:
+        key = self._session_key()
+        if not force and key in _shared_sessions:
+            self._apply_session(_shared_sessions[key])
+            return
+        lock = _shared_session_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if not force and key in _shared_sessions:
+                self._apply_session(_shared_sessions[key])
+                return
+            await self._login_remote()
+            _shared_sessions[key] = {
+                "token": self.token,
+                "cookies": dict(self.cookies),
+                "developer_id": self.developer_id,
+            }
+
+    async def _login_remote(self) -> None:
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(f"{self.base_url}/admin/login", json={"username": self.config["username"], "password": self.config["password"]})
         payload = response.json()
@@ -42,13 +82,21 @@ class TargetSystemClient:
     async def post(self, path: str, payload: dict[str, Any]) -> Any:
         if not self.token:
             await self.login()
-        headers = {"Authorization": self.token, "Content-Type": "application/json"}
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(f"{self.base_url}{path}", json=payload, headers=headers, cookies=self.cookies)
-        body = response.json()
-        if response.status_code != 200 or body.get("code") not in (0, 200):
+        for attempt in range(2):
+            headers = {"Authorization": self.token, "Content-Type": "application/json"}
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(f"{self.base_url}{path}", json=payload, headers=headers, cookies=self.cookies)
+            try:
+                body = response.json()
+            except ValueError as exc:
+                raise RuntimeError("远端返回了无法识别的响应。") from exc
+            if response.status_code == 200 and body.get("code") in (0, 200):
+                return body.get("data") or {}
+            if attempt == 0 and is_target_auth_failure(response.status_code, body):
+                await self.login(force=True)
+                continue
             raise RuntimeError(str(body.get("message") or body.get("msg") or "远端请求失败"))
-        return body.get("data") or {}
+        raise RuntimeError("远端请求失败")
 
     async def list_schools(self) -> list[dict[str, Any]]:
         data = await self.post("/admin/school/list", {"is_business": 1, "schoolIds": []})
@@ -58,7 +106,6 @@ class TargetSystemClient:
         payload: dict[str, Any] = {
             "school_id": school_id,
             "status": 0,
-            "contain_img": 1,
             "judge_admin_id": "",
             "developer_id": self.developer_id,
             "page": page,
@@ -133,8 +180,18 @@ class TargetSystemClient:
     async def download(self, url: str) -> bytes:
         if not self.token:
             await self.login()
-        headers = {"Authorization": self.token}
-        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-            response = await client.get(url, headers=headers, cookies=self.cookies)
-        response.raise_for_status()
-        return response.content
+        for attempt in range(2):
+            headers = {"Authorization": self.token}
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                response = await client.get(url, headers=headers, cookies=self.cookies)
+            if attempt == 0:
+                try:
+                    body = response.json()
+                except ValueError:
+                    body = None
+                if is_target_auth_failure(response.status_code, body):
+                    await self.login(force=True)
+                    continue
+            response.raise_for_status()
+            return response.content
+        raise RuntimeError("题图下载失败")

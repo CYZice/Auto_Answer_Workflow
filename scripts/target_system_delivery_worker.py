@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 import json
 import os
 import sys
@@ -128,6 +129,25 @@ async def login_if_needed(page: Page, config: dict[str, str]) -> None:
     await page.goto(f"{config['base_url'].rstrip('/')}/{SPA_PATH}", wait_until="networkidle")
     if await page.locator('input[placeholder*="账号"], input[placeholder*="密码"]').count() >= 2:
         raise RuntimeError("目标系统登录后仍停留在登录页。")
+
+
+async def open_ai_research_shortcut() -> None:
+    """打开一个可见、已登录的 AI Research 页面，供人工继续录入。"""
+    config = read_config()
+    PROFILE.mkdir(parents=True, exist_ok=True)
+    executable = CHROME if Path(CHROME).exists() else None
+    async with async_playwright() as playwright:
+        context = await playwright.chromium.launch_persistent_context(
+            str(PROFILE), executable_path=executable, headless=False, viewport={"width": 1440, "height": 960}
+        )
+        await protect_terminal_actions(context)
+        page = await context.new_page()
+        await login_if_needed(page, config)
+        print("已打开并登录学解 AI Research 页面。关闭浏览器窗口后，快捷打开进程会自动结束。")
+        try:
+            await page.wait_for_event("close")
+        finally:
+            await context.close()
 
 
 async def open_remote_topic(page: Page, remote_task_id: str, contract: dict[str, object], list_rows: list[dict]) -> None:
@@ -293,4 +313,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description="目标系统浏览器交付工具")
+    parser.add_argument("--open-ai-research", action="store_true", help="仅打开并自动登录 AI Research 页面")
+    args = parser.parse_args()
+    asyncio.run(open_ai_research_shortcut() if args.open_ai_research else main())

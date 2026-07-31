@@ -3,6 +3,7 @@ from app.agent.nodes.llm_client import format_solution
 from app.agent.nodes.llm_client import coerce_token_count
 from app.core.database import SessionLocal
 from app.models.domain import Task
+from app.services.markdown_sanitizer import sanitize_markdown_math
 
 
 def format_node_sync(task_id: str):
@@ -68,13 +69,14 @@ async def format_node(state: AgentState) -> AgentState:
         safe_total_tokens = coerce_token_count(
             state.get("total_tokens"), 0
         ) + coerce_token_count(result.get("tokens"), 0)
+        formatted_result = sanitize_markdown_math(result["formatted_result"])
         from app.services.task_artifacts import persist_task_artifact
 
         await asyncio.to_thread(
             persist_task_artifact,
             state["task_id"],
             "formatter",
-            result["formatted_result"],
+            formatted_result,
             {"tokens": coerce_token_count(result.get("tokens"), 0)},
             state.get("input_revision", 1),
         )
@@ -82,7 +84,7 @@ async def format_node(state: AgentState) -> AgentState:
         return {
             **state,
             "status": "completed",
-            "final_result": result["formatted_result"],
+            "final_result": formatted_result,
             "total_tokens": safe_total_tokens,
         }
     except asyncio.CancelledError:

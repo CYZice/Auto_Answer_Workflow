@@ -38,6 +38,11 @@ class ModelConfig(BaseModel):
     )
     base_url: Optional[str] = Field(default=None, description="API Base URL")
     max_tokens: Optional[int] = Field(default=4096, description="最大生成 Token 数")
+    use_responses_api: bool = Field(default=True, description="是否使用 Responses API")
+    reasoning_effort: Optional[Literal["minimal", "low", "medium", "high", "xhigh"]] = Field(
+        default="xhigh", description="Responses API 推理强度"
+    )
+    store: bool = Field(default=False, description="是否允许上游保存 Responses 响应")
 
 
 class RuntimeModelConfigResponse(BaseModel):
@@ -48,6 +53,9 @@ class RuntimeModelConfigResponse(BaseModel):
     max_tokens: int = Field(default=4096, ge=1)
     api_key_masked: str = ""
     api_key_configured: bool = False
+    use_responses_api: bool = True
+    reasoning_effort: Optional[Literal["minimal", "low", "medium", "high", "xhigh"]] = "xhigh"
+    store: bool = False
 
 
 class RuntimeModelConfigUpdate(BaseModel):
@@ -57,6 +65,22 @@ class RuntimeModelConfigUpdate(BaseModel):
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     max_tokens: Optional[int] = Field(default=None, ge=1)
+    clear_api_key: bool = False
+    clear_reasoning_effort: bool = False
+    use_responses_api: Optional[bool] = None
+    reasoning_effort: Optional[Literal["minimal", "low", "medium", "high", "xhigh"]] = None
+    store: Optional[bool] = None
+
+
+class RuntimeSharedModelConfigResponse(BaseModel):
+    base_url: str = ""
+    api_key_masked: str = ""
+    api_key_configured: bool = False
+
+
+class RuntimeSharedModelConfigUpdate(BaseModel):
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
     clear_api_key: bool = False
 
 
@@ -168,6 +192,7 @@ class RuntimeSettingsResponse(BaseModel):
     solver_config: RuntimeModelConfigResponse
     reviewer_config: RuntimeModelConfigResponse
     formatter_config: RuntimeModelConfigResponse
+    shared_model_config: RuntimeSharedModelConfigResponse
     mineru_config: RuntimeMineruConfigResponse
 
 
@@ -179,6 +204,7 @@ class RuntimeSettingsUpdateRequest(BaseModel):
     solver_config: Optional[RuntimeModelConfigUpdate] = None
     reviewer_config: Optional[RuntimeModelConfigUpdate] = None
     formatter_config: Optional[RuntimeModelConfigUpdate] = None
+    shared_model_config: Optional[RuntimeSharedModelConfigUpdate] = None
     mineru_config: Optional[RuntimeMineruConfigUpdate] = None
 
 

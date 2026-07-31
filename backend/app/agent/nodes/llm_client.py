@@ -1,10 +1,24 @@
 import os
+from urllib.parse import urlparse
 import json
 import asyncio
 import openai
 from pydantic import BaseModel, Field
 from typing import Optional, Literal, List, Callable, Any
 from langchain_openai import ChatOpenAI
+
+
+YUANXUAI_RESPONSES_HEADERS = {
+    "User-Agent": "Yo/JS 4.91.1",
+    "x-stainless-lang": "js",
+    "x-stainless-package-version": "4.91.1",
+    "x-stainless-os": "Windows",
+    "x-stainless-arch": "x64",
+    "x-stainless-runtime": "node",
+    "x-stainless-runtime-version": "v22.22.0",
+    "x-stainless-retry-count": "0",
+    "x-stainless-timeout": "60000",
+}
 from langchain_core.messages import HumanMessage, SystemMessage
 from app.core.database import SessionLocal
 from app.core.events import task_events
@@ -129,19 +143,33 @@ def get_llm(model_config: Optional[dict] = None):
             f"缺少大模型配置: {', '.join(missing_configs)}。请在前端页面设置中填写，或在后端 .env 文件中配置。"
         )
 
-    return ChatOpenAI(
-        model=model_name,
-        api_key=api_key,
-        base_url=base_url,
-        streaming=config.get("streaming", True),
-        temperature=config.get("temperature", 0.5),
-        max_tokens=config.get("max_tokens", 4096),
-        model_kwargs={
+    use_responses_api = bool(config.get("use_responses_api", True))
+    llm_kwargs = {
+        "model": model_name,
+        "api_key": api_key,
+        "base_url": base_url,
+        "streaming": config.get("streaming", True),
+        "temperature": config.get("temperature", 0.5),
+        "max_tokens": config.get("max_tokens", 4096),
+        "use_responses_api": use_responses_api,
+    }
+    if use_responses_api:
+        llm_kwargs["store"] = bool(config.get("store", False))
+        if urlparse(base_url).hostname == "token.yuanxuai.xyz":
+            llm_kwargs["default_headers"] = YUANXUAI_RESPONSES_HEADERS
+    else:
+        llm_kwargs["model_kwargs"] = {
             "max_completion_tokens": config.get(
                 "max_tokens", 4096
             ),  # 兼容某些服务商强制要求的 max_completion_tokens
             "frequency_penalty": config.get("frequency_penalty", 0.5),
-        },
+        }
+    reasoning_effort = config.get("reasoning_effort")
+    if use_responses_api and reasoning_effort:
+        llm_kwargs["reasoning"] = {"effort": reasoning_effort}
+
+    return ChatOpenAI(
+        **llm_kwargs,
     )
 
 

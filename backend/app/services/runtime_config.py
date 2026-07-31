@@ -96,23 +96,36 @@ DEFAULT_PROMPT_TEMPLATES = {
 }
 
 DEFAULT_MODEL_DEFAULTS = {
+    "shared_model_config": {
+        "api_key": "",
+        "base_url": "",
+    },
     "solver_config": {
         "model_name": "",
         "api_key": "",
         "base_url": "",
         "max_tokens": 4096,
+        "use_responses_api": True,
+        "reasoning_effort": "xhigh",
+        "store": False,
     },
     "reviewer_config": {
         "model_name": "",
         "api_key": "",
         "base_url": "",
         "max_tokens": 2048,
+        "use_responses_api": True,
+        "reasoning_effort": "xhigh",
+        "store": False,
     },
     "formatter_config": {
         "model_name": "",
         "api_key": "",
         "base_url": "",
         "max_tokens": 1024,
+        "use_responses_api": True,
+        "reasoning_effort": "xhigh",
+        "store": False,
     },
     "workflow_template_id": "workflow_a",
     "draft_solution": None,
@@ -191,15 +204,33 @@ def normalize_model_config(value: Any, default_max_tokens: int) -> dict[str, Any
         default_max_tokens,
         minimum=1,
     )
+    raw_effort = config.get("reasoning_effort", "xhigh")
+    if raw_effort is None or not str(raw_effort).strip():
+        effort = None
+    else:
+        effort = str(raw_effort).strip().lower()
+        if effort not in {"minimal", "low", "medium", "high", "xhigh"}:
+            effort = "xhigh"
     return {
         "model_name": model_name,
         "api_key": api_key,
         "base_url": base_url,
         "max_tokens": max_tokens,
+        "use_responses_api": bool(config.get("use_responses_api", True)),
+        "reasoning_effort": effort,
+        "store": bool(config.get("store", False)),
     }
 
 
-def read_model_defaults() -> dict[str, Any]:
+def normalize_shared_model_config(value: Any) -> dict[str, str]:
+    config = value if isinstance(value, dict) else {}
+    return {
+        "api_key": str(config.get("api_key") or "").strip(),
+        "base_url": str(config.get("base_url") or "").strip(),
+    }
+
+
+def _read_stored_model_defaults() -> dict[str, Any]:
     with _LOCK:
         raw = _safe_read_yaml(
             PRIVATE_MODEL_DEFAULTS_PATH if PRIVATE_MODEL_DEFAULTS_PATH.exists() else MODEL_DEFAULTS_PATH,
@@ -209,6 +240,7 @@ def read_model_defaults() -> dict[str, Any]:
     solver = normalize_model_config(raw.get("solver_config"), 4096)
     reviewer = normalize_model_config(raw.get("reviewer_config"), 2048)
     formatter = normalize_model_config(raw.get("formatter_config"), 1024)
+    shared_model_config = normalize_shared_model_config(raw.get("shared_model_config"))
     workflow_template_id = str(
         raw.get("workflow_template_id")
         or DEFAULT_MODEL_DEFAULTS["workflow_template_id"]
@@ -218,9 +250,28 @@ def read_model_defaults() -> dict[str, Any]:
         "solver_config": solver,
         "reviewer_config": reviewer,
         "formatter_config": formatter,
+        "shared_model_config": shared_model_config,
         "workflow_template_id": workflow_template_id,
         "draft_solution": raw.get("draft_solution"),
     }
+
+
+def read_model_defaults() -> dict[str, Any]:
+    """Return executable configs with node credentials inheriting shared then env."""
+    stored = _read_stored_model_defaults()
+    shared = stored["shared_model_config"]
+    resolved: dict[str, Any] = {
+        "shared_model_config": shared,
+        "workflow_template_id": stored["workflow_template_id"],
+        "draft_solution": stored["draft_solution"],
+    }
+    for node_name in ("solver", "reviewer", "formatter"):
+        key = f"{node_name}_config"
+        config = dict(stored[key])
+        config["api_key"] = config["api_key"] or shared["api_key"] or os.getenv("LLM_API_KEY", "")
+        config["base_url"] = config["base_url"] or shared["base_url"] or os.getenv("LLM_BASE_URL", "")
+        resolved[key] = config
+    return resolved
 
 
 def _mask_api_key(value: str) -> str:
@@ -233,7 +284,7 @@ def _mask_api_key(value: str) -> str:
 
 
 def public_model_defaults() -> dict[str, Any]:
-    defaults = read_model_defaults()
+    defaults = _read_stored_model_defaults()
     response: dict[str, Any] = {}
     for node_name in ("solver", "reviewer", "formatter"):
         key = f"{node_name}_config"
@@ -245,13 +296,32 @@ def public_model_defaults() -> dict[str, Any]:
             "max_tokens": config.get("max_tokens"),
             "api_key_masked": _mask_api_key(api_key),
             "api_key_configured": bool(api_key),
+            "use_responses_api": bool(config.get("use_responses_api", True)),
+            "reasoning_effort": config.get("reasoning_effort"),
+            "store": bool(config.get("store", False)),
         }
+    shared = defaults["shared_model_config"]
+    response["shared_model_config"] = {
+        "base_url": shared.get("base_url") or "",
+        "api_key_masked": _mask_api_key(shared.get("api_key") or ""),
+        "api_key_configured": bool(shared.get("api_key")),
+    }
     return response
 
 
 def update_model_defaults(payload: dict[str, Any]) -> dict[str, Any]:
-    current = read_model_defaults()
+    current = _read_stored_model_defaults()
     updated = copy.deepcopy(current)
+    shared_payload = payload.get("shared_model_config")
+    if isinstance(shared_payload, dict):
+        shared = dict(current["shared_model_config"])
+        if "base_url" in shared_payload and shared_payload["base_url"] is not None:
+            shared["base_url"] = str(shared_payload["base_url"]).strip()
+        if shared_payload.get("clear_api_key") is True:
+            shared["api_key"] = ""
+        elif str(shared_payload.get("api_key") or "").strip():
+            shared["api_key"] = str(shared_payload["api_key"]).strip()
+        updated["shared_model_config"] = normalize_shared_model_config(shared)
     for node_name, default_tokens in (
         ("solver", 4096),
         ("reviewer", 2048),
@@ -269,6 +339,13 @@ def update_model_defaults(payload: dict[str, Any]) -> dict[str, Any]:
             next_config["max_tokens"] = normalize_positive_int(
                 node_payload["max_tokens"], default_tokens, minimum=1
             )
+        for field in ("use_responses_api", "store"):
+            if node_payload.get(field) is not None:
+                next_config[field] = bool(node_payload[field])
+        if node_payload.get("clear_reasoning_effort") is True:
+            next_config["reasoning_effort"] = None
+        elif node_payload.get("reasoning_effort") is not None:
+            next_config["reasoning_effort"] = str(node_payload["reasoning_effort"])
         if node_payload.get("clear_api_key") is True:
             next_config["api_key"] = ""
         elif str(node_payload.get("api_key") or "").strip():

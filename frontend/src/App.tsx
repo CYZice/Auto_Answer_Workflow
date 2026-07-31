@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider, useMutation, useQueries, useQuery } from '@tanstack/react-query'
 import axios from 'axios'
 import 'katex/dist/katex.min.css'
-import { ChevronDown, ChevronUp, Download, Image as ImageIcon, Maximize2, Play, Plus, Save, Settings, Trash2, X } from 'lucide-react'
+import { ArrowLeft, ChevronDown, ChevronUp, ClipboardCheck, Crosshair, Database, Download, Image as ImageIcon, LayoutDashboard, Maximize2, Menu, Play, Plus, Save, Settings, Trash2, X } from 'lucide-react'
 import { ChangeEvent, DragEvent, MouseEvent, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import rehypeKatex from 'rehype-katex'
@@ -77,6 +77,9 @@ interface ModelConfig {
   api_key: string;
   base_url: string;
   max_tokens: number;
+  use_responses_api: boolean;
+  reasoning_effort: '' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  store: boolean;
 }
 
 interface AdminTask {
@@ -159,6 +162,9 @@ interface RuntimeModelConfig {
   max_tokens: number;
   api_key_masked: string;
   api_key_configured: boolean;
+  use_responses_api: boolean;
+  reasoning_effort: ModelConfig['reasoning_effort'] | null;
+  store: boolean;
 }
 
 interface RuntimeSettingsResponse {
@@ -176,6 +182,11 @@ interface RuntimeSettingsResponse {
   solver_config: RuntimeModelConfig;
   reviewer_config: RuntimeModelConfig;
   formatter_config: RuntimeModelConfig;
+  shared_model_config: {
+    base_url: string;
+    api_key_masked: string;
+    api_key_configured: boolean;
+  };
   mineru_config: {
     base_url: string;
     api_token_masked: string;
@@ -204,6 +215,9 @@ interface SettingsSnapshot {
   sharedBaseUrl: string;
   sharedApiKey: string;
   clearSharedApiKey: boolean;
+  clearSolverApiKey: boolean;
+  clearReviewerApiKey: boolean;
+  clearFormatterApiKey: boolean;
   mineruApiBaseUrl: string;
   mineruApiToken: string;
   clearMineruApiToken: boolean;
@@ -236,21 +250,81 @@ const readStoredJson = <T,>(key: string, fallback: T): T => {
   }
 }
 
-const mergeModelConfigWithShared = (
-  config: ModelConfig,
-  sharedBaseUrl: string,
-  sharedApiKey: string
-): ModelConfig => {
-  const normalizedSharedBaseUrl = sharedBaseUrl.trim()
-  const normalizedSharedApiKey = sharedApiKey.trim()
-  return {
-    ...config,
-    base_url: normalizedSharedBaseUrl || (config.base_url || '').trim(),
-    api_key: normalizedSharedApiKey || (config.api_key || '').trim(),
-  }
+const createDefaultModelConfig = (maxTokens: number): ModelConfig => ({
+  model_name: '',
+  api_key: '',
+  base_url: '',
+  max_tokens: maxTokens,
+  use_responses_api: true,
+  reasoning_effort: 'xhigh',
+  store: false,
+})
+
+const normalizeModelConfig = (value: (Partial<ModelConfig> & { reasoning_effort?: ModelConfig['reasoning_effort'] | null }) | null | undefined, maxTokens: number): ModelConfig => ({
+  ...createDefaultModelConfig(maxTokens),
+  ...(value || {}),
+  max_tokens: value?.max_tokens || maxTokens,
+  use_responses_api: value?.use_responses_api ?? true,
+  reasoning_effort: value?.reasoning_effort === undefined ? 'xhigh' : (value.reasoning_effort || ''),
+  store: value?.store ?? false,
+})
+
+const parseModelMaxTokens = (value: string) => {
+  const parsed = parseInt(value, 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1
 }
 
 const getLatestRetryConfigs = (): Record<string, never> => ({})
+
+function NodeModelSettings({
+  title,
+  accentClass,
+  config,
+  setConfig,
+  clearApiKey,
+  setClearApiKey,
+}: {
+  title: string;
+  accentClass: string;
+  config: ModelConfig;
+  setConfig: (config: ModelConfig) => void;
+  clearApiKey: boolean;
+  setClearApiKey: (value: boolean) => void;
+}) {
+  return (
+    <div className="space-y-4">
+      <h4 className={`border-b pb-2 text-lg font-semibold ${accentClass}`}>{title}</h4>
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <div>
+          <label className="mb-1 block text-sm font-medium text-gray-700">模型名称</label>
+          <input type="text" value={config.model_name} onChange={e => setConfig({ ...config, model_name: e.target.value })} className="w-full rounded-lg border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
+        </div>
+        <div>
+          <label className="mb-1 block text-sm font-medium text-gray-700">Max Tokens</label>
+          <input type="number" value={config.max_tokens || ''} onChange={e => setConfig({ ...config, max_tokens: parseModelMaxTokens(e.target.value) })} className="w-full rounded-lg border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
+        </div>
+        <div>
+          <label className="mb-1 block text-sm font-medium text-gray-700">节点 Base URL <span className="text-xs font-normal text-gray-400">(留空继承共享配置)</span></label>
+          <input type="url" value={config.base_url} onChange={e => setConfig({ ...config, base_url: e.target.value })} placeholder="https://..." className="w-full rounded-lg border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
+        </div>
+        <div>
+          <label className="mb-1 block text-sm font-medium text-gray-700">节点 API Key <span className="text-xs font-normal text-gray-400">(留空保留覆盖值)</span></label>
+          <input type="password" value={config.api_key} onChange={e => setConfig({ ...config, api_key: e.target.value })} placeholder="留空则继承共享 Key" className="w-full rounded-lg border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
+          <label className="mt-2 flex items-center gap-2 text-xs text-rose-700"><input type="checkbox" checked={clearApiKey} onChange={e => setClearApiKey(e.target.checked)} />清除节点独立 Key，改为继承共享 Key</label>
+        </div>
+      </div>
+      <div className="grid grid-cols-1 gap-4 rounded-lg border border-slate-200 bg-slate-50 p-3 sm:grid-cols-3">
+        <label className="flex items-center gap-2 text-sm font-medium text-slate-700"><input type="checkbox" checked={config.use_responses_api} onChange={e => setConfig({ ...config, use_responses_api: e.target.checked, reasoning_effort: e.target.checked ? (config.reasoning_effort || 'xhigh') : '' })} />使用 Responses API</label>
+        <label className="text-sm text-slate-700">推理强度
+          <select disabled={!config.use_responses_api} value={config.reasoning_effort} onChange={e => setConfig({ ...config, reasoning_effort: e.target.value as ModelConfig['reasoning_effort'] })} className="mt-1 w-full rounded border bg-white px-2 py-1.5 disabled:bg-slate-100">
+            <option value="">不设置</option><option value="minimal">minimal</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option>
+          </select>
+        </label>
+        <label className="flex items-center gap-2 text-sm text-slate-700"><input type="checkbox" disabled={!config.use_responses_api} checked={config.store} onChange={e => setConfig({ ...config, store: e.target.checked })} />允许上游保存响应</label>
+      </div>
+    </div>
+  )
+}
 
 const persistTaskForDashboard = (taskId: string) => {
   const submittedTasks = readStoredJson<SubmittedTask[]>(SUBMITTED_TASKS_STORAGE_KEY, [])
@@ -305,34 +379,37 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
   const [taskFilter, setTaskFilter] = useState<'all' | 'running' | 'completed' | 'exception'>('all')
   const [solverConfig, setSolverConfig] = useState<ModelConfig>(() => {
     const saved = localStorage.getItem(SOLVER_CONFIG_STORAGE_KEY)
-    return saved ? JSON.parse(saved) : { model_name: '', api_key: '', base_url: '', max_tokens: 4096 }
+    return normalizeModelConfig(saved ? JSON.parse(saved) : null, 4096)
   })
   const [reviewerConfig, setReviewerConfig] = useState<ModelConfig>(() => {
     const saved = localStorage.getItem(REVIEWER_CONFIG_STORAGE_KEY)
-    return saved ? JSON.parse(saved) : { model_name: '', api_key: '', base_url: '', max_tokens: 2048 }
+    return normalizeModelConfig(saved ? JSON.parse(saved) : null, 2048)
   })
   const [formatterConfig, setFormatterConfig] = useState<ModelConfig>(() => {
     const saved = localStorage.getItem(FORMATTER_CONFIG_STORAGE_KEY)
-    return saved ? JSON.parse(saved) : { model_name: '', api_key: '', base_url: '', max_tokens: 1024 }
+    return normalizeModelConfig(saved ? JSON.parse(saved) : null, 1024)
   })
   const [sharedBaseUrl, setSharedBaseUrl] = useState<string>(() => {
     const shared = (localStorage.getItem(SHARED_BASE_URL_STORAGE_KEY) || '').trim()
     if (shared) return shared
-    const solverSaved = readStoredJson<ModelConfig>(SOLVER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 4096 })
-    const reviewerSaved = readStoredJson<ModelConfig>(REVIEWER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 2048 })
-    const formatterSaved = readStoredJson<ModelConfig>(FORMATTER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 1024 })
+    const solverSaved = readStoredJson<ModelConfig>(SOLVER_CONFIG_STORAGE_KEY, createDefaultModelConfig(4096))
+    const reviewerSaved = readStoredJson<ModelConfig>(REVIEWER_CONFIG_STORAGE_KEY, createDefaultModelConfig(2048))
+    const formatterSaved = readStoredJson<ModelConfig>(FORMATTER_CONFIG_STORAGE_KEY, createDefaultModelConfig(1024))
     return (solverSaved.base_url || reviewerSaved.base_url || formatterSaved.base_url || '').trim()
   })
   const [sharedApiKey, setSharedApiKey] = useState<string>(() => {
     const shared = (localStorage.getItem(SHARED_API_KEY_STORAGE_KEY) || '').trim()
     if (shared) return shared
-    const solverSaved = readStoredJson<ModelConfig>(SOLVER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 4096 })
-    const reviewerSaved = readStoredJson<ModelConfig>(REVIEWER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 2048 })
-    const formatterSaved = readStoredJson<ModelConfig>(FORMATTER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 1024 })
+    const solverSaved = readStoredJson<ModelConfig>(SOLVER_CONFIG_STORAGE_KEY, createDefaultModelConfig(4096))
+    const reviewerSaved = readStoredJson<ModelConfig>(REVIEWER_CONFIG_STORAGE_KEY, createDefaultModelConfig(2048))
+    const formatterSaved = readStoredJson<ModelConfig>(FORMATTER_CONFIG_STORAGE_KEY, createDefaultModelConfig(1024))
     return (solverSaved.api_key || reviewerSaved.api_key || formatterSaved.api_key || '').trim()
   })
   const [sharedApiKeyMasked, setSharedApiKeyMasked] = useState('')
   const [clearSharedApiKey, setClearSharedApiKey] = useState(false)
+  const [clearSolverApiKey, setClearSolverApiKey] = useState(false)
+  const [clearReviewerApiKey, setClearReviewerApiKey] = useState(false)
+  const [clearFormatterApiKey, setClearFormatterApiKey] = useState(false)
   const [mineruApiBaseUrl, setMineruApiBaseUrl] = useState<string>('')
   const [mineruApiToken, setMineruApiToken] = useState<string>('')
   const [mineruApiTokenMasked, setMineruApiTokenMasked] = useState('')
@@ -365,6 +442,9 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
     sharedBaseUrl,
     sharedApiKey,
     clearSharedApiKey,
+    clearSolverApiKey,
+    clearReviewerApiKey,
+    clearFormatterApiKey,
     mineruApiBaseUrl,
     mineruApiToken,
     clearMineruApiToken,
@@ -424,12 +504,39 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
       setFormatterFallbackText(listToText(runtime.fallback?.nodes?.formatter || []))
       setRequestTimeoutSeconds(runtime.request_timeout_seconds || 300)
       setMaxRetries(runtime.max_retries ?? 2)
-      const legacySolver = readStoredJson<ModelConfig>(SOLVER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 4096 })
-      const legacyReviewer = readStoredJson<ModelConfig>(REVIEWER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 2048 })
-      const legacyFormatter = readStoredJson<ModelConfig>(FORMATTER_CONFIG_STORAGE_KEY, { model_name: '', api_key: '', base_url: '', max_tokens: 1024 })
-      const nextSolverConfig: ModelConfig = { model_name: runtime.solver_config?.model_name || legacySolver.model_name || '', api_key: '', base_url: '', max_tokens: runtime.solver_config?.max_tokens || legacySolver.max_tokens || 4096 }
-      const nextReviewerConfig: ModelConfig = { model_name: runtime.reviewer_config?.model_name || legacyReviewer.model_name || '', api_key: '', base_url: '', max_tokens: runtime.reviewer_config?.max_tokens || legacyReviewer.max_tokens || 2048 }
-      const nextFormatterConfig: ModelConfig = { model_name: runtime.formatter_config?.model_name || legacyFormatter.model_name || '', api_key: '', base_url: '', max_tokens: runtime.formatter_config?.max_tokens || legacyFormatter.max_tokens || 1024 }
+      const legacySolver = readStoredJson<ModelConfig>(SOLVER_CONFIG_STORAGE_KEY, createDefaultModelConfig(4096))
+      const legacyReviewer = readStoredJson<ModelConfig>(REVIEWER_CONFIG_STORAGE_KEY, createDefaultModelConfig(2048))
+      const legacyFormatter = readStoredJson<ModelConfig>(FORMATTER_CONFIG_STORAGE_KEY, createDefaultModelConfig(1024))
+      const nextSolverConfig = normalizeModelConfig({
+        ...legacySolver,
+        model_name: runtime.solver_config?.model_name || legacySolver.model_name || '',
+        api_key: '',
+        base_url: runtime.solver_config?.base_url || '',
+        max_tokens: runtime.solver_config?.max_tokens || legacySolver.max_tokens,
+        use_responses_api: runtime.solver_config?.use_responses_api,
+        reasoning_effort: runtime.solver_config?.reasoning_effort === null ? '' : runtime.solver_config?.reasoning_effort,
+        store: runtime.solver_config?.store,
+      }, 4096)
+      const nextReviewerConfig = normalizeModelConfig({
+        ...legacyReviewer,
+        model_name: runtime.reviewer_config?.model_name || legacyReviewer.model_name || '',
+        api_key: '',
+        base_url: runtime.reviewer_config?.base_url || '',
+        max_tokens: runtime.reviewer_config?.max_tokens || legacyReviewer.max_tokens,
+        use_responses_api: runtime.reviewer_config?.use_responses_api,
+        reasoning_effort: runtime.reviewer_config?.reasoning_effort === null ? '' : runtime.reviewer_config?.reasoning_effort,
+        store: runtime.reviewer_config?.store,
+      }, 2048)
+      const nextFormatterConfig = normalizeModelConfig({
+        ...legacyFormatter,
+        model_name: runtime.formatter_config?.model_name || legacyFormatter.model_name || '',
+        api_key: '',
+        base_url: runtime.formatter_config?.base_url || '',
+        max_tokens: runtime.formatter_config?.max_tokens || legacyFormatter.max_tokens,
+        use_responses_api: runtime.formatter_config?.use_responses_api,
+        reasoning_effort: runtime.formatter_config?.reasoning_effort === null ? '' : runtime.formatter_config?.reasoning_effort,
+        store: runtime.formatter_config?.store,
+      }, 1024)
       setSolverConfig(nextSolverConfig)
       setReviewerConfig(nextReviewerConfig)
       setFormatterConfig(nextFormatterConfig)
@@ -453,15 +560,18 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
       setReviewerUserPrompt(detail.prompts?.reviewer?.user || '')
       setFormatterSystemPrompt(detail.prompts?.formatter?.system || '')
       setFormatterUserPrompt(detail.prompts?.formatter?.user || '')
-      const nextSharedBaseUrl = (runtime.solver_config?.base_url || runtime.reviewer_config?.base_url || runtime.formatter_config?.base_url || localStorage.getItem(SHARED_BASE_URL_STORAGE_KEY) || '').trim()
-      const serverHasApiKey = Boolean(runtime.solver_config?.api_key_configured || runtime.reviewer_config?.api_key_configured || runtime.formatter_config?.api_key_configured)
-      const nextSharedApiKey = serverHasApiKey ? '' : (localStorage.getItem(SHARED_API_KEY_STORAGE_KEY) || legacySolver.api_key || legacyReviewer.api_key || legacyFormatter.api_key || '').trim()
+      const nextSharedBaseUrl = (runtime.shared_model_config?.base_url || localStorage.getItem(SHARED_BASE_URL_STORAGE_KEY) || '').trim()
+      const serverHasApiKey = Boolean(runtime.shared_model_config?.api_key_configured)
+      const nextSharedApiKey = serverHasApiKey ? '' : (localStorage.getItem(SHARED_API_KEY_STORAGE_KEY) || '').trim()
       const nextMineruApiBaseUrl = (runtime.mineru_config?.base_url || '').trim()
       const nextMineruApiToken = ''
       setSharedBaseUrl(nextSharedBaseUrl)
       setSharedApiKey(nextSharedApiKey)
-      setSharedApiKeyMasked(runtime.solver_config?.api_key_masked || runtime.reviewer_config?.api_key_masked || runtime.formatter_config?.api_key_masked || '')
+      setSharedApiKeyMasked(runtime.shared_model_config?.api_key_masked || '')
       setClearSharedApiKey(false)
+      setClearSolverApiKey(false)
+      setClearReviewerApiKey(false)
+      setClearFormatterApiKey(false)
       setMineruApiBaseUrl(nextMineruApiBaseUrl)
       setMineruApiToken(nextMineruApiToken)
       setMineruApiTokenMasked(runtime.mineru_config?.api_token_masked || '')
@@ -474,6 +584,9 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
         sharedBaseUrl: nextSharedBaseUrl,
         sharedApiKey: nextSharedApiKey,
         clearSharedApiKey: false,
+        clearSolverApiKey: false,
+        clearReviewerApiKey: false,
+        clearFormatterApiKey: false,
         mineruApiBaseUrl: nextMineruApiBaseUrl,
         mineruApiToken: nextMineruApiToken,
         clearMineruApiToken: false,
@@ -517,9 +630,10 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
             formatter: textToList(formatterFallbackText)
           }
         },
-        solver_config: { ...mergeModelConfigWithShared(solverConfig, sharedBaseUrl, sharedApiKey), clear_api_key: clearSharedApiKey },
-        reviewer_config: { ...mergeModelConfigWithShared(reviewerConfig, sharedBaseUrl, sharedApiKey), clear_api_key: clearSharedApiKey },
-        formatter_config: { ...mergeModelConfigWithShared(formatterConfig, sharedBaseUrl, sharedApiKey), clear_api_key: clearSharedApiKey },
+        shared_model_config: { base_url: sharedBaseUrl, api_key: sharedApiKey, clear_api_key: clearSharedApiKey },
+        solver_config: { ...solverConfig, reasoning_effort: solverConfig.reasoning_effort || undefined, clear_reasoning_effort: !solverConfig.reasoning_effort, clear_api_key: clearSolverApiKey },
+        reviewer_config: { ...reviewerConfig, reasoning_effort: reviewerConfig.reasoning_effort || undefined, clear_reasoning_effort: !reviewerConfig.reasoning_effort, clear_api_key: clearReviewerApiKey },
+        formatter_config: { ...formatterConfig, reasoning_effort: formatterConfig.reasoning_effort || undefined, clear_reasoning_effort: !formatterConfig.reasoning_effort, clear_api_key: clearFormatterApiKey },
         mineru_config: { base_url: mineruApiBaseUrl, api_token: mineruApiToken, clear_api_token: clearMineruApiToken }
       })
 
@@ -860,11 +974,6 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
     }
   };
 
-  const parseMaxTokens = (val: string) => {
-    const parsed = parseInt(val, 10);
-    return isNaN(parsed) ? 0 : parsed;
-  };
-
   const parseNonNegativeInt = (val: string, fallback: number) => {
     const parsed = parseInt(val, 10)
     if (Number.isNaN(parsed) || parsed < 0) return fallback
@@ -878,7 +987,7 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
   }
 
   return (
-    <div className="mx-auto max-w-7xl space-y-8 p-4 sm:p-6 lg:p-8">
+    <div className="mx-auto max-w-7xl space-y-4 p-3 sm:space-y-8 sm:p-6 lg:p-8">
       {/* 错误提示框 */}
       {errorMessage && (
         <div className="bg-red-50 border-l-4 border-red-500 p-4 rounded shadow-sm flex justify-between items-start">
@@ -901,7 +1010,7 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
       )}
 
       {/* 顶部标题与说明 */}
-      <header className="border-b pb-4 flex justify-between items-start">
+      <header className="hidden border-b pb-4 sm:flex sm:justify-between sm:items-start">
         <div>
           <h1 className="text-3xl font-bold text-gray-900">Zyb-Agent 生产流水线</h1>
           <p className="text-sm text-gray-500 mt-2">提示: 可以直接在这个页面 <kbd className="bg-gray-100 px-1 rounded border">Ctrl+V</kbd> 粘贴图片，也可以输入题目文本；每次录入一题并提交后再开始下一题。</p>
@@ -915,7 +1024,7 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
       )}
 
       {/* 单题输入区域 */}
-      <div className="space-y-4 rounded-lg border bg-white p-4 sm:p-6">
+      <div className="space-y-4 border-y bg-white p-4 sm:rounded-lg sm:border sm:p-6">
         <input
           ref={fileInputRef}
           type="file"
@@ -932,7 +1041,7 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
           <div className="flex items-center gap-2">
             <button
               onClick={handlePickLocalImage}
-              className="flex flex-1 items-center justify-center gap-2 whitespace-nowrap rounded-lg border border-blue-200 bg-white px-4 py-2 font-medium text-blue-700 transition-colors hover:bg-blue-50 disabled:opacity-50"
+              className="flex min-h-11 flex-1 items-center justify-center gap-2 whitespace-nowrap rounded-lg border border-blue-200 bg-white px-4 py-2 font-medium text-blue-700 transition-colors hover:bg-blue-50 disabled:opacity-50"
               title="从本地选择一张或多张图片"
             >
               <Plus size={18} />
@@ -941,7 +1050,7 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
             <button
               onClick={handleSubmitCurrentTask}
               disabled={!canSubmitInputTask}
-              className="flex flex-1 items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-blue-600 px-4 py-2 font-medium text-white transition-colors hover:bg-blue-700 disabled:opacity-50"
+              className="flex min-h-11 flex-1 items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-blue-600 px-4 py-2 font-medium text-white transition-colors hover:bg-blue-700 disabled:opacity-50"
               title={inputBlockedReason || '提交当前题目'}
             >
               <Play size={18} />
@@ -969,7 +1078,7 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
               {pendingInputImages.map((imageUrl, index) => (
                 <div key={`${imageUrl.slice(0, 24)}-${index}`} className="relative group border rounded-lg overflow-hidden bg-gray-50 h-36 flex items-center justify-center">
                   <img src={imageUrl} alt={`pending-${index + 1}`} className="max-h-full object-contain" />
-                  <div className="absolute inset-0 bg-black/30 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-2">
+                  <div className="absolute inset-0 flex items-center justify-center gap-2 bg-black/20 opacity-100 transition-opacity sm:bg-black/30 sm:opacity-0 sm:group-hover:opacity-100">
                     <button onClick={() => setPreviewImage(imageUrl)} className="p-2 bg-white rounded-full text-gray-700 hover:text-blue-600" title="预览">
                       <Maximize2 size={18} />
                     </button>
@@ -987,10 +1096,11 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
 
           </div>
         ) : (
-          <div className="h-36 border-2 border-dashed border-gray-300 rounded-lg flex flex-col items-center justify-center text-gray-400 bg-gray-50">
+          <div className="flex h-28 flex-col items-center justify-center rounded-lg border-2 border-dashed border-gray-300 bg-gray-50 px-4 text-center text-gray-400 sm:h-36">
             <Plus size={24} className="mb-2" />
-            <span className="text-sm">支持直接 Ctrl+V 粘贴图片，或点击上方“本地选图”上传一张或多张题目截图</span>
-            <span className="text-xs mt-1">无需先点击文本框；也可以不传图片，直接在下方输入题目后提交</span>
+            <span className="text-sm sm:hidden">选择题目图片，或在下方直接输入题目</span>
+            <span className="hidden text-sm sm:inline">支持直接 Ctrl+V 粘贴图片，或点击上方“本地选图”上传一张或多张题目截图</span>
+            <span className="mt-1 hidden text-xs sm:inline">无需先点击文本框；也可以不传图片，直接在下方输入题目后提交</span>
           </div>
         )}
 
@@ -1005,7 +1115,7 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
           />
         </div>
 
-        <div className="sticky bottom-0 z-10 -mx-6 px-6 py-4 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] bg-white/95 backdrop-blur border-t border-gray-200 space-y-3">
+        <div className="-mx-4 border-t border-gray-200 px-4 pt-4 sm:-mx-6 sm:px-6">
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-sm font-medium text-gray-700 mr-1">出答案模式</span>
             <button
@@ -1024,35 +1134,43 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
             </button>
             <span className="text-xs text-gray-500">{inputSkipReview ? '解题后直接排版' : '解题后经 AI 校验再排版'}</span>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
-            {WORKFLOW_NODE_ORDER.map((node, idx) => (
-              <div key={node} className="flex items-center gap-2">
-                <label className={`inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded border bg-white border-gray-200 ${inputSkipReview ? 'opacity-50' : ''}`}>
-                  <input
-                    type="checkbox"
-                    checked={inputSelectedNodes.includes(node)}
-                    onChange={() => toggleInputNodeSelection(node)}
-                    disabled={inputSkipReview}
-                  />
-                  <span className="font-medium">
-                    {node === 'solver' ? 'Solver 解题' : node === 'reviewer' ? 'AI 校验' : 'Formatter 排版'}
-                  </span>
-                </label>
-                {idx < WORKFLOW_NODE_ORDER.length - 1 && <span className="text-gray-400">-&gt;</span>}
+          <details className="group mt-3 border-t border-gray-100 pt-2 sm:mt-3 sm:border-0 sm:pt-0">
+            <summary className="flex min-h-10 cursor-pointer list-none items-center justify-between text-sm font-medium text-gray-700 sm:hidden">
+              <span>高级流程设置</span>
+              <ChevronDown className="h-4 w-4 transition-transform group-open:rotate-180" />
+            </summary>
+            <div className="hidden space-y-3 pb-1 pt-2 group-open:block sm:block sm:pt-0">
+              <div className="flex flex-wrap items-center gap-2">
+                {WORKFLOW_NODE_ORDER.map((node, idx) => (
+                  <div key={node} className="flex items-center gap-2">
+                    <label className={`inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded border bg-white border-gray-200 ${inputSkipReview ? 'opacity-50' : ''}`}>
+                      <input
+                        type="checkbox"
+                        checked={inputSelectedNodes.includes(node)}
+                        onChange={() => toggleInputNodeSelection(node)}
+                        disabled={inputSkipReview}
+                      />
+                      <span className="font-medium">
+                        {node === 'solver' ? 'Solver 解题' : node === 'reviewer' ? 'AI 校验' : 'Formatter 排版'}
+                      </span>
+                    </label>
+                    {idx < WORKFLOW_NODE_ORDER.length - 1 && <span className="text-gray-400">-&gt;</span>}
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
 
-          <div className="text-xs text-gray-600 bg-white rounded border px-3 py-2">
-            <div>入口节点: <span className="font-mono">{inputEntryPoint || '-'}</span></div>
-            <div>目标节点: <span className="font-mono">{effectiveInputNodes.join(', ') || '-'}</span></div>
-          </div>
+              <div className="rounded border bg-white px-3 py-2 text-xs text-gray-600">
+                <div>入口节点: <span className="font-mono">{inputEntryPoint || '-'}</span></div>
+                <div>目标节点: <span className="font-mono">{effectiveInputNodes.join(', ') || '-'}</span></div>
+              </div>
 
-          {inputBlockedReason && !canSubmitInputTask && (
-            <div className="text-xs text-red-600 bg-red-50 border border-red-100 px-3 py-2 rounded">
-              {inputBlockedReason}
+              {inputBlockedReason && !canSubmitInputTask && (
+                <div className="rounded border border-red-100 bg-red-50 px-3 py-2 text-xs text-red-600">
+                  {inputBlockedReason}
+                </div>
+              )}
             </div>
-          )}
+          </details>
         </div>
       </div>
 
@@ -1135,7 +1253,7 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
 
       {/* 全屏图片预览 Modal */}
       {previewImage && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4" onClick={() => setPreviewImage(null)}>
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/80 p-4" onClick={() => setPreviewImage(null)}>
           <button className="absolute top-4 right-4 text-white hover:text-gray-300">
             <X size={32} />
           </button>
@@ -1150,17 +1268,17 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
 
       {/* 设置弹窗 Modal */}
       {showSettings && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={tryCloseSettings}>
-          <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
-            <div className="p-6 border-b flex justify-between items-center bg-gray-50">
-              <h2 className="text-xl font-bold text-gray-800 flex items-center gap-2"><Settings size={20} /> 全局运行设置</h2>
+        <div className="fixed inset-0 z-[70] flex items-end justify-center bg-black/50 sm:items-center sm:p-4" onClick={tryCloseSettings}>
+          <div className="flex max-h-[94svh] w-full max-w-2xl flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:max-h-[90vh] sm:rounded-xl" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between border-b bg-gray-50 p-4 sm:p-6">
+              <h2 className="flex items-center gap-2 text-lg font-bold text-gray-800 sm:text-xl"><Settings size={20} /> 全局运行设置</h2>
               <button onClick={tryCloseSettings} className="text-gray-500 hover:text-gray-800"><X size={24} /></button>
             </div>
 
-            <div className="p-6 space-y-8 max-h-[70vh] overflow-y-auto">
+            <div className="flex-1 space-y-6 overflow-y-auto p-4 sm:space-y-8 sm:p-6">
               <div className="space-y-4 border border-indigo-100 rounded-xl p-4 bg-indigo-50/30">
                 <h3 className="text-lg font-semibold text-indigo-700 border-b border-indigo-100 pb-2">提示词设置</h3>
-                <div className="grid grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">激活模板</label>
                     <select
@@ -1311,49 +1429,13 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
                     </div>
                   </div>
                 </div>
-                <div className="space-y-4">
-                  <h4 className="text-lg font-semibold text-blue-600 border-b pb-2">Solver (解题) 节点</h4>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-1">模型名称</label>
-                      <input type="text" value={solverConfig.model_name} onChange={e => setSolverConfig({ ...solverConfig, model_name: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
-                    </div>
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-1">Max Tokens</label>
-                      <input type="number" value={solverConfig.max_tokens || ''} onChange={e => setSolverConfig({ ...solverConfig, max_tokens: parseMaxTokens(e.target.value) })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
-                    </div>
-                  </div>
-                </div>
-                <div className="space-y-4">
-                  <h4 className="text-lg font-semibold text-purple-600 border-b pb-2">Reviewer (审查) 节点</h4>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-1">模型名称</label>
-                      <input type="text" value={reviewerConfig.model_name} onChange={e => setReviewerConfig({ ...reviewerConfig, model_name: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-purple-500 outline-none" />
-                    </div>
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-1">Max Tokens</label>
-                      <input type="number" value={reviewerConfig.max_tokens || ''} onChange={e => setReviewerConfig({ ...reviewerConfig, max_tokens: parseMaxTokens(e.target.value) })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-purple-500 outline-none" />
-                    </div>
-                  </div>
-                </div>
-                <div className="space-y-4">
-                  <h4 className="text-lg font-semibold text-green-600 border-b pb-2">Formatter (排版) 节点</h4>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-1">模型名称</label>
-                      <input type="text" value={formatterConfig.model_name} onChange={e => setFormatterConfig({ ...formatterConfig, model_name: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 outline-none" />
-                    </div>
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-1">Max Tokens</label>
-                      <input type="number" value={formatterConfig.max_tokens || ''} onChange={e => setFormatterConfig({ ...formatterConfig, max_tokens: parseMaxTokens(e.target.value) })} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 outline-none" />
-                    </div>
-                  </div>
-                </div>
+                <NodeModelSettings title="Solver (解题) 节点" accentClass="text-blue-600" config={solverConfig} setConfig={setSolverConfig} clearApiKey={clearSolverApiKey} setClearApiKey={setClearSolverApiKey} />
+                <NodeModelSettings title="Reviewer (审查) 节点" accentClass="text-purple-600" config={reviewerConfig} setConfig={setReviewerConfig} clearApiKey={clearReviewerApiKey} setClearApiKey={setClearReviewerApiKey} />
+                <NodeModelSettings title="Formatter (排版) 节点" accentClass="text-green-600" config={formatterConfig} setConfig={setFormatterConfig} clearApiKey={clearFormatterApiKey} setClearApiKey={setClearFormatterApiKey} />
               </div>
             </div>
 
-            <div className="p-4 border-t bg-gray-50 flex justify-end gap-3">
+            <div className="flex justify-end gap-3 border-t bg-gray-50 p-4 pb-[calc(env(safe-area-inset-bottom)+1rem)] sm:pb-4">
               <button onClick={tryCloseSettings} className="px-4 py-2 text-gray-600 hover:bg-gray-200 rounded-lg transition-colors font-medium">取消</button>
               <button onClick={saveSettings} disabled={settingsSaving} className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors font-medium shadow-sm disabled:opacity-50">
                 {settingsSaving ? '保存中...' : '保存配置'}
@@ -1416,6 +1498,7 @@ function TaskStatusBadge({ state }: { state: string }) {
 }
 
 function TaskDetail({ taskId, onPreview, onOpenTargetSystem }: { taskId: string, onPreview: (url: string) => void, onOpenTargetSystem: () => void }) {
+  const [detailSection, setDetailSection] = useState<'input' | 'result'>('result')
   const [draftInput, setDraftInput] = useState('')
   const [customDraftInput, setCustomDraftInput] = useState('')
   const [editedQuestionText, setEditedQuestionText] = useState('')
@@ -1461,6 +1544,7 @@ function TaskDetail({ taskId, onPreview, onOpenTargetSystem }: { taskId: string,
 
   // 当切换任务时，清空流式输出的旧数据
   useEffect(() => {
+    setDetailSection('result')
     setStreamedContent('');
     setCurrentNode('');
     setCustomDraftInput('');
@@ -1672,12 +1756,28 @@ function TaskDetail({ taskId, onPreview, onOpenTargetSystem }: { taskId: string,
   }
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 bg-white p-6 rounded-xl shadow-sm border">
+    <div className="grid grid-cols-1 gap-5 border-y bg-white p-4 sm:rounded-xl sm:border sm:p-6 lg:grid-cols-2 lg:gap-8">
+      <div className="sticky top-14 z-20 grid grid-cols-2 border border-slate-200 bg-white p-1 shadow-sm lg:hidden">
+        <button
+          type="button"
+          onClick={() => setDetailSection('input')}
+          className={`min-h-10 rounded px-3 text-sm font-medium ${detailSection === 'input' ? 'bg-indigo-600 text-white' : 'text-slate-600'}`}
+        >
+          题目与输入
+        </button>
+        <button
+          type="button"
+          onClick={() => setDetailSection('result')}
+          className={`min-h-10 rounded px-3 text-sm font-medium ${detailSection === 'result' ? 'bg-indigo-600 text-white' : 'text-slate-600'}`}
+        >
+          结果与操作
+        </button>
+      </div>
       {/* Left: Original Image & Meta */}
-      <div className="space-y-4 border-r pr-8">
-        <div className="flex items-center justify-between">
-          <h3 className="text-xl font-semibold">Task: <span className="text-sm font-mono text-gray-500">{task.task_id}</span></h3>
-          <div className="flex items-center gap-2">
+      <div className={`${detailSection === 'input' ? 'block' : 'hidden'} space-y-4 lg:block lg:border-r lg:pr-8`}>
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <h3 className="min-w-0 text-base font-semibold sm:text-xl">Task: <span className="break-all font-mono text-xs text-gray-500 sm:text-sm">{task.task_id}</span></h3>
+          <div className="flex flex-wrap items-center gap-2">
             {task.source_kind === 'target_system' && <button onClick={onOpenTargetSystem} className="text-xs text-indigo-700 border border-indigo-200 rounded px-2 py-1 hover:bg-indigo-50">目标系统 · {task.source_item_id || '查看题目'}</button>}
             <span className={`px-3 py-1 rounded-full text-xs font-bold uppercase ${task.state === 'completed' ? 'bg-green-100 text-green-700' :
               task.state === 'failed' ? 'bg-red-100 text-red-700' :
@@ -1703,7 +1803,7 @@ function TaskDetail({ taskId, onPreview, onOpenTargetSystem }: { taskId: string,
               onClick={() => onPreview(imageUrl)}
             >
               <img src={imageUrl} alt={`Task target ${index + 1}`} className="max-h-full object-contain" />
-              <div className="absolute inset-0 bg-black/10 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+              <div className="absolute inset-0 flex items-center justify-center bg-black/10 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100">
                 <Maximize2 className="text-gray-700 bg-white/80 p-2 rounded-full w-10 h-10 shadow-sm" />
               </div>
             </div>
@@ -1718,13 +1818,13 @@ function TaskDetail({ taskId, onPreview, onOpenTargetSystem }: { taskId: string,
         </div>
 
         <div className="border rounded-lg p-3 space-y-3 bg-gray-50">
-          <div className="flex items-center justify-between"><h4 className="text-sm font-medium">编辑输入 / 追加附件</h4><span className="text-xs text-gray-500">保存后旧节点结果会标记过期</span></div>
+          <div className="flex flex-wrap items-center justify-between gap-1"><h4 className="text-sm font-medium">编辑输入 / 追加附件</h4><span className="text-xs text-gray-500">保存后旧节点结果会标记过期</span></div>
           <textarea value={editedQuestionText} onChange={(event) => setEditedQuestionText(event.target.value)} placeholder="题干文字，可直接修正或补充" className="w-full min-h-24 rounded border p-2 text-sm bg-white" />
           <input ref={attachmentInputRef} type="file" accept="image/*" multiple className="hidden" onChange={(event) => void loadAttachments(event.target.files)} />
           <div className="flex flex-wrap gap-2">
             <button onClick={() => attachmentInputRef.current?.click()} className="px-2 py-1.5 text-xs rounded border bg-white">追加图片</button>
             {pendingAttachmentImages.map((image, index) => <button key={`${image.slice(0, 18)}-${index}`} onClick={() => setPendingAttachmentImages((items) => items.filter((_, itemIndex) => itemIndex !== index))} className="px-2 py-1 text-xs rounded bg-white border text-red-600">移除图片 {index + 1}</button>)}
-            <button onClick={() => inputMutation.mutate({ questionText: editedQuestionText, images: [...taskImageUrls, ...pendingAttachmentImages], mode: 'replace' })} disabled={inputMutation.isPending || (!editedQuestionText.trim() && taskImageUrls.length + pendingAttachmentImages.length === 0)} className="ml-auto px-3 py-1.5 text-xs rounded bg-indigo-600 text-white disabled:opacity-50">保存新输入版本</button>
+            <button onClick={() => inputMutation.mutate({ questionText: editedQuestionText, images: [...taskImageUrls, ...pendingAttachmentImages], mode: 'replace' })} disabled={inputMutation.isPending || (!editedQuestionText.trim() && taskImageUrls.length + pendingAttachmentImages.length === 0)} className="w-full rounded bg-indigo-600 px-3 py-1.5 text-xs text-white disabled:opacity-50 sm:ml-auto sm:w-auto">保存新输入版本</button>
           </div>
         </div>
 
@@ -1742,7 +1842,7 @@ function TaskDetail({ taskId, onPreview, onOpenTargetSystem }: { taskId: string,
       </div>
 
       {/* Right: Agent Outputs & Interventions */}
-      <div className="space-y-6">
+      <div className={`${detailSection === 'result' ? 'block' : 'hidden'} min-w-0 space-y-6 lg:block`}>
         <div className="border rounded-lg divide-y bg-white">
           <div className="px-4 py-3 flex items-center justify-between">
             <h3 className="font-semibold text-gray-800">节点结果预览</h3>
@@ -1848,7 +1948,7 @@ function TaskDetail({ taskId, onPreview, onOpenTargetSystem }: { taskId: string,
               onChange={(e) => setDraftInput(e.target.value)}
               placeholder="Edit the draft solution here..."
             />
-            <div className="flex gap-4 pt-2">
+            <div className="grid gap-2 pt-2 sm:flex sm:gap-4">
               <button
                 onClick={() => manualMutation.mutate({ action: 'resume', draft: draftInput || historyDraftSolution })}
                 className="bg-green-600 text-white px-6 py-2.5 rounded font-medium hover:bg-green-700 transition-colors shadow-sm"
@@ -1871,11 +1971,11 @@ function TaskDetail({ taskId, onPreview, onOpenTargetSystem }: { taskId: string,
           </div>
         ) : task.state === 'completed' ? (
           <div className="space-y-4 h-full flex flex-col">
-            <div className="flex items-center justify-between shrink-0"><h3 className="font-semibold text-green-600 flex items-center gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-2 shrink-0"><h3 className="font-semibold text-green-600 flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-green-600 inline-block"></span>
               Final Output
             </h3><div className="flex gap-2"><button onClick={() => void navigator.clipboard.writeText(task.final_result || '')} className="px-2 py-1 text-xs border rounded hover:bg-gray-50">一键复制</button><button onClick={exportAnswerPng} className="px-2 py-1 text-xs border rounded hover:bg-gray-50">导出答案 PNG</button></div></div>
-            <div className="prose prose-sm max-w-none border p-6 rounded-lg bg-gray-50 overflow-y-auto flex-grow max-h-[400px]">
+            <div className="prose prose-sm max-w-none flex-grow overflow-y-auto rounded-lg border bg-gray-50 p-4 sm:max-h-[400px] sm:p-6">
               <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
                 {task.final_result || ''}
               </ReactMarkdown>
@@ -2410,7 +2510,7 @@ function AdminPanel({
   }
 
   return (
-    <div className="max-w-7xl mx-auto p-8 space-y-6">
+    <div className="mx-auto max-w-7xl space-y-4 p-3 sm:space-y-6 sm:p-6 lg:p-8">
       <header className="border-b pb-4 flex justify-between items-center">
         <div>
           <p className="text-xs font-semibold tracking-wider text-indigo-600">TASK DATABASE</p>
@@ -2425,8 +2525,8 @@ function AdminPanel({
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div className="bg-white border rounded-xl p-4 space-y-4">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3 lg:gap-6">
+        <div className={`${selectedTaskId ? 'hidden lg:block' : 'block'} space-y-4 border-y bg-white p-4 sm:rounded-xl sm:border`}>
           <div className="space-y-2">
             <label className="text-sm font-medium text-gray-700">Task ID 搜索</label>
             <input
@@ -2516,7 +2616,7 @@ function AdminPanel({
                 </div>
               </div>
             )}
-            <div className="space-y-2 max-h-[600px] overflow-y-auto">
+            <div className="max-h-none space-y-2 overflow-y-auto lg:max-h-[600px]">
               {listLoading && <div className="text-sm text-gray-500">加载中...</div>}
               {!listLoading && (listData?.items || []).map((task) => (
                 <div
@@ -2560,14 +2660,24 @@ function AdminPanel({
           </div>
         )}
 
-        <div className="lg:col-span-2 bg-white border rounded-xl p-6 space-y-4">
+        <div className={`${selectedTaskId ? 'block' : 'hidden lg:block'} space-y-4 border-y bg-white p-4 sm:rounded-xl sm:border sm:p-6 lg:col-span-2`}>
+          {selectedTaskId && (
+            <button
+              type="button"
+              onClick={() => setSelectedTaskId(null)}
+              className="inline-flex min-h-10 items-center gap-2 text-sm font-medium text-indigo-700 lg:hidden"
+            >
+              <ArrowLeft className="h-4 w-4" />
+              返回任务列表
+            </button>
+          )}
           {!selectedTaskId && <div className="text-sm text-gray-500">请从左侧选择任务</div>}
           {detailLoading && <div className="text-sm text-gray-500">正在加载详情...</div>}
           {selectedTask && (
             <>
-              <div className="flex justify-between items-center">
-                <h2 className="text-lg font-semibold text-gray-800 font-mono">{selectedTask.task_id}</h2>
-                <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <h2 className="min-w-0 break-all font-mono text-base font-semibold text-gray-800 sm:text-lg">{selectedTask.task_id}</h2>
+                <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto sm:justify-end">
                   {isErrataTask(selectedTask) ? <button
                     onClick={() => onOpenErrata(selectedTask.source_id || '', selectedTask.source_item_id || '')}
                     disabled={!selectedTask.source_id || !selectedTask.source_item_id}
@@ -2680,7 +2790,7 @@ function AdminPanel({
                 )}
               </div>}
 
-              <div className="grid grid-cols-2 gap-4 text-sm bg-gray-50 border rounded p-4">
+              <div className="grid grid-cols-1 gap-3 rounded border bg-gray-50 p-4 text-sm sm:grid-cols-2 sm:gap-4">
                 <div><strong>thread_id:</strong> {selectedTask.thread_id}</div>
                 <div><strong>retry:</strong> {selectedTask.retry_count}</div>
                 <div><strong>created_at:</strong> {selectedTask.created_at || '-'}</div>
@@ -2772,11 +2882,11 @@ function AdminPanel({
                 <textarea value={editHistory} onChange={(e) => setEditHistory(e.target.value)} className="w-full min-h-36 border rounded-lg px-3 py-2 text-xs font-mono" />
               </div>
 
-              <div className="flex justify-end">
+              <div className="flex justify-stretch sm:justify-end">
                 <button
                   onClick={() => updateMutation.mutate()}
                   disabled={updateMutation.isPending}
-                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+                  className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-indigo-600 px-4 py-2 text-white hover:bg-indigo-700 disabled:opacity-50 sm:w-auto"
                 >
                   <Save size={16} />
                   {updateMutation.isPending ? '保存中...' : '保存修改'}
@@ -3258,16 +3368,16 @@ function PaperBuilder({
   const batchTargetGroupName = groups.find((group) => group.id === batchTargetGroupId)?.name || ''
 
   return (
-    <div className="max-w-7xl mx-auto p-8 space-y-6">
-      <header className="border-b pb-4 flex justify-between items-center">
+    <div className="mx-auto max-w-7xl space-y-4 p-3 sm:space-y-6 sm:p-6 lg:p-8">
+      <header className="flex flex-col gap-4 border-b pb-4 lg:flex-row lg:items-center lg:justify-between">
         <div>
-          <h1 className="text-3xl font-bold text-gray-900">排版台</h1>
+          <h1 className="text-2xl font-bold text-gray-900 sm:text-3xl">排版台</h1>
           <p className="text-sm text-gray-500 mt-2">按题型组卷、组内排序、导出结构化试卷</p>
           <p className="text-xs text-gray-500 mt-1">
             {isLoadingDraft ? '正在加载草稿...' : (isSavingDraft ? '草稿自动保存中...' : `草稿状态：已保存 ${lastSavedAt ? new Date(lastSavedAt).toLocaleString() : '（本地草稿）'}`)}
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:flex lg:items-center">
           <button
             onClick={() => addGroup('选择题')}
             className="px-3 py-2 text-sm rounded-lg border bg-white hover:bg-gray-50"
@@ -3315,8 +3425,8 @@ function PaperBuilder({
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <div className="bg-white border rounded-xl p-4 space-y-4">
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-2 xl:gap-6">
+        <div className="space-y-4 border-y bg-white p-4 sm:rounded-xl sm:border">
           <div className="space-y-3">
             <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
               <div>
@@ -3378,7 +3488,7 @@ function PaperBuilder({
           {isLoading ? (
             <div className="text-sm text-gray-500">加载中...</div>
           ) : (
-            <div className="space-y-3 max-h-[620px] overflow-y-auto">
+            <div className="max-h-[55svh] space-y-3 overflow-y-auto xl:max-h-[620px]">
               {tasks.map((task) => (
                 <div
                   key={task.task_id}
@@ -3428,7 +3538,7 @@ function PaperBuilder({
           )}
         </div>
 
-        <div className="bg-white border rounded-xl p-4 space-y-4">
+        <div className="space-y-4 border-y bg-white p-4 sm:rounded-xl sm:border">
           <h2 className="text-lg font-semibold text-gray-800">组卷排版区</h2>
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-gray-700">草稿名称</label>
@@ -3623,7 +3733,17 @@ function App() {
   const [errataFocusItemId, setErrataFocusItemId] = useState<string | null>(null)
   const paperFocusQuestionId: number | null = null
   const [settingsOpenRequest, setSettingsOpenRequest] = useState(0)
+  const [mobileToolsOpen, setMobileToolsOpen] = useState(false)
   const targetRenderTaskId = new URLSearchParams(window.location.search).get('target-render-task')
+  const viewLabels: Record<typeof currentView, string> = {
+    dashboard: '工作台',
+    admin: '任务',
+    builder: '排版台',
+    'smart-parser': '智能解析',
+    errata: '勘误',
+    'paper-docx': '整卷答案',
+    'target-system': '目标系统',
+  }
 
   if (targetRenderTaskId) {
     return <QueryClientProvider client={queryClient}><TargetAnswerRender taskId={targetRenderTaskId} /></QueryClientProvider>
@@ -3631,8 +3751,8 @@ function App() {
 
   return (
     <QueryClientProvider client={queryClient}>
-      <div className="min-h-screen bg-slate-50 font-sans text-slate-800">
-        <header className="border-b border-slate-200 bg-white">
+      <div className="min-h-screen bg-slate-50 pb-[calc(env(safe-area-inset-bottom)+5rem)] font-sans text-slate-800 md:pb-0">
+        <header className="hidden border-b border-slate-200 bg-white md:block">
           <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-1 px-4 py-3 sm:px-6 lg:px-8">
             <span className="mr-4 text-sm font-semibold text-slate-950">Zyb-Agent</span>
             {[['dashboard', '工作台'], ['admin', '数据库'], ['errata', '勘误'], ['target-system', '目标系统']].map(([view, label]) => <button key={view} onClick={() => setCurrentView(view as typeof currentView)} className={`rounded-md px-3 py-2 text-sm ${currentView === view ? 'bg-indigo-600 text-white' : 'text-slate-600 hover:bg-slate-100'}`}>{label}</button>)}
@@ -3645,9 +3765,34 @@ function App() {
             <button onClick={() => { setCurrentView('dashboard'); setSettingsOpenRequest((value) => value + 1) }} className="ml-auto rounded-md p-2 text-slate-500 hover:bg-slate-100 hover:text-indigo-700" title="模型配置" aria-label="模型配置"><Settings className="h-5 w-5" /></button>
           </div>
         </header>
+        <header className="sticky top-0 z-30 flex h-14 items-center justify-between border-b border-slate-200 bg-white/95 px-4 backdrop-blur md:hidden">
+          <div className="min-w-0">
+            <p className="text-xs font-semibold text-indigo-600">Zyb-Agent</p>
+            <p className="truncate text-sm font-medium text-slate-900">{viewLabels[currentView]}</p>
+          </div>
+          {currentView === 'dashboard' && (
+            <button
+              type="button"
+              onClick={() => setSettingsOpenRequest((value) => value + 1)}
+              className="rounded-md p-2 text-slate-500"
+              title="模型配置"
+              aria-label="模型配置"
+            >
+              <Settings className="h-5 w-5" />
+            </button>
+          )}
+        </header>
 
         {currentView === 'dashboard' && (
-          <TaskDashboard settingsOpenRequest={settingsOpenRequest} onOpenTargetSystem={() => setCurrentView('target-system')} />
+          <TaskDashboard settingsOpenRequest={settingsOpenRequest} onOpenTargetSystem={() => {
+            const opened = window.open('about:blank', '_blank')
+            if (!opened) return
+            opened.document.title = '正在打开学解…'
+            void api.post('/api/target-system/browser/open-ai-research').then(({ data }) => {
+              if (typeof data.access_url !== 'string') return
+              opened.location.replace(new URL(data.access_url, window.location.origin).toString())
+            }).catch(() => opened.close())
+          }} />
         )}
         {currentView === 'admin' && (
           <AdminPanel
@@ -3669,6 +3814,92 @@ function App() {
         {currentView === 'paper-docx' && <PaperDocxWorkbench focusQuestionId={paperFocusQuestionId} />}
         {currentView === 'errata' && <ErrataWorkbench focusItemId={errataFocusItemId} />}
         {currentView === 'target-system' && <TargetSystemWorkbench />}
+
+        <nav className="fixed inset-x-0 bottom-0 z-50 grid grid-cols-5 border-t border-slate-200 bg-white/95 px-1 pb-[calc(env(safe-area-inset-bottom)+0.35rem)] pt-1 backdrop-blur md:hidden" aria-label="移动端主导航">
+          {[
+            ['dashboard', '工作台', LayoutDashboard],
+            ['admin', '任务', Database],
+            ['errata', '勘误', ClipboardCheck],
+            ['target-system', '目标', Crosshair],
+          ].map(([view, label, Icon]) => {
+            const selected = currentView === view
+            return (
+              <button
+                key={String(view)}
+                type="button"
+                onClick={() => {
+                  setMobileToolsOpen(false)
+                  setCurrentView(view as typeof currentView)
+                }}
+                className={`flex min-h-14 flex-col items-center justify-center gap-0.5 rounded-md text-[11px] ${selected ? 'text-indigo-700' : 'text-slate-500'}`}
+                aria-current={selected ? 'page' : undefined}
+              >
+                <Icon className={`h-5 w-5 ${selected ? 'stroke-[2.4]' : ''}`} />
+                <span>{String(label)}</span>
+              </button>
+            )
+          })}
+          <button
+            type="button"
+            onClick={() => setMobileToolsOpen(true)}
+            className={`flex min-h-14 flex-col items-center justify-center gap-0.5 rounded-md text-[11px] ${mobileToolsOpen || ['builder', 'smart-parser', 'paper-docx'].includes(currentView) ? 'text-indigo-700' : 'text-slate-500'}`}
+            aria-expanded={mobileToolsOpen}
+          >
+            <Menu className="h-5 w-5" />
+            <span>更多</span>
+          </button>
+        </nav>
+
+        {mobileToolsOpen && (
+          <div className="fixed inset-0 z-[60] bg-slate-950/35 md:hidden" onClick={() => setMobileToolsOpen(false)}>
+            <section className="absolute inset-x-0 bottom-0 rounded-t-lg bg-white px-4 pb-[calc(env(safe-area-inset-bottom)+1rem)] pt-3 shadow-2xl" onClick={(event) => event.stopPropagation()}>
+              <div className="mb-2 flex items-center justify-between">
+                <h2 className="text-base font-semibold text-slate-900">更多工具</h2>
+                <button type="button" onClick={() => setMobileToolsOpen(false)} className="rounded-md p-2 text-slate-500" aria-label="关闭更多工具">
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+              <div className="divide-y divide-slate-100">
+                {[
+                  ['builder', '排版台', '编排任务并导出试卷'],
+                  ['smart-parser', '智能解析', '解析整卷并批量生成题目'],
+                  ['paper-docx', '整卷答案', '检查整卷答案并导出 DOCX'],
+                ].map(([view, label, description]) => (
+                  <button
+                    key={view}
+                    type="button"
+                    onClick={() => {
+                      setCurrentView(view as typeof currentView)
+                      setMobileToolsOpen(false)
+                    }}
+                    className="flex w-full items-center justify-between py-3 text-left"
+                  >
+                    <span>
+                      <span className="block text-sm font-medium text-slate-900">{label}</span>
+                      <span className="mt-0.5 block text-xs text-slate-500">{description}</span>
+                    </span>
+                    <span className="text-slate-300">›</span>
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCurrentView('dashboard')
+                    setMobileToolsOpen(false)
+                    setSettingsOpenRequest((value) => value + 1)
+                  }}
+                  className="flex w-full items-center justify-between py-3 text-left"
+                >
+                  <span>
+                    <span className="block text-sm font-medium text-slate-900">模型配置</span>
+                    <span className="mt-0.5 block text-xs text-slate-500">运行参数、模型和提示词</span>
+                  </span>
+                  <Settings className="h-4 w-4 text-slate-400" />
+                </button>
+              </div>
+            </section>
+          </div>
+        )}
       </div>
     </QueryClientProvider>
   )
@@ -4361,23 +4592,23 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
   }
 
   return (
-    <div className="max-w-7xl mx-auto px-8 pb-4">
-      <div className="mb-6 flex items-center justify-between">
-        <h2 className="text-2xl font-bold">智能解析试卷</h2>
+    <div className="mx-auto max-w-7xl px-3 pb-4 sm:px-6 lg:px-8">
+      <div className="mb-4 flex items-center justify-between sm:mb-6">
+        <h2 className="text-xl font-bold sm:text-2xl">智能解析试卷</h2>
         <button
           onClick={onBack}
-          className="px-4 py-2 text-sm text-gray-600 hover:text-gray-800"
+          className="px-3 py-2 text-sm text-gray-600 hover:text-gray-800"
         >
-        return <span className="text-amber-600">Stopped manually</span>
+          返回工作台
         </button>
       </div>
 
-      <div className="grid grid-cols-2 gap-6">
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-2 xl:gap-6">
         {/* 左侧：上传区域 */}
-        <div className="bg-white rounded-xl shadow-sm p-6">
+        <div className="border-y bg-white p-4 sm:rounded-xl sm:border sm:p-6">
           <h3 className="text-lg font-semibold mb-4">上传试卷</h3>
 
-          <div className="border-2 border-dashed border-gray-200 rounded-xl p-6 text-center">
+          <div className="rounded-xl border-2 border-dashed border-gray-200 p-4 text-center sm:p-6">
             <input
               type="file"
               accept="image/*,.pdf,.doc,.docx,.ppt,.pptx,.html,.htm,.epub,.txt,.md"
@@ -4436,7 +4667,7 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
                 onClick={handleStopParse}
                 className="px-4 py-2 bg-amber-100 text-amber-700 rounded-lg hover:bg-amber-200 text-sm"
               >
-                Stop parse
+                停止解析
               </button>
             )}
           </div>
@@ -4455,7 +4686,7 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
         </div>
 
         {/* 右侧：题目列表 */}
-        <div className="bg-white rounded-xl shadow-sm p-6">
+        <div className="border-y bg-white p-4 sm:rounded-xl sm:border sm:p-6">
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-lg font-semibold">题目列表</h3>
             {questions.length > 0 && (
@@ -4464,7 +4695,7 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
           </div>
 
           {questions.length === 0 && (
-            <div className="h-80 flex items-center justify-center text-gray-400 text-sm">
+            <div className="flex h-40 items-center justify-center text-sm text-gray-400 sm:h-80">
               解析完成后显示题目
             </div>
           )}
@@ -4475,18 +4706,18 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
                 onClick={addEditableQuestion}
                 className="px-3 py-2 text-xs border border-gray-300 rounded hover:bg-gray-50"
               >
-                Add question
+                新增题目
               </button>
               <button
                 onClick={sortEditableQuestions}
                 className="px-3 py-2 text-xs border border-gray-300 rounded hover:bg-gray-50"
               >
-                Sort by number
+                按题号排序
               </button>
             </div>
           )}
           {questions.length > 0 && (
-            <div className="space-y-4 max-h-[calc(100vh-320px)] overflow-y-auto">
+            <div className="max-h-none space-y-4 overflow-y-auto xl:max-h-[calc(100vh-320px)]">
               {Object.entries(groupedQuestions).map(([type, qs]) => (
                 <div key={type}>
                   <h4 className="text-sm font-medium text-indigo-600 mb-2">{type}</h4>
@@ -4527,9 +4758,9 @@ function SmartPaperParser({ onBack }: { onBack: () => void }) {
                             <span className="font-medium">Q{q.number}</span>
                             {canEditBeforeSolve && (
                               <div className="ml-auto flex items-center gap-1">
-                                <button type="button" onClick={() => moveQuestionByOffset(q.number, -1)} className="px-2 py-1 text-[11px] border rounded hover:bg-white">Up</button>
-                                <button type="button" onClick={() => moveQuestionByOffset(q.number, 1)} className="px-2 py-1 text-[11px] border rounded hover:bg-white">Down</button>
-                                <button type="button" onClick={() => deleteEditableQuestion(q.number)} className="px-2 py-1 text-[11px] border border-red-200 text-red-600 rounded hover:bg-red-50">Delete</button>
+                                <button type="button" onClick={() => moveQuestionByOffset(q.number, -1)} className="px-2 py-1 text-[11px] border rounded hover:bg-white">上移</button>
+                                <button type="button" onClick={() => moveQuestionByOffset(q.number, 1)} className="px-2 py-1 text-[11px] border rounded hover:bg-white">下移</button>
+                                <button type="button" onClick={() => deleteEditableQuestion(q.number)} className="px-2 py-1 text-[11px] border border-red-200 text-red-600 rounded hover:bg-red-50">删除</button>
                               </div>
                             )}
                             {status && (

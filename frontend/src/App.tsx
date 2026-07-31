@@ -281,6 +281,7 @@ function NodeModelSettings({
   accentClass,
   config,
   setConfig,
+  apiKeyMasked,
   clearApiKey,
   setClearApiKey,
 }: {
@@ -288,6 +289,7 @@ function NodeModelSettings({
   accentClass: string;
   config: ModelConfig;
   setConfig: (config: ModelConfig) => void;
+  apiKeyMasked: string;
   clearApiKey: boolean;
   setClearApiKey: (value: boolean) => void;
 }) {
@@ -310,6 +312,7 @@ function NodeModelSettings({
         <div>
           <label className="mb-1 block text-sm font-medium text-gray-700">节点 API Key <span className="text-xs font-normal text-gray-400">(留空保留覆盖值)</span></label>
           <input type="password" value={config.api_key} onChange={e => setConfig({ ...config, api_key: e.target.value })} placeholder="留空则继承共享 Key" className="w-full rounded-lg border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
+          {apiKeyMasked && <p className="mt-1 text-xs text-emerald-700">服务器已保存：{apiKeyMasked}</p>}
           <label className="mt-2 flex items-center gap-2 text-xs text-rose-700"><input type="checkbox" checked={clearApiKey} onChange={e => setClearApiKey(e.target.checked)} />清除节点独立 Key，改为继承共享 Key</label>
         </div>
       </div>
@@ -406,6 +409,9 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
     return (solverSaved.api_key || reviewerSaved.api_key || formatterSaved.api_key || '').trim()
   })
   const [sharedApiKeyMasked, setSharedApiKeyMasked] = useState('')
+  const [solverApiKeyMasked, setSolverApiKeyMasked] = useState('')
+  const [reviewerApiKeyMasked, setReviewerApiKeyMasked] = useState('')
+  const [formatterApiKeyMasked, setFormatterApiKeyMasked] = useState('')
   const [clearSharedApiKey, setClearSharedApiKey] = useState(false)
   const [clearSolverApiKey, setClearSolverApiKey] = useState(false)
   const [clearReviewerApiKey, setClearReviewerApiKey] = useState(false)
@@ -568,6 +574,9 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
       setSharedBaseUrl(nextSharedBaseUrl)
       setSharedApiKey(nextSharedApiKey)
       setSharedApiKeyMasked(runtime.shared_model_config?.api_key_masked || '')
+      setSolverApiKeyMasked(runtime.solver_config?.api_key_masked || '')
+      setReviewerApiKeyMasked(runtime.reviewer_config?.api_key_masked || '')
+      setFormatterApiKeyMasked(runtime.formatter_config?.api_key_masked || '')
       setClearSharedApiKey(false)
       setClearSolverApiKey(false)
       setClearReviewerApiKey(false)
@@ -1429,9 +1438,9 @@ function TaskDashboard({ settingsOpenRequest, onOpenTargetSystem }: { settingsOp
                     </div>
                   </div>
                 </div>
-                <NodeModelSettings title="Solver (解题) 节点" accentClass="text-blue-600" config={solverConfig} setConfig={setSolverConfig} clearApiKey={clearSolverApiKey} setClearApiKey={setClearSolverApiKey} />
-                <NodeModelSettings title="Reviewer (审查) 节点" accentClass="text-purple-600" config={reviewerConfig} setConfig={setReviewerConfig} clearApiKey={clearReviewerApiKey} setClearApiKey={setClearReviewerApiKey} />
-                <NodeModelSettings title="Formatter (排版) 节点" accentClass="text-green-600" config={formatterConfig} setConfig={setFormatterConfig} clearApiKey={clearFormatterApiKey} setClearApiKey={setClearFormatterApiKey} />
+                <NodeModelSettings title="Solver (解题) 节点" accentClass="text-blue-600" config={solverConfig} setConfig={setSolverConfig} apiKeyMasked={solverApiKeyMasked} clearApiKey={clearSolverApiKey} setClearApiKey={setClearSolverApiKey} />
+                <NodeModelSettings title="Reviewer (审查) 节点" accentClass="text-purple-600" config={reviewerConfig} setConfig={setReviewerConfig} apiKeyMasked={reviewerApiKeyMasked} clearApiKey={clearReviewerApiKey} setClearApiKey={setClearReviewerApiKey} />
+                <NodeModelSettings title="Formatter (排版) 节点" accentClass="text-green-600" config={formatterConfig} setConfig={setFormatterConfig} apiKeyMasked={formatterApiKeyMasked} clearApiKey={clearFormatterApiKey} setClearApiKey={setClearFormatterApiKey} />
               </div>
             </div>
 
